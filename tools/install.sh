@@ -1598,16 +1598,21 @@ linux_target_preflight() { # <tag> <head-tag> <asset>
 # `aterm --version` prints the origin line, the build, which copy runs and the
 # trust roots under it (aterm-cli's version_text), and comparing the whole report
 # refused every release. Status 0 yes, 1 it runs and names another version, 2 it
-# cannot run here (a non-zero exit or no answer in 30 s; what it printed on stderr,
-# a missing glibc symbol say, reaches the person); LINUX_CANDIDATE_SAID is the line
-# it gave. stdin is /dev/null: under `curl … | bash` the inherited stdin
-# is the rest of this script. Called directly, never in $(…).
+# cannot run here (a non-zero exit, or cut off by bounded's hang detector; what it
+# printed on stderr, a missing glibc symbol say, reaches the person);
+# LINUX_CANDIDATE_SAID is the line it gave. It runs through bounded (on /dev/null,
+# its process group cut off at VERIFY_WAIT_SECS) and its answer is read from a
+# file, as first_line_bounded runs every other binary this script asks what it
+# is. Called directly, never in $(…).
 LINUX_CANDIDATE_SAID=""
 linux_candidate_answers_tag() { # <exe> <tag>
-	local nl=$'\n' said
+	local out s=0
 	LINUX_CANDIDATE_SAID=""
-	said="$(timeout 30 "$1" --version </dev/null)" || return 2
-	LINUX_CANDIDATE_SAID="${said%%"$nl"*}"
+	out="$(mktemp "${TMPDIR:-/tmp}/aterm-probe.XXXXXX")" || return 2
+	bounded "$VERIFY_WAIT_SECS" "$1" --version >"$out" || s=$?
+	[[ "$s" -ne 0 ]] || LINUX_CANDIDATE_SAID="$(head -n 1 "$out")"
+	rm -f "$out"
+	[[ "$s" -eq 0 ]] || return 2
 	case "$LINUX_CANDIDATE_SAID" in
 	"aterm ${2#v}" | "aterm ${2#v}+"* | "aterm ${2#v} "*) return 0 ;;
 	*) return 1 ;;
@@ -1707,7 +1712,8 @@ def verify_ed25519(key, data, signature):
             ["openssl", "pkeyutl", "-verify", "-pubin", "-keyform", "DER",
              "-inkey", key_path, "-rawin", "-in", data_path, "-sigfile", sig_path],
             pass_fds=descriptors, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, timeout=10, check=False,
+            # VERIFY_WAIT_SECS, the hang detector: OpenSSL answers or is wedged.
+            stderr=subprocess.DEVNULL, timeout=60, check=False,
         )
         return result.returncode == 0
     finally:
@@ -2935,7 +2941,7 @@ if [[ "$DO_APP" -eq 1 ]]; then
 			# environment facts, so both skip the half before any download.
 			LINUX_ASSET="aterm-${TAG#v}-linux-$LINUX_ARCH"
 			# So are the verifier's tools.
-			if ! command -v openssl >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1 ||
+			if ! command -v openssl >/dev/null 2>&1 ||
 				! python3 -I -c 'import tomllib, hashlib, os; assert hasattr(os, "memfd_create"); assert hasattr(hashlib, "file_digest")' >/dev/null 2>&1; then
 				APP_SKIP="signed Linux bootstrap needs Python 3.11+ and OpenSSL with Ed25519 support — install them and re-run"
 			elif ! ensure_dirs_writable "$STORE_DIR" "$BIN_DIR"; then
@@ -3492,7 +3498,7 @@ install_cli() {
 		claim_bin_aterm || return 0
 		ln -sfn "$target" "$BIN_DIR/aterm"
 		BIN_ATERM_EXPOSED=1
-		echo "install.sh: linked $("$BIN_DIR/aterm" --version | head -n 1) -> $BIN_DIR/aterm (follows the app's updates)"
+		echo "install.sh: linked $(first_line_bounded "$BIN_DIR/aterm" --version) -> $BIN_DIR/aterm (follows the app's updates)"
 	elif [[ -n "$CLI_CARGO_SKIP" ]]; then
 		# Neither source is available here: no installed bundle ships the
 		# toolset (older release, or no app), and the build fallback is
@@ -3566,7 +3572,7 @@ install_cli_from_source() {
 	# STORE_DIR was pre-flighted (created + writability-checked) before the build.
 	place_store_binary "$rel/aterm"
 	PLACED_ATERM="$STORE_DIR/aterm"
-	echo "install.sh: installed $("$STORE_DIR/aterm" --version | head -n 1) -> $STORE_DIR"
+	echo "install.sh: installed $(first_line_bounded "$STORE_DIR/aterm" --version) -> $STORE_DIR"
 	say_store_command ""
 }
 
