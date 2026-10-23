@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! String templates for generated code.
-//!
-//! A template is Rust source with `#name` holes. It is lexed by the compiler
-//! (`TokenStream::from_str`), so its tokens take the call site's span, as
-//! `quote!` gives them; [`quote_spanned`] gives them one chosen span instead.
-//! A hole takes the tokens of the value bound to its name, and those keep
-//! their own spans: a field's type spliced into an impl still points at the
-//! field. `#[...]` and `#!` are attributes, not holes.
+//! String templates with `#name` holes for generated code.
 
 use proc_macro::{Delimiter, Group, Ident, Literal, Punct, Span, TokenStream, TokenTree};
 
@@ -109,8 +102,7 @@ impl ToTokens for bool {
     }
 }
 
-/// `items` with `separator` (one punctuation character, e.g. `,`) between
-/// each and after the last when `trailing`.
+/// Joins `items` with `separator`, plus a trailing separator when `trailing` is true.
 #[must_use]
 pub fn join<T: ToTokens>(items: &[T], separator: char, trailing: bool) -> TokenStream {
     let mut out = Vec::new();
@@ -133,9 +125,6 @@ pub fn join<T: ToTokens>(items: &[T], separator: char, trailing: bool) -> TokenS
 }
 
 /// Lexes `template` and fills its `#name` holes from `vars`.
-///
-/// A template that does not lex, or a hole with no binding, is a bug in the
-/// macro; it comes out as a `compile_error!` naming the template.
 #[inline]
 #[must_use]
 pub fn quote(template: &str, vars: &[(&str, &dyn ToTokens)]) -> TokenStream {
@@ -242,7 +231,6 @@ pub fn braced(inner: TokenStream) -> TokenTree {
 }
 
 /// [`quote()`] with its holes bound by name: `q!("let #x = #y;", x, y = expr)`.
-/// A bare name binds the variable of that name; `name = expr` binds `expr`.
 #[macro_export]
 macro_rules! q {
     (@arg $name:ident) => { &$name as &dyn $crate::ToTokens };

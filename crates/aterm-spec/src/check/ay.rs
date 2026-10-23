@@ -3,23 +3,9 @@
 
 //! The `ay` certificate bundles: hand-encoded SMT-LIB2 obligations under
 //! `aterm-spec-models/proofs/ay`, each declaring the verdict it must get.
-//!
-//! An obligation states its verdict with the standard `(set-info :status
-//! unsat|sat)`, so a file is held the moment it is written and none can be
-//! left out of a list; `(set-info :aterm-cost minutes)` marks one only
-//! `--full` solves. `ay` reads neither, so the declarations never change a
-//! solve.
-//!
-//! One solve, one attributed verdict: every solve reports the build that
-//! answered (`build.stamp=` on stderr), and the whole run must be answered by
-//! ONE build, because a correct verdict from a solver that will not name
-//! itself is not re-checkable evidence. `--no-proof` keeps a solve from
-//! rewriting the tracked proof sidecars beside its input.
 
 use std::path::{Path, PathBuf};
 
-/// The solver's budget for one obligation that is not minutes-class: every
-/// one answers in seconds, so this only bounds a regression.
 const TIMEOUT: &str = "-t:120000";
 
 /// What a solve must answer.
@@ -148,8 +134,8 @@ pub(crate) fn stamp(stderr: &str) -> Option<String> {
     })
 }
 
-/// Solve one obligation.
 // Skip: spawns the solver. Verification tooling.
+/// Solve one obligation.
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn solve(ay: &Path, obligation: &Obligation) -> Result<Answer, String> {
     let mut cmd = aterm_uds::spawnfd::command(ay);

@@ -126,8 +126,7 @@ impl Enc {
         self.buf.clear();
     }
 
-    /// Makes room for at least `additional` more bytes, so the next writes up to that many do not
-    /// grow the buffer one doubling at a time.
+    /// Makes room for at least `additional` more bytes.
     pub fn reserve(&mut self, additional: usize) {
         self.buf.reserve(additional);
     }

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Python semantics the embedded verifier's rules were written in, where they decide a
-//! verdict or its words: an exact `int` ([`uint`]), truthiness ([`truthy`]), `==` against
-//! an int ([`equals_int`]), `pathlib`'s spelling of a path ([`PyPath`]), `int()` of a tag's
-//! part ([`int_tuple`]), and an `OSError`'s message ([`os_error`]).
+//! Python value, path, integer, and `OSError` semantics used by the embedded verifier.
 
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
@@ -16,8 +13,7 @@ use aterm_toml::Value;
 
 use crate::{Refusal, Verdict};
 
-/// `uint(value, name, maximum)`: an integer (never a bool or a float) in `0..=maximum`,
-/// else `invalid <name>`.
+/// Parses `value` as an integer in `0..=maximum`, else refuses with `invalid <name>`.
 pub(crate) fn uint(value: Option<&Value>, name: &str, maximum: u64) -> Verdict<u64> {
     match value {
         Some(Value::Integer(v)) => u64::try_from(*v)
@@ -70,8 +66,7 @@ pub(crate) fn equals_str(value: Option<&Value>, text: &str) -> bool {
     value.and_then(Value::as_str) == Some(text)
 }
 
-/// Python's `repr()` of a string the OS gave as bytes (undecodable bytes as the
-/// `surrogateescape` code points Python reads them as).
+/// Python's `repr()` of an OS byte string using `surrogateescape` for undecodable bytes.
 pub(crate) fn repr(text: &OsStr) -> String {
     let mut body = String::new();
     let mut quote = '\'';
@@ -108,7 +103,6 @@ pub(crate) fn repr(text: &OsStr) -> String {
     format!("{quote}{body}{quote}")
 }
 
-/// The OS's words for `error`, without Rust's `(os error N)`.
 fn strerror(error: &std::io::Error) -> String {
     let text = error.to_string();
     match error.raw_os_error() {
@@ -120,8 +114,7 @@ fn strerror(error: &std::io::Error) -> String {
     }
 }
 
-/// An `OSError` about `path`, as Python words it: `[Errno 2] No such file or directory:
-/// '/path'`.
+/// Formats an `OSError` for `path` as `[Errno N] <msg>: '<path>'`.
 pub(crate) fn os_error(error: &std::io::Error, path: &Path) -> Refusal {
     match error.raw_os_error() {
         Some(code) => Refusal::new(format!(
@@ -141,9 +134,7 @@ pub(crate) fn bare_os_error(error: &std::io::Error) -> Refusal {
     }
 }
 
-/// A path as `pathlib.PurePosixPath` spells it: empty and `.` components dropped, `..`
-/// kept, and a root of `/`, or `//` for exactly two leading slashes (POSIX leaves that
-/// one implementation-defined, and pathlib keeps it).
+/// A POSIX path normalized as `pathlib.PurePosixPath` spells it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PyPath {
     root: &'static str,
@@ -267,8 +258,7 @@ impl PartialOrd for Int {
     }
 }
 
-/// Python's `int(text)` in base 10: surrounding whitespace, a sign, and digits with single
-/// underscores between them; else `invalid literal for int() with base 10: '<text>'`.
+/// Parses `text` as Python's base-10 `int(text)`.
 pub(crate) fn int(text: &str) -> Verdict<Int> {
     let invalid = || {
         Refusal::new(format!(

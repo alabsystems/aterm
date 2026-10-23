@@ -23,7 +23,6 @@ fn lab(args: &[String]) -> Result<(Run, Vec<String>), Fail> {
 }
 
 /// The lab has a Codex to run.
-///
 /// # Errors
 /// None is managed in this lab.
 pub fn need_codex(run: &Run) -> Result<(), Fail> {
@@ -36,7 +35,6 @@ pub fn need_codex(run: &Run) -> Result<(), Fail> {
     Ok(())
 }
 
-/// A TOML string.
 fn q(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -116,7 +114,6 @@ pub fn config_text(mode: &str, port: &str, proj: &str, proj_spelled: &str, model
 }
 
 /// Write the scratch `config.toml` for `mode` (through no link).
-///
 /// # Errors
 /// The write was refused.
 pub fn write_config(run: &Run, mode: &str) -> Result<(), Fail> {
@@ -188,7 +185,6 @@ pub fn auth_json(label: &str, account: &str, plan: &str, now: i64) -> String {
 }
 
 /// Write [`auth_json`] into the scratch `CODEX_HOME` (mode 0600, through no link).
-///
 /// # Errors
 /// The write was refused.
 pub fn write_auth(run: &Run, label: &str, account: &str, plan: &str) -> Result<PathBuf, Fail> {
@@ -200,7 +196,6 @@ pub fn write_auth(run: &Run, label: &str, account: &str, plan: &str) -> Result<P
 }
 
 /// Write [`auth_json`] into the live `CODEX_HOME` and a note of it into the stub's log.
-///
 /// # Errors
 /// The write was refused, or the stub did not take the note.
 pub fn auth_and_note(run: &Run, label: &str, account: &str, plan: &str) -> Result<PathBuf, Fail> {
@@ -220,7 +215,6 @@ pub fn auth_and_note(run: &Run, label: &str, account: &str, plan: &str) -> Resul
 }
 
 /// Refuse arguments that would start a login, contact a real server, or open the Desktop app.
-///
 /// # Errors
 /// What was refused.
 pub fn safe_args(tab: bool, args: &[String]) -> Result<(), String> {
@@ -351,7 +345,6 @@ pub struct Launch {
 }
 
 /// Parse `codex`'s options.
-///
 /// # Errors
 /// An unknown option, `-e` with no value, or a plan that is no `plan_type`.
 pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
@@ -394,7 +387,6 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
 }
 
 /// Launch the managed Codex in the lab's first tab.
-///
 /// # Errors
 /// No Codex, no witness, a refused argument, or the launch line could not be typed.
 pub fn launch(run: &Run, l: &Launch) -> Result<String, Fail> {
@@ -459,7 +451,6 @@ pub fn cmd_codex_run(args: &[String]) -> Res {
 }
 
 /// [`cmd_codex_run`] on a loaded lab.
-///
 /// # Errors
 /// No Codex, a refused argument, or the jail could not start it.
 pub fn codex_run(
@@ -542,7 +533,6 @@ pub fn cmd_codex_auth(args: &[String]) -> Res {
 }
 
 /// The `x-codex-*` headers of `ratelimits`' arguments.
-///
 /// # Errors
 /// A missing window or an unknown key.
 pub fn ratelimit_headers(args: &[String]) -> Result<J, String> {
@@ -608,11 +598,7 @@ pub fn ratelimit_headers(args: &[String]) -> Result<J, String> {
     Ok(J::Obj(h))
 }
 
-/// `ratelimits [tag] off | PRIMARY SECONDARY [credits=yes|no|unlimited]
-/// [balance=N] [reached=TYPE] [promo=TEXT] [active=ID]`: the `x-codex-*`
-/// headers every stub answer carries, and the account usage a `--chatgpt` Codex
-/// polls; the `on200`/`on429` blocks `headers` wrote stay
-/// ([`crate::verbs::write_headers`]).
+/// `ratelimits [tag] off | PRIMARY SECONDARY …`.
 pub fn cmd_ratelimits(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     let h = ratelimit_headers(&a).map_err(Fail::die)?;
@@ -781,17 +767,10 @@ mod tests {
         assert!(ratelimit_headers(&["1".into(), "2".into(), "bogus=1".into()]).is_err());
     }
 
-    /// The bytes of a stand-in codex-alab binary: clap's literal for the
-    /// flag among other text, as the store's build holds it.
     const NAMES_IT: &[u8] = b"\x00\xcf\xfa\xed\xfeno-daemon cannot be used with --remote\x00";
 
-    /// The bytes of a stand-in binary that takes no `--no-daemon`: the
-    /// literal's pieces, never the literal (vendor 0.151.0's case).
     const NAMES_NONE: &[u8] = b"\x00\xcf\xfa\xed\xfeno-daemo\x00n-daemon\x00no-daemoN\x00";
 
-    /// A Codex package at `root` (layout 1, `bin/codex` its entrypoint,
-    /// holding `exe`), its manifest's version `version`, ALab's when `alab`
-    /// (its `alab-build.json` beside the manifest): the binary's path.
     fn package_at(root: &Path, version: &str, alab: bool, exe: &[u8]) -> String {
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::write(root.join("bin/codex"), exe).unwrap();
@@ -809,10 +788,6 @@ mod tests {
         root.join("bin/codex").to_string_lossy().into_owned()
     }
 
-    /// THE LAUNCHER EXECS CODEX BY PATH, `--no-daemon` ONLY WHERE IT IS
-    /// TAKEN: codex-alab's package (its ALab build mark beside the manifest)
-    /// is launched with `--no-daemon` before the caller's arguments, in the
-    /// tab and in `codex-run`, its bytes unread.
     #[test]
     fn the_launcher_execs_codex_by_path_with_no_daemon_where_it_is_taken() {
         let scratch = aterm_tempfile::tempdir().expect("exclusive package fixture");
@@ -913,11 +888,6 @@ mod tests {
         assert_eq!(takes(&dev), [Some(false); 2], "CONTROL: the literal");
     }
 
-    /// The literal is found wherever it lies, across the seam of two read
-    /// blocks too, and nowhere it is not: a file whose only `no-daemon`
-    /// straddles the first 4 MiB block's end is read as naming it, the same
-    /// file with one byte of it changed is not, and a directory is never
-    /// opened.
     #[test]
     fn a_binary_names_the_flag_across_a_block_seam() {
         let scratch = aterm_tempfile::tempdir().expect("exclusive binary fixture");

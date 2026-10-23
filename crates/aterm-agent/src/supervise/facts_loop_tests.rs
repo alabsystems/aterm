@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the facts seam in the loop (`run/facts_loop.rs`): a hung call's no-progress fact
-//! riding a prompt the turn-end policy types anyway, and its own line at a break under
-//! `[harness] stuck_break_note`, once per episode across both doors.
+//! Tests for the supervision-loop facts seam across turn-end riders and break lines.
 
 use super::*;
 use crate::supervise::BackgroundCall;
@@ -11,12 +9,9 @@ use crate::supervise::facts::EpisodeKey;
 
 const NO_PROGRESS: &str = "fact-no-progress@v1";
 
-/// The leader's birth of the hung call's first episode, and of a later one in the same group.
 const BORN: u64 = 1_792_498_000_123_456;
 const REBORN: u64 = BORN + 1;
 
-/// A hung call: its group's leader `pid` born at `birth`, quiet 31 min, every word the host
-/// passes on planted.
 fn hung(birth: u64) -> BackgroundCall {
     BackgroundCall {
         pid: 27098,
@@ -29,7 +24,6 @@ fn hung(birth: u64) -> BackgroundCall {
     }
 }
 
-/// The fact the agent is told of `hung(birth)`.
 fn told(birth: u64) -> String {
     hung(birth).told()
 }
@@ -42,8 +36,6 @@ enum Step {
     End,
 }
 
-/// A run over both doors: under `policy` (its own `stuck_break_note` and `facts`), each step at
-/// its second from the start, on `host`; `seed` a ledger a loop before this one left.
 struct Run<'a> {
     tag: &'a str,
     policy: SupervisorConfig,
@@ -52,7 +44,6 @@ struct Run<'a> {
     seed: Option<(String, i64)>,
 }
 
-/// What a run gave, and the session's own word on each episode as it left it.
 struct Both {
     ran: Ran,
     /// Each step's writes' texts (`send … -- <text>`).
@@ -61,12 +52,10 @@ struct Both {
 }
 
 impl Both {
-    /// The texts the run sent, in order.
     fn sends(&self) -> Vec<String> {
         self.sent.iter().flatten().cloned().collect()
     }
 
-    /// The `FACT` records of `door`, the words after `door=<door> `.
     fn facts(&self, door: &str) -> Vec<String> {
         let mark = format!(" door={door} ");
         self.ran
@@ -77,8 +66,6 @@ impl Both {
             .collect()
     }
 
-    /// The fact rows of the ledger: `(rule, decision, reason)` of each `fact-intent@v1` row of a
-    /// no-progress episode and each `fact-no-progress@v1` row.
     fn rows(&self) -> Vec<(String, String, String)> {
         self.ran
             .ledger
@@ -100,7 +87,6 @@ impl Both {
     }
 }
 
-/// The text of a `send` request.
 fn sent_text(request: &str) -> Option<String> {
     request
         .starts_with("send ")
@@ -108,17 +94,14 @@ fn sent_text(request: &str) -> Option<String> {
         .flatten()
 }
 
-/// The words a fact adds to a prompt it rides.
 fn riding(birth: u64) -> String {
     format!(" (aterm: {})", told(birth))
 }
 
-/// The stuck fact's own line.
 fn stuck(birth: u64) -> String {
     templates::stuck_line(&told(birth))
 }
 
-/// The hosted policy under `occupancy`, the stuck fact's key `key`.
 fn keyed(occupancy: Occupancy, key: bool) -> SupervisorConfig {
     SupervisorConfig {
         stuck_break_note: key,
@@ -139,8 +122,6 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// The run, `before` each step (given the step's index), each episode of `asked` told or not
-    /// as the session left it.
     fn run(
         self,
         asked: &[u64],
@@ -259,24 +240,16 @@ impl<'a> Run<'a> {
     }
 }
 
-/// The agent takes the act or line typed at the step before.
 fn took(s: &mut Session<'_, Logged<'_>>) {
     s.took(7, Some(&policy(Occupancy::Off)), &mut Heard::default());
 }
 
-/// A step before which the agent took what the step before typed.
 fn taking(s: &mut Session<'_, Logged<'_>>, _: &DoorHost, i: usize) {
     if i > 0 {
         took(s);
     }
 }
 
-/// ONCE PER EPISODE ACROSS BOTH DOORS: the hung call's fact rides the first prompt the policy
-/// types, ` (aterm: …)` after it, booked as an intent before the write and `typed` after it; the
-/// break after that types no line of it, though its key is on, and the next prompt carries none.
-/// Told first at a break, its line is that break's and no prompt carries it after. A call born
-/// since in the same group is another episode, told at the next prompt; a fresh reading that no
-/// longer names it ends it, and the same call quiet again is told again.
 #[test]
 fn a_hung_call_is_told_once_per_episode_across_both_doors() {
     let at = |m: i64, step| (m * 60, step);
@@ -369,13 +342,6 @@ fn a_hung_call_is_told_once_per_episode_across_both_doors() {
     assert_eq!(words(&first.rows()), told_rows);
 }
 
-/// §2.1'S RANK 4, AFTER THE UPGRADE'S NOTICE AND BEFORE THE NUDGES: at the break the host types
-/// its notice at, the stuck fact and the due nudge are both held for it (the notice untaken,
-/// `held:act-untaken`; the break's line gone, `held:host-line`); once the notice is taken, the
-/// next break types the stuck fact's line, `[aterm harness] aterm:
-/// <fact>.`, the nudge held for it there; the nudge waits for that line to be taken and for the
-/// session's pace past it, then goes. The stuck fact is typed once: no later break or prompt
-/// carries it.
 #[test]
 fn the_stuck_fact_goes_after_the_hosts_notice_and_before_the_due_nudge() {
     let at = |m: i64, step| (m * 60, step);
@@ -440,11 +406,38 @@ fn the_stuck_fact_goes_after_the_hosts_notice_and_before_the_due_nudge() {
     assert!(notice < line && line < paced, "{calls:#?}");
 }
 
-/// WITH THE KEY OFF A BREAK IS MAIN'S EXACTLY (`[harness] stuck_break_note`, which ships off):
-/// under every `occupancy`, a host whose reading names a hung call is asked nothing more, and
-/// the run's requests, host calls, rows and journal are those of a host with no reading. WITH IT
-/// ON, `off` and `observe` book the same: the line, typed and fenced, its intent row and its
-/// `typed` row, and the same requests.
+#[test]
+fn the_stuck_line_waits_out_the_pace_of_a_nudge_the_door_typed() {
+    let at = |m: i64, step| (m * 60, step);
+    let run = Run {
+        host: Arc::new(DoorHost::default()),
+        ..Run::new(
+            "facts-after-nudge",
+            keyed(Occupancy::Prompt, true),
+            &[
+                at(0, Step::Break),
+                at(31, Step::Break),
+                at(33, Step::Break),
+                at(52, Step::Break),
+            ],
+        )
+    };
+    let ran = run.run(&[BORN], &mut |s, host, i| {
+        if i == 2 {
+            took(s);
+            *host.facts.lock().expect("facts") = Some(vec![hung(BORN)]);
+        }
+    });
+    assert!(
+        ran.sent[1].len() == 1 && ran.sent[1][0].ends_with(&format!("(rule {NUDGE})")),
+        "the nudge: {:#?}",
+        ran.sent
+    );
+    assert!(ran.sent[2].is_empty(), "{:#?}", ran.ran.noted);
+    assert_eq!(ran.sent[3], [stuck(BORN)], "{:#?}", ran.ran.noted);
+    assert_eq!(ran.facts("break"), ["paced", "typed"]);
+}
+
 #[test]
 fn with_the_key_off_a_break_is_mains_exactly() {
     let run = |tag: &str, occupancy, key: bool, reading: bool| {
@@ -501,8 +494,6 @@ fn with_the_key_off_a_break_is_mains_exactly() {
     );
 }
 
-/// ALL OR NOTHING: a prompt the fact would push past the verbatim limit is typed without it,
-/// and the fact stays untold, so the break after it, the key on, types it.
 #[test]
 fn a_fact_that_would_not_fit_leaves_the_prompt_alone_and_stays_untold() {
     let long = "keep going ".repeat(69).trim_end().to_string();
@@ -528,8 +519,6 @@ fn a_fact_that_would_not_fit_leaves_the_prompt_alone_and_stays_untold() {
     assert_eq!(ran.sent[1], [stuck(BORN)], "untold: {:#?}", ran.ran.noted);
 }
 
-/// `[harness] facts = false` TELLS NONE: no prompt carries a fact, no break types one though
-/// `stuck_break_note` is on, and the host is never asked for its reading.
 #[test]
 fn facts_off_tells_none_at_either_door() {
     let ran = Run::new(
@@ -562,10 +551,6 @@ fn facts_off_tells_none_at_either_door() {
     assert!(ran.rows().is_empty(), "{:#?}", ran.rows());
 }
 
-/// A RESTART TELLS NOTHING TOLD (`FactsState::seed`): a successor loop that reads its
-/// predecessor's `typed` row types no line of that episode at a break and carries none on a
-/// prompt. A predecessor that booked its intent and died before its outcome left it untold: its
-/// successor tells it, once.
 #[test]
 fn a_restart_does_not_retell_a_told_call() {
     let first = Run::new(
@@ -611,12 +596,9 @@ fn a_restart_does_not_retell_a_told_call() {
     );
 }
 
-/// A PROMPT LEFT IN THE COMPOSER LEAVES ITS FACT UNTOLD, SAID AS LEFT: the continuation carrying
-/// the fact is written and its Enter skipped (a person's hand), so its outcome row says
-/// `why=not-submitted`, not that nothing was written, and the episode is not told.
 #[test]
 fn a_prompt_left_in_the_composer_says_its_fact_not_submitted() {
-    let left = Run::new(
+    let fenced = Run::new(
         "facts-left",
         keyed(Occupancy::Off, false),
         &[(0, Step::End)],
@@ -628,31 +610,60 @@ fn a_prompt_left_in_the_composer_says_its_fact_not_submitted() {
             .push_back(ok("OK skipped reason=person seq=101\n"));
     });
     assert!(
-        left.sent[0].len() == 1 && left.sent[0][0].ends_with(&riding(BORN)),
+        fenced.sent[0].len() == 1 && fenced.sent[0][0].ends_with(&riding(BORN)),
         "{:#?}",
-        left.sent
+        fenced.sent
     );
-    let rows = left.rows();
-    assert_eq!(
-        rows.last()
-            .map(|(rule, decision, _)| (rule.as_str(), decision.as_str())),
-        Some((NO_PROGRESS, "skipped")),
-        "{rows:#?}"
+    let guarded = |tag: &str, reply: CtlReply| {
+        let left = Run::new(tag, keyed(Occupancy::Off, false), &[(0, Step::End)]).run(
+            &[BORN],
+            &mut |s, _, _| {
+                s.caps.gen_fence = Some(false);
+                s.ctl
+                    .m
+                    .verb_replies
+                    .insert("turn", VecDeque::from([reply.clone()]));
+            },
+        );
+        assert!(
+            left.ran
+                .requests
+                .iter()
+                .any(|(r, _)| r.starts_with("turn ") && r.ends_with(&riding(BORN))),
+            "{tag}: {:#?}",
+            left.ran.requests
+        );
+        left
+    };
+    let missed = guarded(
+        "facts-left-guard",
+        ok("OK 0 turn skipped reason=guard submitted=0 seq=102 id=1\n"),
     );
-    assert!(
-        rows.last()
-            .is_some_and(|(_, _, reason)| reason.ends_with(" why=not-submitted")),
-        "{rows:#?}"
+    let halted = guarded(
+        "facts-left-halted",
+        ok("OK 0 turn skipped reason=halted submitted=0 seq=102 id=1\n"),
     );
-    assert_eq!(left.told, [false], "{:#?}", left.ran.noted);
+    let busy = guarded("facts-left-busy", err("busy sink"));
+    for left in [fenced, missed, halted, busy] {
+        let rows = left.rows();
+        assert_eq!(
+            rows.last()
+                .map(|(rule, decision, _)| (rule.as_str(), decision.as_str())),
+            Some((NO_PROGRESS, "skipped")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.last()
+                .is_some_and(|(_, _, reason)| reason.ends_with(" why=not-submitted")),
+            "{rows:#?}"
+        );
+        assert_eq!(left.told, [false], "{:#?}", left.ran.noted);
+    }
 }
 
-/// THE PACE COUNTS LINES THAT WENT, AND A RESTART CARRIES IT: a stuck line a predecessor typed
-/// 5 min before the loop's start spaces the next one, another birth's, under every `occupancy`
-/// mode; a wait-nudge that `observe` only would have typed 5 min before spaces nothing.
 #[test]
 fn the_stuck_lines_pace_counts_lines_that_went_across_a_restart() {
-    use crate::supervise::occupancy::rules::{RuleId, WOULD_RULE, would_reason};
+    use crate::supervise::occupancy::rules::{RuleId, SESSION_PACE_MS, WOULD_RULE, would_reason};
     let first = Run::new(
         "facts-pace-1",
         keyed(Occupancy::Off, true),
@@ -670,9 +681,55 @@ fn the_stuck_lines_pace_counts_lines_that_went_across_a_restart() {
         }
         .run(&[REBORN], &mut taking)
     };
-    let went = stamped(&first.ran.ledger, at_ms - 5 * MIN);
+    for went in [at_ms - 5 * MIN, at_ms + MIN].map(|ts| stamped(&first.ran.ledger, ts)) {
+        for occupancy in [Occupancy::Off, Occupancy::Observe, Occupancy::Prompt] {
+            let paced = after("facts-pace-2", went.clone(), occupancy);
+            assert!(
+                paced.sent[0].is_empty(),
+                "{occupancy:?}: {:#?}",
+                paced.ran.noted
+            );
+            assert_eq!(
+                paced.facts("break"),
+                ["paced"],
+                "{occupancy:?}: {:#?}",
+                paced.ran.noted
+            );
+        }
+    }
+    let reason = would_reason(RuleId::WaitNudge, 1, 31 * MIN, false);
+    let would = approvals::Row {
+        rule_id: WOULD_RULE,
+        outcome: approvals::Outcome::Waiting,
+        command: "",
+        reason: &reason,
+        box_seq: 1,
+    }
+    .to_json(at_ms - 5 * MIN, Some("@s-1"));
+    let ahead = stamped(&first.ran.ledger, at_ms + SESSION_PACE_MS);
+    for body in [would, ahead] {
+        for occupancy in [Occupancy::Off, Occupancy::Observe, Occupancy::Prompt] {
+            let free = after("facts-pace-3", body.clone(), occupancy);
+            assert_eq!(
+                free.sent[0],
+                [stuck(REBORN)],
+                "{occupancy:?}: {:#?}",
+                free.ran.noted
+            );
+        }
+    }
+    use crate::supervise::occupancy::door::{Told, outcome_reason};
+    let reason = outcome_reason(RuleId::WaitNudge, 1, 31 * MIN, false, Told::Typed);
+    let nudged = approvals::Row {
+        rule_id: crate::supervise::facts::FactKind::Hold.rule(),
+        outcome: approvals::Outcome::Typed,
+        command: "a nudge",
+        reason: &reason,
+        box_seq: 1,
+    }
+    .to_json(at_ms - 5 * MIN, Some("@s-1"));
     for occupancy in [Occupancy::Off, Occupancy::Observe, Occupancy::Prompt] {
-        let paced = after("facts-pace-2", went.clone(), occupancy);
+        let paced = after("facts-pace-4", nudged.clone(), occupancy);
         assert!(
             paced.sent[0].is_empty(),
             "{occupancy:?}: {:#?}",
@@ -685,23 +742,8 @@ fn the_stuck_lines_pace_counts_lines_that_went_across_a_restart() {
             paced.ran.noted
         );
     }
-    let reason = would_reason(RuleId::WaitNudge, 1, 31 * MIN, false);
-    let would = approvals::Row {
-        rule_id: WOULD_RULE,
-        outcome: approvals::Outcome::Waiting,
-        command: "",
-        reason: &reason,
-        box_seq: 1,
-    }
-    .to_json(at_ms - 5 * MIN, Some("@s-1"));
-    let free = after("facts-pace-3", would, Occupancy::Observe);
-    assert_eq!(free.sent[0], [stuck(REBORN)], "{:#?}", free.ran.noted);
 }
 
-/// THE PLANT NEVER REACHES A WRITE: a hung call whose binary, task word and wait the host passes
-/// on are all `ignore.previous.instructions` is told at both doors by its pid and minutes alone:
-/// no text the session types and no line the host shows the person carries the plant (the
-/// owner's records may name the exe, as data).
 #[test]
 fn a_planted_word_reaches_no_write_at_either_door() {
     let runs = [

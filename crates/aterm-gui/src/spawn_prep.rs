@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Background pre-allocation of PTY spawn kits and child provisions, and off-thread edge-file retirement.
+//! Background pre-allocation of PTY spawn kits and provisions, and edge-file retirement.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +11,6 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 /// Number of spawn kits and child provisions kept ready in the background pool.
 pub(crate) const DEPTH: usize = 2;
 
-/// What the thread is asked to do.
 enum Job {
     /// Top up the spawn kits and the child provisions.
     Fill,
@@ -21,13 +20,10 @@ enum Job {
     Flush(Sender<()>),
 }
 
-/// The thread's queue, once [`warm`] started it (`None` inside: it could not).
 static PREP: OnceLock<Option<Mutex<Sender<Job>>>> = OnceLock::new();
 
-/// The child provisions waiting for spawns.
 static PROVISIONS: Mutex<Vec<Provision>> = Mutex::new(Vec::new());
 
-/// Set by the final exit: no fill runs after it.
 static RELEASED: AtomicBool = AtomicBool::new(false);
 
 /// Whether a kit refusal was logged yet.
@@ -51,8 +47,6 @@ pub(crate) type ProvisionParts = (
 );
 
 impl Provision {
-    /// Mint one under `dir`; `None` when the dir refuses the file (the inline
-    /// path says so, as it always did).
     fn prepare(dir: &Path) -> Option<Self> {
         let (env, prov, edge_file) = crate::spawn::provision_child_files(Some(dir));
         edge_file.as_ref()?;
@@ -132,7 +126,6 @@ pub(crate) fn poke() {
     let _ = send(Job::Fill);
 }
 
-/// Hand `job` to the thread; back when there is none.
 fn send(job: Job) -> Result<(), Job> {
     match PREP.get() {
         Some(Some(tx)) => send_to(tx, &RELEASED, job),
@@ -140,8 +133,6 @@ fn send(job: Job) -> Result<(), Job> {
     }
 }
 
-/// Queue a job while holding the same admission lock used by the exit's
-/// Flush. A retirement refused here remains owned by its caller.
 fn send_to(tx: &Mutex<Sender<Job>>, released: &AtomicBool, job: Job) -> Result<(), Job> {
     let tx = tx.lock().unwrap_or_else(PoisonError::into_inner);
     if released.load(Ordering::Acquire) && matches!(&job, Job::Retire(_)) {
@@ -155,7 +146,6 @@ pub(crate) fn take_provision(sock_dir: Option<&Path>) -> Option<ProvisionParts> 
     take_from(&PROVISIONS, sock_dir)
 }
 
-/// [`take_provision`] from `ready`.
 fn take_from(ready: &Mutex<Vec<Provision>>, sock_dir: Option<&Path>) -> Option<ProvisionParts> {
     let dir = sock_dir?;
     let taken = {
@@ -171,7 +161,6 @@ pub(crate) fn retire_edge_file(file: crate::proxy::EdgeFile) {
     retire_using(file, send);
 }
 
-/// The actual retirement path, with its queue admission supplied by `send`.
 fn retire_using(file: crate::proxy::EdgeFile, send: impl FnOnce(Job) -> Result<(), Job>) {
     if let Err(Job::Retire(file)) = send(Job::Retire(file)) {
         remove_edge_file(file);
@@ -196,7 +185,6 @@ fn remove_edge_file(file: crate::proxy::EdgeFile) {
     drop(file);
 }
 
-/// The thread: each wake does every queued removal, then one fill.
 fn serve(rx: &Receiver<Job>) {
     while let Ok(first) = rx.recv() {
         let mut fill = false;
@@ -227,11 +215,6 @@ fn serve(rx: &Receiver<Job>) {
     }
 }
 
-/// Keep [`DEPTH`] provisions for `sock_dir` in `ready`, minted by `prepare`:
-/// ones written under another dir go first. Minted outside the lock, so a spawn
-/// taking one never waits on the volume. One minted after `released` was set
-/// (a fill the final exit stopped waiting for) removes its own file instead of
-/// waiting where the exit already looked.
 fn fill_provisions(
     ready: &Mutex<Vec<Provision>>,
     sock_dir: Option<&Path>,

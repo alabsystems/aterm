@@ -12,10 +12,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// The longest accepted request head.
 const MAX_HEAD: usize = 16 << 10;
 
-/// The largest answer a page may POST.
 const MAX_ANSWER: usize = 64 << 20;
 
 /// A running server.
@@ -35,12 +33,7 @@ impl Server {
         Self::serve(root, false)
     }
 
-    /// [`Server::start`], every file sent with the two headers that make a
-    /// page of it cross-origin isolated (`Cross-Origin-Opener-Policy:
-    /// same-origin`, `Cross-Origin-Embedder-Policy: require-corp`), where a
-    /// browser's `performance.now()` keeps its fine resolution (Chromium's
-    /// is 100 µs without, 5 µs with). Everything the page loads is this
-    /// origin's, so the embedder policy blocks nothing.
+    /// [`Server::start`] with COOP/COEP cross-origin isolation headers.
     pub(crate) fn start_isolated(root: &Path) -> Result<Self, String> {
         Self::serve(root, true)
     }
@@ -171,8 +164,6 @@ pub(crate) fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-/// `raw` with each `%XX` escape decoded, if every escape is two hex digits
-/// and the result is UTF-8.
 fn percent_decoded(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -197,7 +188,6 @@ pub(crate) fn answer_kind(target: &str) -> Option<&str> {
         .filter(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase()))
 }
 
-/// A request head's `Content-Length`, if it names one.
 fn content_length(head: &str) -> Option<usize> {
     head.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
@@ -207,7 +197,6 @@ fn content_length(head: &str) -> Option<usize> {
     })
 }
 
-/// A complete request head from `reader`, which reads at most one byte past [`MAX_HEAD`].
 fn request_head<R: Read>(reader: &mut BufReader<Take<R>>) -> std::io::Result<String> {
     let mut head = String::new();
     loop {
@@ -238,7 +227,6 @@ fn empty_response(out: &mut TcpStream, status: &str) -> std::io::Result<()> {
     )
 }
 
-/// The body after `head`.
 fn request_body<R: Read>(
     head: &str,
     reader: &mut BufReader<Take<R>>,
@@ -260,12 +248,9 @@ fn request_body<R: Read>(
     Ok(body)
 }
 
-/// The headers that make a page cross-origin isolated
-/// ([`Server::start_isolated`]).
 const ISOLATED: &str = "Cross-Origin-Opener-Policy: same-origin\r\n\
                         Cross-Origin-Embedder-Policy: require-corp\r\n";
 
-/// Read one request from `stream` and answer it.
 fn answer(
     mut stream: TcpStream,
     root: &Path,
@@ -356,9 +341,6 @@ mod tests {
         assert_eq!(input.position(), MAX_HEAD as u64 + 1);
     }
 
-    /// A POST's body is read whole, the bytes buffered with its head first,
-    /// and no further: a body without a length, or longer than an answer may
-    /// be, is refused before it is read.
     #[test]
     fn a_post_body_is_its_content_length_and_no_more() {
         let body = "x".repeat(20_000);
@@ -412,8 +394,6 @@ mod tests {
             resolve(root, "/gpu/aterm_gpu_web.js?v=1#x"),
             Some(PathBuf::from("/site/gpu/aterm_gpu_web.js"))
         );
-        // An escaped name is fetched as itself: the glue spells its module's
-        // file name this way.
         assert_eq!(
             resolve(root, "/q/quote%27%60%24%7Bx%7D%23%3F%25_bg.wasm?copy=1"),
             Some(PathBuf::from("/site/q/quote'`${x}#?%_bg.wasm"))
@@ -495,8 +475,6 @@ mod tests {
         )
     }
 
-    /// A real loopback round trip: a file comes back whole with its type, a
-    /// missing one and an escape are 404s, and dropping the server stops it.
     #[test]
     fn the_server_answers_files_and_refuses_the_rest() {
         let dir = aterm_tempfile::Builder::new()

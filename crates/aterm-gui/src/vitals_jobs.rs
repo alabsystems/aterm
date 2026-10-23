@@ -357,18 +357,37 @@ fn background_call_live(r: &JobRow) -> bool {
 }
 
 /// The canary's plain form of a row: the process it names (the waiting one
-/// for a wait, else the leader) and that process's name, the group, the
-/// agent's task id, the quiet age and a Tier B naming's word.
+/// for a wait, else the leader) and that process's short name
+/// ([`comm_word`]), the group, the agent's task id, the quiet age and a Tier
+/// B naming's word.
 fn background_call(r: &JobRow) -> BackgroundCall {
     BackgroundCall {
         pid: r.wait.as_ref().map_or(r.leader.0, |w| w.leaf),
         pgid: r.pgid,
         birth: r.leader.1,
-        exe: r.exe.clone(),
+        exe: comm_word(&r.exe),
         task: r.task.clone(),
         quiet_ms: r.quiet_ms.unwrap_or(0),
         wait: r.named.as_ref().map(|n| n.word.word().to_string()),
     }
+}
+
+/// The bytes of a program's file name the kernel's short name keeps: Linux's `comm` holds 15
+/// (`TASK_COMM_LEN` less its NUL), and macOS's `p_comm` 16 (`MAXCOMLEN`), the cut used elsewhere.
+pub(crate) const COMM_BYTES: usize = if cfg!(target_os = "linux") { 15 } else { 16 };
+
+/// A row's `exe` (its executable's basename, `JobRow::exe`) cut to [`COMM_BYTES`], back to a
+/// character boundary: a test binary's `aterm_gui-e0964a1b2c3d4e5f` is said `aterm_gui-e0964a` on
+/// macOS, its `p_comm` ([`BackgroundCall::exe`]), and a file name past the canary's 32 bytes is
+/// still said.
+fn comm_word(exe: &str) -> String {
+    let end = exe
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .take_while(|end| *end <= COMM_BYTES)
+        .last()
+        .unwrap_or(0);
+    exe.get(..end).unwrap_or_default().to_owned()
 }
 
 /// How long until the next pass after one whose demand was `demand`: the
@@ -379,7 +398,7 @@ fn next_pass_ms(demand: Demand) -> u64 {
     demand.every_ms().unwrap_or(FAST_MS).max(FAST_MS)
 }
 
-/// HOW SOON A READING NO WINDOW SHOWS IS DUE AGAIN after one that gave `view` (the hung-call design's D1, "while any agent-call job is suspect"; leftover §9): while a live agent call (any consumer) stands suspect (`Standing::Capable | Capped`, the only rows that accrue φ; every `no_progress` row is one), the engine's own cadence ([`next_pass_ms`] of its `Demand`); else `None`, and the disk watch's next look reads.
+/// HOW SOON A READING NO WINDOW SHOWS IS DUE AGAIN after one that gave `view` (the hung-call design's D1, "while any agent-call job is suspect"; leftover §9): while a live agent call (any consumer) stands suspect (`Standing::Capable | Capped`, the only rows that accrue φ; every `no_progress` row is one), the engine's own cadence ([`next_pass_ms`] of its `Demand`); else `None`, and the next reading is `vitals_host::job_demand_after`'s (a live job at the view's own `Demand`) or the disk watch's next look.
 pub(crate) fn windowless_after(view: &JobsView) -> Option<Duration> {
     let suspect = view.rows.iter().any(|r| {
         r.kind == JobKind::AgentCall
@@ -388,6 +407,17 @@ pub(crate) fn windowless_after(view: &JobsView) -> Option<Duration> {
     });
     (suspect && view.demand != Demand::Idle)
         .then(|| Duration::from_millis(next_pass_ms(view.demand)))
+}
+
+/// How far past the engine's cadence a window's reading lands while [`told_after`] paces it.
+const TOLD_BEAT: Duration = Duration::from_millis(250);
+
+/// HOW SOON A WINDOW'S READING IS DUE AGAIN while a live agent call of `view` reads `no_progress` (what `harness_host::WorkerIdle::facts` tells, only from a view no older than the facts gate, `aterm_agent::supervise::facts::FACT_FRESH_MS`, 5 s): a beat ([`TOLD_BEAT`]) past the engine's own cadence, so each reading lands past the pass's due and runs it while staying the bars' paced reading (its split still ticks); else `None`, and the window's own cadence stands. A background window's 5 s never meets the gate: each ask is paced from the last, then read and adopted.
+pub(crate) fn told_after(view: &JobsView) -> Option<Duration> {
+    view.rows
+        .iter()
+        .any(|r| background_call_live(r) && r.no_progress)
+        .then(|| Duration::from_millis(next_pass_ms(view.demand)) + TOLD_BEAT)
 }
 
 /// The engine's tabs from the host's request: its session key, the number
@@ -564,10 +594,11 @@ fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
 pub(crate) mod tests {
     use super::*;
 
-    /// The engine's cadence, and with no window the reading's: while a live
-    /// agent call stands, the engine's demand (2 s fast, 30 s slow); an idle
-    /// engine, an exited call or jobs that are no agent's ask nothing before
-    /// the disk watch's next look.
+    /// The engine's cadence, and with no window the suspect rule's: while a
+    /// live agent call stands suspect, the engine's demand (2 s fast, 30 s
+    /// slow); an idle engine, an exited, running or listening call and jobs
+    /// that are no agent's ask nothing of it (a live job is still read at its
+    /// own demand, through `vitals_host::job_demand_after`).
     #[test]
     fn the_engine_is_asked_again_at_its_own_cadence_never_faster_than_two_seconds() {
         assert_eq!(next_pass_ms(Demand::Fast), 2_000);
@@ -603,6 +634,27 @@ pub(crate) mod tests {
         assert_eq!(windowless_after(&view(Vec::new(), Demand::Idle)), None);
         assert_eq!(windowless_after(&view(vec![running], Demand::Fast)), None);
         assert_eq!(windowless_after(&view(vec![serving], Demand::Slow)), None);
+        let beat = |ms| Some(Duration::from_millis(ms));
+        assert_eq!(told_after(&view(vec![call()], Demand::Fast)), beat(2_250));
+        let mut moving = call();
+        moving.no_progress = false;
+        assert_eq!(told_after(&view(vec![moving], Demand::Fast)), None);
+    }
+
+    /// THE CANARY SAYS THE KERNEL'S SHORT NAME: a row naming an integration
+    /// test binary by its whole file name (38 bytes, past the canary's 32) is
+    /// said by its first [`COMM_BYTES`], as the kernel's short name holds it,
+    /// never as `-`; a short name is said whole and a multi-byte one is cut on
+    /// a character.
+    #[test]
+    fn the_canary_names_a_call_by_the_kernels_short_name() {
+        let said =
+            |exe: &str| background_call(&call_row(4, Consumer::Agent, true, 31, 27098, exe)).exe;
+        let long = "conformance_occupancy-0123456789abcdef";
+        assert_eq!(said(long), long[..COMM_BYTES]);
+        assert_eq!(said("python3"), "python3");
+        let split = format!("{}\u{e9}x", "a".repeat(COMM_BYTES - 1));
+        assert_eq!(said(&split), "a".repeat(COMM_BYTES - 1));
     }
 
     /// An agent's call in tab `tab` read `no_progress` (or not), by `consumer`,
@@ -686,7 +738,7 @@ pub(crate) mod tests {
                 pid: 27098,
                 pgid: 27090,
                 birth: None,
-                exe: "aterm_gui-e0964a".into(),
+                exe: "aterm_gui-e0964a"[..COMM_BYTES].into(),
                 task: Some("bplle5dxj".into()),
                 quiet_ms: 31 * 60_000,
                 wait: Some("timer".into()),

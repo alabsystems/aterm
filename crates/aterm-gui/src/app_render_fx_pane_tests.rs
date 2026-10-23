@@ -13,7 +13,6 @@ use aterm_render::Frame;
 use super::*;
 use crate::pane::PaneRect;
 
-/// A pane-local layer of one rect `(x, y, w, h)`.
 fn pane_layer(id: u64, (x, y, w, h): (i32, i32, u16, u16), space: FxSpace) -> FxLayer {
     FxLayer::new(
         id,
@@ -27,7 +26,6 @@ fn pane_layer(id: u64, (x, y, w, h): (i32, i32, u16, u16), space: FxSpace) -> Fx
     )
 }
 
-/// A two-pane vertical split under a one-row tab strip, its panes laid out.
 fn split_app() -> (App, WindowId, Vec<PaneRect>) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -48,9 +46,6 @@ fn split_app() -> (App, WindowId, Vec<PaneRect>) {
     (app, wid, rects)
 }
 
-/// Install `layers` (pane-local) for `pane` into the window's freshly
-/// composed frame through the shared projection, then splice the strip, as a
-/// composed redraw orders them; render it.
 fn frame_with(
     app: &mut App,
     wid: WindowId,
@@ -89,7 +84,6 @@ fn frame_with(
     r.render_input(&input)
 }
 
-/// The projection with no cursor stream, carrying `layers`.
 fn project(dst: &mut RenderInput, clip: Option<ComposedCursorEffectClip>, layers: &[FxLayer]) {
     project_focused_composed_cursor_effects(
         dst,
@@ -111,7 +105,6 @@ fn project(dst: &mut RenderInput, clip: Option<ComposedCursorEffectClip>, layers
     );
 }
 
-/// The pixels that differ between two frames of one size, as `(x, y)`.
 fn changed(a: &Frame, b: &Frame) -> Vec<(usize, usize)> {
     assert_eq!((a.width, a.height), (b.width, b.height));
     (0..a.pixels.len())
@@ -120,13 +113,6 @@ fn changed(a: &Frame, b: &Frame) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// THE PLACEMENT LAW, for each pane of a split under a tab strip: a layer
-/// authored larger than its pane on every side lights exactly the pane's box
-/// of cells (its corners included, nothing beyond, the sibling untouched); a
-/// one-cell probe at `(0, 0)` lights exactly the pane's top-left cell; a
-/// Grid-space twin is byte for byte the Window-space layer; installing the
-/// same layers twice installs them once; and with no pane they are
-/// withdrawn.
 #[test]
 fn a_panes_fx_layers_land_at_its_corner_and_stay_in_its_box() {
     let (mut app, wid, panes) = split_app();
@@ -272,9 +258,6 @@ fn a_panes_fx_layers_land_at_its_corner_and_stay_in_its_box() {
     assert!(dst.fx_layers.is_empty(), "no pane, no light");
 }
 
-/// The placement's arithmetic, exactly: offset plus the origin of the
-/// layer's space; the clip moved with it and cut to the pane box, the Grid
-/// box being the window box moved by the grid-to-window difference.
 #[test]
 fn the_placement_moves_offset_and_clip_by_the_pane_origin() {
     let placement = PaneFxPlacement {
@@ -308,10 +291,6 @@ fn same(a: &[Arc<FxArt>], b: &[&Arc<FxArt>]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y))
 }
 
-/// THE HINT SEAM: a present hands the renderer exactly what was queued (a
-/// stale list in the scratch is replaced); one that reached the renderer
-/// consumes them, so no later frame re-sends them; one that did not queues
-/// them again ahead of what was queued since.
 #[test]
 fn a_hint_reaches_one_present_that_reaches_the_renderer() {
     let (a, b, c) = (art(1), art(2), art(3));
@@ -335,10 +314,6 @@ fn a_hint_reaches_one_present_that_reaches_the_renderer() {
     );
 }
 
-/// The seam on the real redraw path (a scripted CPU surface): a queue is
-/// deduplicated by identity; a hint-only frame is not proved unchanged (the
-/// gate a plain repeat redraw takes) and consumes the hints; a frame whose
-/// present fails keeps them for the next.
 #[test]
 fn queued_hints_ride_the_next_present_through_a_dropped_one() {
     use crate::present::scripted::ScriptedOutcome;
@@ -378,10 +353,6 @@ fn queued_hints_ride_the_next_present_through_a_dropped_one() {
     );
 }
 
-/// The split twin of [`queued_hints_ride_the_next_present_through_a_dropped_one`]:
-/// a composed window has its own repaint gate (`redraw_compose`), and a
-/// hint-only frame must pass it too, or the hints would wait in the queue
-/// until something else moved.
 #[test]
 fn queued_hints_ride_a_split_windows_next_present() {
     use crate::scripted_redraw_fixture::scripted_app;

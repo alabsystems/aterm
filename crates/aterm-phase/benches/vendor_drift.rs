@@ -75,7 +75,6 @@ pub(crate) fn looks_like_a_build(bytes: &[u8]) -> bool {
             .get(..4)
             .is_some_and(|head| MAGICS.iter().any(|magic| magic == head))
 }
-/// Below this, a file that is no native executable is a stub script.
 const MIN_BUILD_BYTES: usize = 4 * 1024 * 1024;
 
 /// Resolve [`canary_path`] for `program` from `$<env>` or `aterm pkg which`.
@@ -92,8 +91,6 @@ pub(crate) fn canary_binary(program: &str, env: &str) -> Option<std::path::PathB
     canary_path(text.lines().next()?, home.as_deref())
 }
 
-/// A real managed vendor build; a reroute stub or unreadable entry cannot
-/// decide a drift check. Version records are read separately, never by spawning.
 fn store_binary(program: &str, env: &str) -> Option<(String, Vec<u8>)> {
     let path = canary_binary(program, env)?.to_string_lossy().into_owned();
     let bytes = std::fs::read(&path).ok()?;
@@ -223,8 +220,6 @@ fn literal_anchors_in_build(path: &str, bytes: &[u8], table: &[Anchor]) -> Outco
     ))
 }
 
-/// Where the Gemini CLI canary looks: `$ATERM_GEMINI_BIN`, else the first
-/// `gemini` on PATH, else Homebrew's link.
 fn gemini_bin() -> Option<std::path::PathBuf> {
     if let Some(path) = std::env::var_os("ATERM_GEMINI_BIN") {
         return Some(path.into());
@@ -240,18 +235,9 @@ fn gemini_bin() -> Option<std::path::PathBuf> {
 fn every_literal_anchor_is_in_the_store_claude() -> Outcome {
     literal_anchors_are_in_the_store("claude", "ATERM_CLAUDE_BIN", ANCHORS)
 }
-/// The step fold's keys ([`TRANSCRIPT_KEYS`]) in the store's Claude Code
-/// build: a build that renamed one writes rows the fold misreads. The
-/// build is grepped, never started.
 fn every_transcript_key_is_in_the_store_claude() -> Outcome {
     literal_anchors_are_in_the_store("claude", "ATERM_CLAUDE_BIN", TRANSCRIPT_KEYS)
 }
-/// The Codex step fold's keys ([`ROLLOUT_KEYS`]) in the store's Codex
-/// build (`$ATERM_CODEX_BIN`, else `aterm pkg which codex`; its version
-/// from atpkg's record, the build never started), as Claude Code's
-/// transcript keys are: a build that renamed one writes rows the fold
-/// misreads. `CANARY NOT RUN` where no build is found. NEGATIVE
-/// CONTROL: where one is, a planted key no build holds is named missing.
 fn every_rollout_key_is_in_the_store_codex() -> Outcome {
     let Some((path, bytes)) = store_binary("codex", "ATERM_CODEX_BIN") else {
         return Outcome::CouldNotRun(
@@ -270,11 +256,6 @@ fn every_rollout_key_is_in_the_store_codex() -> Outcome {
     outcome
 }
 
-/// The drift check for [`reset_templates`], admitted by [`store_binary`].
-/// NOT gated on the build's version: the readers read one build's wording,
-/// the store's, so the store's build
-/// owes every template. NEGATIVE CONTROL: a template of a kind no build
-/// names is named missing.
 fn every_reset_template_is_whole_in_the_store_claude() -> Outcome {
     let Some((path, bytes)) = store_binary("claude", "ATERM_CLAUDE_BIN") else {
         return Outcome::CouldNotRun(
@@ -321,8 +302,6 @@ fn every_literal_agy_anchor_is_in_the_store_agy() -> Outcome {
 fn every_literal_muse_anchor_is_in_the_store_muse() -> Outcome {
     literal_anchors_are_in_the_store("muse", "ATERM_MUSE_BIN", MUSE_ANCHORS)
 }
-/// Gemini's npm package is read as files, including every adjacent .js chunk.
-/// Absence is a typed refusal, like any other missing vendor build.
 fn every_literal_gemini_anchor_is_in_its_bundle() -> Outcome {
     let Some((dir, bytes, version)) = gemini_bin().as_deref().and_then(gemini_bundle) else {
         return Outcome::CouldNotRun(
@@ -367,16 +346,7 @@ fn every_literal_gemini_anchor_is_in_its_bundle() -> Outcome {
     ))
 }
 
-/// THE DRIFT CANARY FOR THE PHRASE TABLE. The reader names a wall by
-/// [`PHRASES`], and a vendor build that words a notice differently reads
-/// as no wall — behind a shell, as `busy` for as long as the shell runs.
-/// Every row (lowercased) must be in the
-/// store claude's binary, but for the rows older builds carry and neither
-/// 2.1.283 nor 2.1.284 does (measured). The explicit bench resolves
-/// `$ATERM_CLAUDE_BIN` or `aterm pkg which claude`; absence is CouldNotRun.
 fn every_wall_phrase_is_in_the_store_claude() -> Outcome {
-    /// Rows of [`PHRASES`] that older builds carry and 2.1.283 and 2.1.284
-    /// do not (`strings -a` of both, 2026-09-28).
     const OLDER_BUILDS: &[&str] = &[
         "repeated overloaded errors",
         "weekly rate limit",
@@ -385,9 +355,6 @@ fn every_wall_phrase_is_in_the_store_claude() -> Outcome {
         "reached your limit",
         "limit will reset",
     ];
-    /// Rows whose words are the API's own, which Claude Code only passes
-    /// on (`API Error: <its message>`): no build carries them (anchors.rs,
-    /// `wall.refused.identity`, `wall.refused.dlp`).
     const SERVER_WORDS: &[&str] = &["verify your identity", "data loss prevention"];
     let Some((path, bytes)) = store_binary("claude", "ATERM_CLAUDE_BIN") else {
         return Outcome::CouldNotRun(

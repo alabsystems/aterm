@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// STOCK EXCEPTION: Windows only, and Trust has no Windows std, so only stock Rust builds this (the
+// Windows lane's guest pins its version: `aterm-lab/src/windows_guest.rs`).
 #![cfg(windows)]
 
 #[expect(

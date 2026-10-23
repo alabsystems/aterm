@@ -17,7 +17,7 @@ use aterm_aos::{ArtifactId, ArtifactKind, Digest, Revision};
 use crate::toy::{
     TICK_CLEARS, ToyInput, ToyObs, ToySchema, ToyState, Variant, adds, apply, attached,
     boundary_over, code, contract, feed, fold, identity, judged_by, live, live_with,
-    mislabelled_code, other_contract,
+    mislabelled_code, other_contract, policy_labelled_code,
 };
 
 use ToyInput::{Add, Tick};
@@ -527,6 +527,12 @@ fn a_candidate_whose_artifact_is_not_code_is_refused() {
         b.prepare(mislabelled_code()).err(),
         Some(PublishRefusal::NotCode {
             kind: ArtifactKind::Contract
+        })
+    );
+    assert_eq!(
+        b.prepare(policy_labelled_code()).err(),
+        Some(PublishRefusal::NotCode {
+            kind: ArtifactKind::Policy
         })
     );
 }

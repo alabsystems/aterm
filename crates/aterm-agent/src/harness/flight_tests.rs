@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the flight fold and mapping ([`super`]).
+//! The flight fold and the mapping ([`super`]).
 
 use super::*;
 use aterm_phase::agents_panel::parse_row;
 use std::path::Path;
 
-/// A measured transcript of `testdata/flight/`, its rows (the header left out).
 fn rows(name: &str) -> Vec<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src/harness/testdata/flight")
@@ -20,7 +19,6 @@ fn rows(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// A measured screen of `aterm-phase`'s fixtures, row by row.
 fn screen(name: &str) -> Vec<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../aterm-phase/src/fixtures")
@@ -32,7 +30,6 @@ fn screen(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// The fold of `rows`.
 fn fold(rows: &[String]) -> FlightFold {
     let mut fold = FlightFold::new();
     for row in rows {
@@ -41,14 +38,10 @@ fn fold(rows: &[String]) -> FlightFold {
     fold
 }
 
-/// Unix ms of an RFC 3339 stamp.
 fn ms(stamp: &str) -> i64 {
     crate::harness::codex_rollout::stamp_ms(stamp).unwrap()
 }
 
-/// MEASURED: `long probe`'s one call, `sleep 300` with `timeout: 400000`, is
-/// in flight from its row to its result's, then the model's, then done; its
-/// start is its first row's. Control: before its row, nothing is known.
 #[test]
 fn the_measured_long_call_is_in_flight_until_its_result() {
     let rows = rows("claude-2.1.304-long-bash.jsonl");
@@ -67,8 +60,6 @@ fn the_measured_long_call_is_in_flight_until_its_result() {
     assert_eq!(fold(&rows).flight(), FileFlight::Done, "its turn ended");
 }
 
-/// MEASURED: `bg probe`'s Bash went to the background and is never in
-/// flight. Control: the same row without `run_in_background` is.
 #[test]
 fn a_background_call_is_never_in_flight() {
     let rows = rows("claude-2.1.304-bg-bash.jsonl");
@@ -84,7 +75,6 @@ fn a_background_call_is_never_in_flight() {
     assert_eq!(fold(&rows).flight(), FileFlight::Done);
 }
 
-/// A call row of message `msg`, call `id`, tool `name`, input `input`, at second `s` past 10:00.
 fn call_row(msg: &str, id: &str, name: &str, input: &str, s: u32) -> String {
     format!(
         "{{\"type\":\"assistant\",\"message\":{{\"id\":\"{msg}\",\"stop_reason\":\"tool_use\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"{name}\",\"input\":{input}}}]}},\"timestamp\":\"2026-10-20T10:{:02}:{:02}.000Z\"}}",
@@ -93,7 +83,6 @@ fn call_row(msg: &str, id: &str, name: &str, input: &str, s: u32) -> String {
     )
 }
 
-/// The result row of call `id`.
 fn result_row(id: &str) -> String {
     format!(
         "{{\"type\":\"user\",\"message\":{{\"content\":[{{\"tool_use_id\":\"{id}\",\"type\":\"tool_result\",\"content\":\"\"}}]}},\"timestamp\":\"2026-10-20T10:59:00.000Z\"}}"
@@ -102,7 +91,6 @@ fn result_row(id: &str) -> String {
 
 const PROMPT: &str = "{\"type\":\"user\",\"message\":{\"content\":\"[stand-in prompt]\"},\"timestamp\":\"2026-10-20T10:00:00.000Z\"}";
 
-/// Builds a text row for message `msg` with optional `stop` reason.
 fn text_row(msg: &str, stop: Option<&str>, s: u32) -> String {
     let stop = stop.map_or_else(|| "null".to_owned(), |stop| format!("\"{stop}\""));
     format!(
@@ -112,14 +100,6 @@ fn text_row(msg: &str, stop: Option<&str>, s: u32) -> String {
     )
 }
 
-/// THE WAYS A WORKFLOW'S AGENT ENDS (the shapes MEASURED on one run of 22
-/// agents): on its answered [`FINAL_TOOL`] call with no
-/// assistant row after it, or on a text row whose turn stops on
-/// `stop_sequence` (or `max_tokens`, `refusal`): each is done, so a run
-/// whose other agent sits in a long Bash call waits on that call, not on
-/// the model. An assistant row read for its kind alone says the model's
-/// turn. CONTROLS: an errored output's result is the model's turn again, as
-/// any other answered call is.
 #[test]
 fn an_agent_ends_on_its_answered_output_or_its_stop() {
     let output = [
@@ -188,9 +168,6 @@ fn budget_of(rows: &[String]) -> u64 {
     }
 }
 
-/// A Bash call's budget is its declared timeout, at most Bash's maximum, or
-/// Bash's default; every other tool's is the default, whatever it declares
-/// (control: the same `timeout` on Bash buys it).
 #[test]
 fn a_calls_budget_is_its_own_declared_timeout() {
     let with =
@@ -212,8 +189,6 @@ fn a_calls_budget_is_its_own_declared_timeout() {
     assert_eq!(budget_of(&with("Read", "{}")), DEFAULT_BUDGET_MS);
 }
 
-/// Of parallel calls, the first to outlive its budget is the one shown;
-/// answering it shows the next. A new message answers every older call.
 #[test]
 fn parallel_calls_show_the_first_due_and_a_new_message_answers_them() {
     let rows = vec![
@@ -236,8 +211,6 @@ fn parallel_calls_show_the_first_due_and_a_new_message_answers_them() {
     assert_eq!(call.tool.as_str(), "Read", "m1's calls were answered");
 }
 
-/// A message with more calls than kept, or a row too long to read, leaves
-/// the file unknown until its next message; [`FLIGHT_MAX`] calls are kept.
 #[test]
 fn what_cannot_be_kept_leaves_the_file_unknown_until_the_next_message() {
     let many = |n: usize| {
@@ -264,9 +237,6 @@ fn what_cannot_be_kept_leaves_the_file_unknown_until_the_next_message() {
     assert!(matches!(long.flight(), FileFlight::Tool(_)));
 }
 
-/// A row is read only where its bytes may hold a call, a result or a turn's
-/// end — a `\u` escape spelling a key included (control: the same row with
-/// its key spelt out); a restart forgets everything and moves on.
 #[test]
 fn escaped_keys_are_read_and_a_restart_forgets() {
     let row = call_row("m1", "c1", "Bash", "{}", 1);
@@ -286,7 +256,6 @@ fn escaped_keys_are_read_and_a_restart_forgets() {
     assert!(f.generation() > generation);
 }
 
-/// Claude Code's own normalisations, as 2.1.304 writes them.
 #[test]
 fn panel_text_and_slugs_are_claude_codes() {
     assert_eq!(panel_text("  long\tprobe \n now "), "long probe now");
@@ -297,7 +266,6 @@ fn panel_text_and_slugs_are_claude_codes() {
     assert_eq!(cells("a中b"), "a中 b");
 }
 
-/// The panel rows of a measured screen, each with its key.
 fn keyed(screen: &[String]) -> (Vec<String>, Vec<Option<RowKey>>) {
     let bottom = aterm_phase::phase::composer_bottom(screen).expect("a composer");
     let panel = crate::harness::footer::agents_panel_under(screen, bottom).expect("a panel");
@@ -311,7 +279,6 @@ fn keyed(screen: &[String]) -> (Vec<String>, Vec<Option<RowKey>>) {
     (names, keys)
 }
 
-/// Writes measured `long probe` and `bg probe` fixture files up to `rows_read`.
 fn run1_table(rows_read: usize) -> FlightTable {
     let long = rows("claude-2.1.304-long-bash.jsonl");
     let bg = rows("claude-2.1.304-bg-bash.jsonl");
@@ -335,15 +302,10 @@ fn run1_table(rows_read: usize) -> FlightTable {
     }
 }
 
-/// The measured panel's row whose text holds `name`.
 fn row_of(names: &[String], name: &str) -> usize {
     names.iter().position(|r| r.contains(name)).unwrap()
 }
 
-/// MEASURED: at `2m 37s` `long probe`'s row is its file's, waiting in Bash
-/// 157 s into a call that has 273 s of its budget left. `bg probe`'s clock
-/// stands at `0s` (its turn is done; Claude draws end − start), so it implies
-/// no start its file agrees with: unknown, the screen's rules alone.
 #[test]
 fn the_measured_rows_map_to_their_own_files() {
     let screen = screen("claude-2.1.304-agents-panel-long-bash-2m37s-120col.txt");
@@ -370,10 +332,6 @@ fn the_measured_rows_map_to_their_own_files() {
     assert_eq!(place(&keys, &run1_table(3), now)[long], Flight::Model);
 }
 
-/// A row maps only by exact agreement: another activity, another name, a
-/// start outside the clock's resolution and the slack, two files that both
-/// agree, or two rows that both take one file — each leaves it unknown.
-/// Control: the measured agreement maps.
 #[test]
 fn a_row_maps_only_by_exact_agreement() {
     let screen = screen("claude-2.1.304-agents-panel-long-bash-2m37s-120col.txt");
@@ -425,9 +383,6 @@ fn a_row_maps_only_by_exact_agreement() {
     );
 }
 
-/// A row whose activity Claude cut with `…` maps by its prefix (control: a
-/// prefix the description does not start with), and a wide glyph's right
-/// half is a space of the pane's text.
 #[test]
 fn a_cut_activity_maps_by_its_prefix_in_cells() {
     let start = 1_000_000_000_000i64;
@@ -459,9 +414,6 @@ fn a_cut_activity_maps_by_its_prefix_in_cells() {
     );
 }
 
-/// MEASURED: the workflow's row is its run's by its slug and its script's
-/// start; its run waits on `long`'s call while `quick` is done (control:
-/// with `long` answered, the run is done and its row the model's).
 #[test]
 fn the_measured_workflow_row_maps_to_its_run() {
     let screen = screen("claude-2.1.304-agents-panel-workflow-long-bash-2m46s-120col.txt");
@@ -487,8 +439,6 @@ fn the_measured_workflow_row_maps_to_its_run() {
     assert_eq!(place(&keys, &table(4), now)[wf], Flight::Model);
 }
 
-/// A run is unknown if any of its agents is, the model's while any is in
-/// its turn, else waiting on the first call due, else done.
 #[test]
 fn a_runs_flight_combines_its_agents() {
     let call = |budget_ms| Call {
@@ -505,10 +455,6 @@ fn a_runs_flight_combines_its_agents() {
     assert_eq!(combine([]), Done);
 }
 
-/// A tool's name is kept to its bound: whole where it fits (its bound
-/// exactly, too), else cut at a char boundary and ended with `…`, so a cut
-/// name is never shown or compared as a whole one. NEGATIVE CONTROL: the
-/// name cut bare at the bound is not what is kept.
 #[test]
 fn a_tool_name_is_kept_inline_and_a_cut_one_says_so() {
     assert_eq!(ToolName::of("Bash").as_str(), "Bash");

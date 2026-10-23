@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! install.sh's embedded Linux verifier (`linux_release_verify_python`) held to the
-//! updater ([`HARNESS`], [`crate::chain`]).
-//!
-//! The embedded verifier is Python 3.11+ and OpenSSL 3, which only the Linux guest
-//! provides (`TOOLS`' python3 and openssl3 rows), so this module is Linux's: the static
-//! verifier that replaces it is held to the same corpus by
-//! crates/aterm-bootstrap-verify/tests/install_sh on every host.
+//! `install.sh`'s embedded Linux verifier (`linux_release_verify_python`) held to the updater.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,8 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::chain::{self, Answer, Case, Laid, PolicyAnswer, PolicyView};
 use crate::support::{Lib, Scratch, chmod, install_sh, q, run, s, symlink, system_path};
 
-/// Runs the verifier the installer pipes to `python3 -`. `run`: the script as
-/// `__main__` with its master pin replaced, exit status and all.
+/// Python harness that drives the verifier piped to `python3 -`.
 const HARNESS: &str = r#"import contextlib, errno, io, json, os, sys, types
 source = sys.stdin.read()
 marker = "\nMASTER_PUBKEYS = "
@@ -82,15 +75,13 @@ with open(os.environ["STUB_CALLS"], encoding="utf-8") as calls:
                 verifier[target] = kept
 "#;
 
-/// The verifier's own floor: Python 3.11+ (tomllib, `hashlib.file_digest`) and
-/// an OpenSSL 3 (`pkeyutl -rawin` over Ed25519; macOS's LibreSSL has none).
+/// Python 3.11+ and OpenSSL 3 binaries for the verifier.
 struct Tools {
     python: PathBuf,
     openssl: PathBuf,
 }
 
-/// Where the verifier's tools are looked for: each list in order, the first candidate
-/// that meets the floor taken.
+/// Candidate paths for the verifier's Python and OpenSSL tools.
 #[derive(Default)]
 struct Search {
     python: Vec<PathBuf>,
@@ -116,9 +107,7 @@ impl Search {
     }
 }
 
-/// `row`'s candidates: `$ATERM_TEST_<ROW>` alone when it is set (an operator's choice is
-/// never passed over for another), else the row's usual paths, then each of `names` on
-/// `$PATH`.
+/// Candidate paths for `row` (`$ATERM_TEST_<ROW>` if set, else default paths and `$PATH`).
 fn candidates(row: &str, names: &[&str]) -> Vec<PathBuf> {
     let row = aterm_uds::host::tool(row);
     if let Some(named) = std::env::var_os(row.var()) {
@@ -129,8 +118,7 @@ fn candidates(row: &str, names: &[&str]) -> Vec<PathBuf> {
     found
 }
 
-/// The first of `search`'s candidates that meets the floor, or the `TOOLS` rows of the
-/// ones no candidate meets.
+/// First candidate in `search` meeting the floor, or the missing `TOOLS` rows.
 fn tools_in(search: &Search) -> Result<Tools, Vec<&'static str>> {
     let python = search.python.iter().find(|python| {
         python.is_file()
@@ -164,9 +152,7 @@ fn tools_in(search: &Search) -> Result<Tools, Vec<&'static str>> {
     }
 }
 
-/// The installer's embedded verifier, reachable from a batch: `python3` is the harness
-/// over the found Python, `openssl` the found OpenSSL 3, and the script is install.sh (or
-/// a broken copy of it, for a negative control).
+/// Embedded verifier harness bound to a script and toolset.
 struct Embedded {
     bin: PathBuf,
     python: PathBuf,
@@ -174,7 +160,7 @@ struct Embedded {
 }
 
 impl Embedded {
-    /// install.sh's verifier under `scratch`, over this host's tools.
+    /// `install.sh`'s verifier under `scratch`, over this host's tools.
     fn new(scratch: &Scratch) -> Self {
         Self::of(scratch, &install_sh())
     }
@@ -184,10 +170,7 @@ impl Embedded {
         Self::with(scratch, &Search::host(), script)
     }
 
-    /// `script`'s verifier under `scratch`, over the tools `search` finds. A host without
-    /// them ends the test COULD NOT RUN saying what is missing (their `TOOLS` rows'
-    /// refusals): never a pass, and never a FAIL, which would charge the installer with
-    /// the host's gap.
+    /// `script`'s verifier under `scratch`, ending `COULD NOT RUN` if tools are absent.
     fn with(scratch: &Scratch, search: &Search, script: &Path) -> Self {
         let tools = tools_in(search).unwrap_or_else(|absent| {
             aterm_uds::host::could_not_run_without(&absent);
@@ -221,8 +204,7 @@ impl Embedded {
 
 static CALLS: AtomicU32 = AtomicU32::new(0);
 
-/// One verifier answer per call line, the batch split across threads: the heredoc in the
-/// script through its own `linux_release_verify`.
+/// Run `calls` against `verifier` across worker threads.
 fn ask_verifier(scratch: &Scratch, verifier: &Embedded, calls: &[String]) -> Vec<String> {
     ask_verifier_with(scratch, verifier, calls, &[])
 }
@@ -383,9 +365,7 @@ impl chain::Verifier for Embedded {
     }
 }
 
-/// §10 S2: with its tools looked up nowhere, the verifier ends COULD NOT RUN saying what
-/// is missing and where they are provided, never a FAIL: a host without Python 3.11+ and
-/// OpenSSL 3 did not run these tests, which is no verdict on the installer.
+/// Without Python 3.11+ and OpenSSL 3, the verifier ends `COULD NOT RUN`.
 #[test]
 fn a_host_without_the_verifiers_tools_ends_could_not_run() {
     let scratch = Scratch::new();
@@ -431,8 +411,7 @@ fn the_embedded_verifier_agrees_with_the_updater_on_a_generated_corpus() {
     chain::agrees_with_the_updater_on_a_generated_corpus(&scratch, &Embedded::new(&scratch));
 }
 
-/// Negative control: a copy of install.sh whose verifier forgets the durable revocation
-/// set is caught.
+/// Negative control: dropping the durable revocation check fails the differential.
 #[test]
 fn the_verifier_differential_catches_a_dropped_durable_revocation() {
     let scratch = Scratch::new();
@@ -551,10 +530,7 @@ fn the_install_path_walk_is_the_updaters_on_this_machine() {
     );
 }
 
-/// The user-private-group rule is the updater's, fact for fact: over every
-/// combination of an account, a group and the accounts that have it as their
-/// primary group (each fact known or not), the embedded verifier's
-/// `user_private_group` and the updater's answer alike.
+/// `user_private_group` agrees with the updater across account and group combinations.
 #[test]
 fn the_user_private_group_rule_is_the_updaters() {
     use aterm_update::linux::install_path::{Account, Group, user_private_group};
@@ -630,11 +606,7 @@ fn the_user_private_group_rule_is_the_updaters() {
     }
     assert!(admitted > 0, "the corpus holds a private group");
 }
-/// The access-ACL rule is the updater's, attribute for attribute, on a
-/// stand-in filesystem: over every pair of answers the two ACL attributes'
-/// length queries can give (it exists, `ENODATA`, `ENOTSUP`, another errno),
-/// the embedded verifier's `access_acl`, its `os.getxattr` standing in for
-/// the file, and the updater's `acl_carried` alike.
+/// `access_acl` agrees with the updater's `acl_carried` across `getxattr` outcomes.
 #[test]
 fn the_acl_rule_is_the_updaters_on_a_stand_in_nfs4_file() {
     use aterm_update::linux::install_path::acl_carried;
@@ -678,15 +650,7 @@ fn the_acl_rule_is_the_updaters_on_a_stand_in_nfs4_file() {
     assert!(!carried(Some(enodata), Some(enotsup)), "no ACL on ext4");
 }
 
-/// The filesystem rule is the updater's: each remote type, and the local ones
-/// beside them, is remote or not to the embedded verifier's
-/// `remote_filesystem_type` as to the updater's `remote_filesystem`; the
-/// verifier's statfs (ctypes) reads the type the updater reads on each of
-/// this machine's paths, `/proc` and the scratch root among them, and none
-/// for a path that does not exist; with no C library to read the type, the
-/// verifier counts the filesystem remote; and its install-path walk takes the
-/// private group's exemption back on a stand-in NFS type, as on an
-/// unreadable one.
+/// `remote_filesystem_type`, `filesystem_type`, and path checks agree with the updater.
 #[test]
 fn the_filesystem_rule_is_the_updaters() {
     use aterm_update::linux::install_path::{
@@ -778,10 +742,7 @@ fn the_filesystem_rule_is_the_updaters() {
     }
 }
 
-/// The passwd enumeration is the updater's on this machine's accounts: for
-/// root's group, this user's primary group and `nogroup`, the embedded
-/// verifier's `primary_members` (`getpwent_r` through ctypes) lists the uids
-/// the updater's does, in order.
+/// `primary_members` agrees with the updater's passwd enumeration on this machine.
 #[test]
 fn the_passwd_enumeration_is_the_updaters_on_this_machine() {
     use aterm_update::linux::install_path::{is_user_private_group, primary_members};

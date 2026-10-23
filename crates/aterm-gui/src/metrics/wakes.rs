@@ -8,9 +8,6 @@ use std::mem::Discriminant;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Slots in a [`WakeTable`]. `Wake` has about 184 variants; the last slot is
-/// reserved for `other`, which counts every variant seen after the rest are
-/// claimed.
 const WAKE_SLOTS: usize = 256;
 const OTHER: usize = WAKE_SLOTS - 1;
 
@@ -31,11 +28,6 @@ impl WakeTable {
         }
     }
 
-    /// The slot that counts `name`: the first slot already holding it, or
-    /// the first free one, claimed for it. Every claim scans from slot 0 and
-    /// a claimed slot never changes, so two censuses over one table (test
-    /// `App`s) share one slot per variant and a name is never listed twice.
-    /// Cold: a census calls it once per variant it sees.
     fn slot(&self, name: &str) -> usize {
         for (i, cell) in self.names[..OTHER].iter().enumerate() {
             if *cell.get_or_init(|| Box::leak(name.into())) == name {
@@ -102,12 +94,6 @@ impl WakeCensus {
     }
 }
 
-// Extracts the leading identifier of `ev`'s `Debug` output without formatting payload fields.
-/// The leading identifier of `ev`'s `Debug` spelling, which for a derived
-/// `Debug` is the variant's name. The writer takes identifier bytes and
-/// returns `Err` at the first other byte (` {`, `(`), and the derived impl
-/// stops at that error before it formats a field, so the payload is never
-/// formatted: a `Wake` can carry a whole document's bytes.
 fn variant_name(ev: &dyn fmt::Debug) -> String {
     struct LeadingIdent(String);
     impl fmt::Write for LeadingIdent {
@@ -138,7 +124,6 @@ mod tests {
         Box::leak(Box::new(WakeTable::new()))
     }
 
-    /// A payload that counts the times its `Debug` runs.
     struct Probe<'a>(&'a Cell<u32>);
     impl std::fmt::Debug for Probe<'_> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

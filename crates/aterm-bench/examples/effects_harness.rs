@@ -13,7 +13,9 @@ use aterm_effects::harness_card::{
     card_layer_id, dark_ground,
 };
 use aterm_gpu::gpu_time::{self, Settled};
-use aterm_gpu::{FrameShape, GpuContext, GpuRenderer, UnormAblation, WindowGpu};
+use aterm_gpu::{
+    FetchProbe, FrameShape, GpuContext, GpuRenderer, UnormAblation, UnormRoute, WindowGpu,
+};
 use aterm_render::{GlowQuad, RenderInput, Renderer, Theme, WindowCpu};
 
 const FONT_PX: f32 = 30.0;
@@ -56,6 +58,14 @@ const LINE_ROW: u16 = 3;
 const LINE_STAR_COL: u16 = 12;
 const LINE_COL: u16 = LINE_STAR_COL + 2;
 const LINE_TEXT: &str = "Cruise: the kitty keeps watch while the reply streams";
+
+/// `--light`: every scene on a light ground, the card in its light palette.
+const LIGHT: Theme = Theme {
+    fg: 0x0020_2020,
+    bg: 0x00F4_F1EA,
+    cursor: 0x0050_FA7B,
+    selection: 0x0033_415E,
+};
 
 const CARD_TOP: u16 = 2;
 const SCROLL_TOP: u16 = 20;
@@ -183,6 +193,16 @@ fn set_ablation(_: &mut GpuRenderer, _: UnormAblation) {
 }
 
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
+fn set_route(gpu: &mut GpuRenderer, route: UnormRoute) {
+    gpu.set_unorm_route(route);
+}
+
+#[cfg(not(any(debug_assertions, feature = "dev-seams")))]
+fn set_route(_: &mut GpuRenderer, _: UnormRoute) {
+    fail(NO_SEAM);
+}
+
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
 fn set_clocked(clocked: bool) {
     gpu_time::set_paused(!clocked);
 }
@@ -196,29 +216,44 @@ fn set_clocked(_: bool) {
 struct Way {
     ablation: UnormAblation,
     clocked: bool,
+    /// The route the way asks for: the shipped one, or the split a fetch-capable device skips.
+    route: UnormRoute,
     name: &'static str,
 }
 
-const WAYS: [Way; 4] = [
+/// How each frame is presented, in turn: the shipped plan, the two ablations, the shipped plan
+/// with the GPU clock paused, and the shipped plan kept on the split (the Unorm-law light in
+/// passes of its own, as before the framebuffer-fetch route), which prices the route in place.
+const WAYS: [Way; 5] = [
     Way {
         ablation: UnormAblation::Off,
         clocked: true,
+        route: UnormRoute::Fetch,
         name: "off",
     },
     Way {
         ablation: UnormAblation::Thin,
         clocked: true,
+        route: UnormRoute::Fetch,
         name: "thin",
     },
     Way {
         ablation: UnormAblation::Drop,
         clocked: true,
+        route: UnormRoute::Fetch,
         name: "drop",
     },
     Way {
         ablation: UnormAblation::Off,
         clocked: false,
+        route: UnormRoute::Fetch,
         name: "untimed",
+    },
+    Way {
+        ablation: UnormAblation::Off,
+        clocked: true,
+        route: UnormRoute::Split,
+        name: "split",
     },
 ];
 
@@ -269,7 +304,7 @@ struct Sample {
     raster: Spent,
     fx_quads: u64,
     under_quads: u64,
-    arms: [Arm; 4],
+    arms: [Arm; WAYS.len()],
 }
 
 impl Sample {
@@ -284,6 +319,9 @@ impl Sample {
     }
     fn untimed(&self) -> &Arm {
         &self.arms[3]
+    }
+    fn split(&self) -> &Arm {
+        &self.arms[4]
     }
 }
 
@@ -353,7 +391,7 @@ impl Reference {
 
 struct Win {
     cpu: WindowCpu,
-    gpu: [WindowGpu; 4],
+    gpu: [WindowGpu; WAYS.len()],
 }
 
 impl Win {
@@ -407,7 +445,11 @@ impl Rig {
             env!("CARGO_MANIFEST_DIR"),
             "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
         );
-        let theme = Theme::default();
+        let theme = if std::env::args().skip(1).any(|a| a == "--light") {
+            LIGHT
+        } else {
+            Theme::default()
+        };
         let ctx = GpuContext::new().unwrap_or_else(|e| skip(format!("no GPU: {e}")));
         let raster = |what: &str| {
             let mut r = Renderer::from_system_with_family(Some(font), FONT_PX, theme)
@@ -557,11 +599,12 @@ impl Rig {
         drop(view);
         let raster = watch.stop();
 
-        let mut arms = [Arm::default(); 4];
+        let mut arms = [Arm::default(); WAYS.len()];
         for k in 0..WAYS.len() {
             let i = (k + self.frames) % WAYS.len();
             let way = WAYS[i];
             set_ablation(&mut self.gpu, way.ablation);
+            set_route(&mut self.gpu, way.route);
             set_clocked(way.clocked);
             let watch = Stopwatch::start();
             if !self
@@ -589,13 +632,15 @@ impl Rig {
             };
         }
         set_ablation(&mut self.gpu, UnormAblation::Off);
+        set_route(&mut self.gpu, UnormRoute::Fetch);
         self.frames += 1;
         if self.frames.is_multiple_of(REF_EVERY) {
             let reference = self.reference_frame();
             self.refs.push(reference);
         }
-        let [off, thin, dropped, untimed] = &arms;
+        let [off, thin, dropped, untimed, split] = &arms;
         Self::check_ablation(&off.shape, &thin.shape, &dropped.shape);
+        self.check_route(&off.shape, &split.shape);
         if (
             untimed.shape.ablation,
             untimed.shape.passes,
@@ -642,6 +687,30 @@ impl Rig {
         }
         if thin.instances != off.instances || dropped.instances != off.instances {
             fail("an ablated plan built other instances than the shipped one");
+        }
+    }
+
+    /// The shipped way took the route the device's verdict allows, and the split way the split,
+    /// drawing the same instances and Unorm-law draws.
+    fn check_route(&self, off: &FrameShape, split: &FrameShape) {
+        let want = if self.gpu.fetch_probe() == Some(FetchProbe::Passed) {
+            UnormRoute::Fetch
+        } else {
+            UnormRoute::Split
+        };
+        if off.route != want || split.route != UnormRoute::Split {
+            fail(format!(
+                "the shipped way drew on the {} route and the split way on the {} route (want {} \
+                 and split)",
+                off.route.name(),
+                split.route.name(),
+                want.name()
+            ));
+        }
+        if (split.instances, split.unorm_draws, split.unorm_instances)
+            != (off.instances, off.unorm_draws, off.unorm_instances)
+        {
+            fail("the split way drew other instances or Unorm draws than the shipped one");
         }
     }
 
@@ -1243,7 +1312,7 @@ impl Scene {
             format!("{s}_n"),
             self.runs.iter().map(|run| run.samples.len()).sum::<usize>() as u64,
         );
-        let timed: [(&str, Figure); 16] = [
+        let timed: [(&str, Figure); 19] = [
             ("emit", |x| Some(ns(x.emit.wall_ns))),
             ("emit_cpu", |x| Some(ns(x.emit.cpu_ns))),
             ("splice", |x| Some(ns(x.splice_ns))),
@@ -1262,9 +1331,12 @@ impl Scene {
             ("pass_encode", |x| {
                 Some(ns(x.thin().encode_ns) - ns(x.drop().encode_ns))
             }),
+            ("split_encode", |x| Some(ns(x.split().encode_ns))),
+            ("split_gpu", |x| x.split().gpu_ns.map(ns)),
+            ("split_present", |x| Some(ns(x.split().present_ns()))),
         ];
         for (what, f) in timed {
-            if !clocked && (what.ends_with("gpu") || what == "present") {
+            if !clocked && (what.ends_with("gpu") || what.ends_with("present")) {
                 continue;
             }
             let mut v = self.pooled(f);
@@ -1274,7 +1346,7 @@ impl Scene {
         let mut present = self.pooled(|x| Some(ns(x.off().present_ns())));
         let present_p95 = pct(&mut present, 95.0).max(1.0);
         if clocked {
-            let paired: [(&str, Figure); 3] = [
+            let paired: [(&str, Figure); 4] = [
                 ("pass_gpu", |x| {
                     Some(ns(x.thin().gpu_ns?) - ns(x.drop().gpu_ns?))
                 }),
@@ -1283,6 +1355,9 @@ impl Scene {
                 }),
                 ("unorm_draw", |x| {
                     Some(ns(x.off().present_ns()) - ns(x.thin().present_ns()))
+                }),
+                ("route_gain", |x| {
+                    Some(ns(x.split().present_ns()) - ns(x.off().present_ns()))
                 }),
             ];
             for (what, f) in paired {
@@ -1294,6 +1369,12 @@ impl Scene {
                     r.num(format!("{s}_pass_cost_pct"), 100.0 * cost / present_p95);
                     let present_p50 = pct(&mut present, 50.0).max(1.0);
                     r.num(format!("{s}_pass_cost_pct_p50"), 100.0 * cost / present_p50);
+                }
+                if what == "route_gain" {
+                    let gain = pct(&mut v, 50.0);
+                    let mut split = self.pooled(|x| Some(ns(x.split().present_ns())));
+                    let split_p95 = pct(&mut split, 95.0).max(1.0);
+                    r.num(format!("{s}_route_gain_pct"), 100.0 * gain / split_p95);
                 }
             }
             let mut clock =
@@ -1321,9 +1402,10 @@ impl Scene {
             format!("{s}_build_stage_pct"),
             100.0 * pct(&mut build_stage, 50.0) / present_p95,
         );
-        let counts: [(&str, Figure); 9] = [
+        let counts: [(&str, Figure); 10] = [
             ("passes", |x| Some(f64::from(x.off().shape.passes))),
             ("drop_passes", |x| Some(f64::from(x.drop().shape.passes))),
+            ("split_passes", |x| Some(f64::from(x.split().shape.passes))),
             (
                 "instances",
                 |x| Some(x.off().shape.total_instances() as f64),
@@ -1570,6 +1652,18 @@ fn main() {
     report.text("gpu_clock", rig.clock);
     report.text("cpu_clock", if cfg!(unix) { "thread" } else { "wall" });
     report.text("cpu_counter", rig.counter);
+    report.text(
+        "ground",
+        if dark_ground(rig.theme.bg) {
+            "dark"
+        } else {
+            "light"
+        },
+    );
+    report.text(
+        "fetch_probe",
+        rig.gpu.fetch_probe().map_or("unminted", FetchProbe::name),
+    );
     report.int("runs", RUNS as u64);
     report.int("warmup", WARMUP as u64);
     report.int("rows", ROWS as u64);
@@ -1595,7 +1689,8 @@ fn main() {
         let get = |k: &str| report.get(&format!("{}_{k}", scene.name)).to_string();
         eprintln!(
             "effects_harness: {:<8} n={} emit {} us | raster {} us | encode {}/{} us | gpu {}/{} us \
-             | passes {} (drop {}) | pass cost {} us = {}% of present p95 {} us | unorm draws {} us \
+             | passes {} (drop {}, split {}) | pass cost {} us = {}% of present p95 {} us \
+             | split present p95 {} us, route gain {} us = {}% | unorm draws {} us \
              | build+stage {}% | instances max {} (under {}) | clock {} us, {} kins \
              | rel emit {} raster {} encode {} gpu {} | kins emit {} raster {} encode {}",
             scene.name,
@@ -1608,9 +1703,13 @@ fn main() {
             get("gpu_p95_us"),
             get("passes_max"),
             get("drop_passes_max"),
+            get("split_passes_max"),
             get("pass_cost_p50_us"),
             get("pass_cost_pct"),
             get("present_p95_us"),
+            get("split_present_p95_us"),
+            get("route_gain_p50_us"),
+            get("route_gain_pct"),
             get("unorm_draw_p50_us"),
             get("build_stage_pct"),
             get("instances_max"),

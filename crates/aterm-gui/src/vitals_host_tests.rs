@@ -1059,6 +1059,143 @@ fn delegated_work_pulls_once_before_any_snapshot_and_uses_the_earlier_deadline()
     assert_eq!(app.vitals_deadline(), None);
 }
 
+/// A VIEW IS AS OLD AS THE READING THAT MADE IT: the board counts a new view's age from when the
+/// probe began the oldest reading handed over since the loop last adopted one that carries it (a
+/// later reading may carry the same view), not from the adoption, so the facts gate sees the
+/// probe's read and the wait for the loop.
+#[test]
+fn a_views_age_counts_from_the_probes_read_not_its_adoption() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let _rx = with_reader(&mut app, &BOARD);
+    let sid = sid_of_tab0(&app);
+    let view = Arc::new(JobsView {
+        rows: vec![hung_call()],
+        demand: Demand::Fast,
+        ..JobsView::default()
+    });
+    let snap = |seq| {
+        Arc::new(Snapshot {
+            seq,
+            jobs: Some(Arc::clone(&view)),
+            ..Snapshot::default()
+        })
+    };
+    let read = Instant::now();
+    hand_over(&app.vitals.latest, &snap(1), Vec::new(), read);
+    hand_over(
+        &app.vitals.latest,
+        &snap(2),
+        Vec::new(),
+        read + Duration::from_secs(1),
+    );
+    let adopted = read + Duration::from_secs(3);
+    assert!(app.adopt_vitals(Audience::None, adopted, false));
+    let (age, calls) = BOARD
+        .facts(&sid, adopted)
+        .expect("a view inside JOBS_FRESH");
+    assert_eq!((age, calls.len()), (Duration::from_secs(3), 1));
+}
+
+/// AN EARLIER READING OF AN OLDER VIEW DOES NOT AGE A NEW ONE: readings the loop never adopted
+/// (a `sys` pull's wakes no one) pile up while it sleeps, and the board counts a new view's age
+/// from the reading that made it, not from the first one handed over since the last adoption.
+#[test]
+fn an_earlier_reading_of_an_older_view_does_not_age_a_new_one() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let _rx = with_reader(&mut app, &BOARD);
+    let sid = sid_of_tab0(&app);
+    let snap = |seq| {
+        Arc::new(Snapshot {
+            seq,
+            jobs: Some(Arc::new(JobsView {
+                rows: vec![hung_call()],
+                demand: Demand::Fast,
+                ..JobsView::default()
+            })),
+            ..Snapshot::default()
+        })
+    };
+    let read = Instant::now();
+    hand_over(&app.vitals.latest, &snap(1), Vec::new(), read);
+    hand_over(
+        &app.vitals.latest,
+        &snap(2),
+        Vec::new(),
+        read + Duration::from_secs(70),
+    );
+    let adopted = read + Duration::from_secs(71);
+    assert!(app.adopt_vitals(Audience::None, adopted, false));
+    let (age, calls) = BOARD
+        .facts(&sid, adopted)
+        .expect("a new view, a second old");
+    assert_eq!((age, calls.len()), (Duration::from_secs(1), 1));
+}
+
+/// A WINDOWLESS ASK A FULL QUEUE DROPS IS ASKED AGAIN AT THE FLOOR: with no window showing the
+/// bars and a hung call standing, the reading `jobs_due` asks finds the thread's queue full (a
+/// `sys` pull's reading and an ask behind it, neither of which wakes the loop); it is due again
+/// `JOBS_FLOOR` on, not at the next edge or disk look, and once the thread is gone nothing is.
+#[test]
+fn a_dropped_windowless_ask_is_asked_again_at_the_floor() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let now = Instant::now();
+    land(&app, 1, vec![hung_call()], Demand::Fast);
+    assert!(app.adopt_vitals(Audience::None, now, false));
+    let due = now + Duration::from_secs(2);
+    assert_eq!(app.vitals_deadline(), Some(due));
+    let tx = app.vitals.tx.clone().expect("the thread's queue");
+    for _ in 0..2 {
+        tx.try_send(Msg::Read(Box::default())).expect("room");
+    }
+    app.serve_windowless_vitals(Audience::None, due, false);
+    assert_eq!(asked(&rx), 2, "the ask was dropped");
+    assert_eq!(app.vitals.jobs_due, Some(due + JOBS_FLOOR));
+    drop((tx, rx));
+    app.serve_windowless_vitals(Audience::None, due + JOBS_FLOOR, false);
+    assert_eq!(app.vitals.jobs_due, None, "no thread: nothing to ask");
+}
+
+/// A DROPPED ASK OUTLIVES A READING THAT DID NOT LOOK: the disk look's ask over a parked view (no
+/// cadence of its own) finds the queue full; the in-flight pull's whole reading, adopted before
+/// the retry, ran no engine pass (it carries the held view), so the ask is still due at the floor;
+/// a view a reading begun since made is the look, and nothing more is due.
+#[test]
+fn a_dropped_ask_outlives_a_whole_reading_that_did_not_look() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let now = Instant::now();
+    land(&app, 1, Vec::new(), Demand::Idle);
+    assert!(app.adopt_vitals(Audience::None, now, false));
+    let held = app.vitals.snapshot.as_ref().and_then(|s| s.jobs.clone());
+    let tx = app.vitals.tx.clone().expect("the thread's queue");
+    for _ in 0..2 {
+        tx.try_send(Msg::Read(Box::default())).expect("room");
+    }
+    app.vitals.disk_pull = true;
+    app.serve_windowless_vitals(Audience::None, now, false);
+    assert_eq!(asked(&rx), 2, "the look's ask was dropped");
+    let pulled = |seq, jobs| {
+        Arc::new(Snapshot {
+            seq,
+            jobs,
+            ..Snapshot::default()
+        })
+    };
+    hand_over(&app.vitals.latest, &pulled(2, held), Vec::new(), now);
+    let later = now + Duration::from_secs(1);
+    assert!(app.adopt_vitals(Audience::None, later, false));
+    assert_eq!(app.vitals.jobs_due, Some(now + JOBS_FLOOR), "still owed");
+    let looked = Some(Arc::new(JobsView::default()));
+    hand_over(&app.vitals.latest, &pulled(3, looked), Vec::new(), later);
+    assert!(app.adopt_vitals(Audience::None, later, false));
+    assert_eq!(app.vitals.jobs_due, None, "a new view since: looked");
+}
+
 #[test]
 fn machine_only_and_held_engine_views_do_not_move_delegated_sweeps() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -2006,6 +2143,7 @@ fn engine_reads(
         &app.vitals.latest,
         &snap,
         req.ttys.iter().map(TtyWord::seen).collect(),
+        Instant::now(),
     );
 }
 
@@ -2638,7 +2776,7 @@ fn a_cold_pulls_first_reading_hands_its_events_to_the_published_one() {
     assert_eq!(seqs, vec![4, 5], "the warm reading's first, none lost");
     let slot = Mutex::new(Handover::default());
     assert!(
-        hand_over(&slot, &Arc::new(snap), Vec::new()),
+        hand_over(&slot, &Arc::new(snap), Vec::new(), Instant::now()),
         "the loop hears of it"
     );
 }
@@ -2671,11 +2809,11 @@ fn the_hand_over_keeps_job_events_for_the_loop_and_says_when_one_moved() {
         Arc::new(s)
     };
     assert!(
-        !hand_over(&slot, &snap(1, false), Vec::new()),
+        !hand_over(&slot, &snap(1, false), Vec::new(), Instant::now()),
         "nothing moved"
     );
-    assert!(hand_over(&slot, &snap(2, true), Vec::new()));
-    assert!(hand_over(&slot, &snap(3, true), Vec::new()));
+    assert!(hand_over(&slot, &snap(2, true), Vec::new(), Instant::now()));
+    assert!(hand_over(&slot, &snap(3, true), Vec::new(), Instant::now()));
     let mut v = VitalsHost {
         latest: Arc::new(slot),
         ..VitalsHost::default()

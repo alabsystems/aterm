@@ -99,7 +99,6 @@ impl Scratch<'static> {
             Some(parent) => builder.tempdir_in(parent)?,
             None => builder.tempdir()?,
         };
-        // The successfully created TempDir is immediately retained, including on unwind.
         Ok(Self::from_owner(Box::new(LiveDirectory { dir: Some(dir) })))
     }
 }
@@ -163,7 +162,6 @@ mod tests {
         assert_eq!(sys.read_file(&file).unwrap(), b"file owner");
         assert_eq!(sys.read_link(&link).unwrap(), Path::new("/elsewhere"));
         assert_eq!(sys.read_file(&subtree).unwrap(), b"directory owner");
-        // Exhaustion does not acquire cleanup rights over any occupied candidate.
         let sys = Fake::root();
         for n in 0..5 {
             let path = Fake::scratch_path(Some(parent), "full", n);
@@ -208,7 +206,6 @@ mod tests {
             sys.read_file(&kept.join("old.app")).unwrap(),
             b"rollback bytes"
         );
-        // A separate failure may instead be retried successfully without transferring.
         let mut retry = Scratch::new(&sys, "retry").unwrap();
         let path = retry.path().to_owned();
         sys.scratch_close_fails(&path, Some(io::ErrorKind::PermissionDenied));

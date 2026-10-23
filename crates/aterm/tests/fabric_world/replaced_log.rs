@@ -7,9 +7,6 @@ use crate::harness;
 
 use harness::{FLEET, World, id_at_off, off_of, until};
 
-/// THE LOG GOES: the broker stops, its bus.log is moved aside, and it comes
-/// back on an empty one at the same path and socket — a log of another
-/// identity, whose offsets start again from 0.
 fn replace_the_log(w: &mut World) {
     if let Some(mut h) = w.handle.take() {
         h.shutdown();
@@ -23,13 +20,6 @@ fn replace_the_log(w: &mut World) {
     w.broker = Some(broker);
 }
 
-/// **A FRESH LOG'S RECORDS AT THE OLD LOG'S OFFSETS ALL REACH THE SESSION**
-/// (r2-01). The endpoint dedups delivery on the bare offset, and a fresh log
-/// numbers its records from 0 again: a record there at an offset the session
-/// was already handed on the old log was answered as the old row and never
-/// appended — mail lost while the bridge, told `OK`, committed past it. Forty
-/// rows land on the old log; the log is replaced under the running instance;
-/// forty more land on the new one, their offsets overlapping the old forty's.
 #[test]
 fn a_fresh_logs_records_at_the_old_logs_offsets_all_reach_the_session() {
     let mut w = World::boot("replaced-log-offsets", &[]);
@@ -80,15 +70,6 @@ fn a_fresh_logs_records_at_the_old_logs_offsets_all_reach_the_session() {
     );
 }
 
-/// **A RECEIPT OWED FOR THE OLD LOG'S ROW IS RETIRED, NEVER PUBLISHED ON THE
-/// NEW ONE** (r2-01's residual). a asks b on the old log; the broker goes
-/// before b decides, so b's receipt is owed with no broker to take it; the
-/// log is replaced and the broker comes back on it. The endpoint, told the
-/// new log, lists the receipt as an earlier log's, and the bridge retires it
-/// `unacked re=<old off> verdict=handled reason=log-replaced` on b's `ev` —
-/// a's ack lane on the new log stays empty, where `ack re=<old off>` would
-/// name another record. Negative control, run: a bridge that ignores the mark
-/// publishes that `ack` there, and the hang detector on the `unacked` fails.
 #[test]
 fn a_receipt_owed_for_the_old_logs_row_is_retired_not_published_on_the_new_one() {
     let mut w = World::boot("replaced-log-receipt", &[]);

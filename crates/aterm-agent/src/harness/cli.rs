@@ -3728,7 +3728,7 @@ fn run_upgrade_owner(
     };
     let word = match ask {
         OwnerAsk::Status => {
-            let (rows, vetted) =
+            let (rows, whole) =
                 super::upgrade_drive::status_rows(&opts, policy.enabled && policy.upgrade);
             let rows: Vec<_> = rows
                 .into_iter()
@@ -3737,11 +3737,11 @@ fn run_upgrade_owner(
             for row in &rows {
                 print(out, row);
             }
-            if !vetted {
+            if !whole {
                 let _ = writeln!(
                     err,
-                    "aterm harness: Claude's session files could not be read whole, so stale \
-                     upgrades may be listed"
+                    "aterm harness: upgrade status is incomplete: upgrade records or agent \
+                     session files could not be read whole, so upgrades may be missing or stale"
                 );
             }
             if let Some(path) = env.config.as_deref() {
@@ -3765,7 +3765,7 @@ fn run_upgrade_owner(
                     );
                 }
             }
-            if rows.is_empty() && !json {
+            if whole && rows.is_empty() && !json {
                 let _ = writeln!(
                     out,
                     "no session waits for an upgrade{}",
@@ -3776,7 +3776,11 @@ fn run_upgrade_owner(
                     }
                 );
             }
-            return ExitCode::SUCCESS;
+            return if whole {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            };
         }
         OwnerAsk::Now => super::upgrade_drive::Ask::Now,
         OwnerAsk::Defer(secs) => super::upgrade_drive::Ask::Defer(secs),
@@ -5538,6 +5542,7 @@ fn run_accounts_use(
             let Some((_, raw)) = accounts_read_roster(env, err) else {
                 return ExitCode::from(1);
             };
+            let _ = super::accounts_sync::recover_staging_renewals(&store, &raw, now);
             let roster = store.bound(&raw, now).unwrap_or(raw);
             let enrolled = accounts::enrolled(&roster);
             let remedy = match roster.row(label) {
@@ -5684,10 +5689,26 @@ pub(crate) fn machine_entries(hosts: &[String]) -> Result<Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Renewal {
+pub(super) enum Renewal {
     Renewed,
+    AuthFailed,
     WrongAccount,
     Failed,
+}
+
+impl Renewal {
+    pub(super) fn authentication_failed(code: Option<i32>) -> Self {
+        // The terminal flow maps signals to 128 + signal; bounded captures
+        // retain no exit code when a signal ended the child.
+        match code {
+            Some(0..=127) => Self::AuthFailed,
+            _ => Self::Failed,
+        }
+    }
+
+    pub(super) fn can_retry_authentication(self) -> bool {
+        matches!(self, Self::AuthFailed | Self::WrongAccount)
+    }
 }
 
 /// The opener's link, `<accounts store>/bin/aterm-open-url` → this program ([`AccountsHost::current_exe`]), made again on every renewal that opens a profile or runs over SSH (a temp link, then a rename), so it names a moved or updated binary.
@@ -5830,7 +5851,7 @@ fn renew_one(
                  and nothing live changed"
             ),
         );
-        return Renewal::Failed;
+        return Renewal::authentication_failed(Some(exited));
     }
     if !accounts::login_made(&staging) {
         drop_staging(&staging, err);
@@ -5838,18 +5859,20 @@ fn renew_one(
             err,
             "the sign-in exited 0 and left no login; nothing was recorded",
         );
-        return Renewal::Failed;
+        return Renewal::AuthFailed;
     }
     let facts = match host.status_in_home(&staging_text) {
-        Ok(got) => status_facts(&got, email).ok_or_else(|| {
-            let exit = got
-                .code
-                .map_or_else(|| "ended by a signal".to_string(), |c| format!("exit {c}"));
-            format!("{exit}, with no answer that can be read")
-        }),
+        Ok(got) => status_facts(&got, email)
+            .map(|facts| (facts, got.code))
+            .ok_or_else(|| {
+                let exit = got
+                    .code
+                    .map_or_else(|| "ended by a signal".to_string(), |c| format!("exit {c}"));
+                format!("{exit}, with no answer that can be read")
+            }),
         Err(why) => Err(super::one_line(&why, 160)),
     };
-    let facts = match facts {
+    let (facts, status_code) = match facts {
         Ok(facts) => facts,
         Err(why) => {
             drop_staging(&staging, err);
@@ -5879,7 +5902,11 @@ fn renew_one(
                 }
             ),
         );
-        return Renewal::WrongAccount;
+        return if recorded.is_ok() {
+            Renewal::WrongAccount
+        } else {
+            Renewal::Failed
+        };
     }
     if !facts.renews() {
         drop_staging(&staging, err);
@@ -5892,7 +5919,7 @@ fn renew_one(
             err,
             &format!("the new login answers {what}; nothing was recorded"),
         );
-        return Renewal::Failed;
+        return Renewal::authentication_failed(status_code);
     }
     let now = host.now().max(now);
     if let Err(why) = accounts::write_renewal_checkpoint(
@@ -6074,12 +6101,19 @@ fn run_accounts_renew(
             }
         };
         let enrolled = accounts::enrolled(&roster);
-        for label in accounts::renew_due(&roster, &logins, &state, &enrolled, now) {
-            if !chosen.contains(&label) {
-                chosen.push(label);
+        let due_labels = accounts::renew_due(&roster, &logins, &state, &enrolled, now);
+        for label in &due_labels {
+            if !chosen.contains(label) {
+                chosen.push(label.clone());
             }
         }
-        if chosen.is_empty() {
+        let has_non_limited_due = due_labels.iter().any(|label| {
+            !state
+                .accounts
+                .get(label)
+                .is_some_and(|a| a.limited_until(now).is_some())
+        });
+        if !has_non_limited_due {
             let candidates =
                 super::accounts_sync::auto_renew_candidates(&file_roster, &state, &logins, now);
             let target = candidates
@@ -6089,9 +6123,25 @@ fn run_accounts_renew(
                         || (host.stdin_is_terminal() && r.browser.is_some())
                 })
                 .or_else(|| candidates.first());
-            if let Some(target) = target {
+            if let Some(target) = target
+                && !chosen.contains(&target.label)
+            {
+                if labels.is_empty() {
+                    chosen.retain(|label| {
+                        !state
+                            .accounts
+                            .get(label)
+                            .is_some_and(|a| a.limited_until(now).is_some())
+                    });
+                }
                 chosen.push(target.label.clone());
             }
+        }
+        if labels.is_empty()
+            && !host.stdin_is_terminal()
+            && chosen.iter().any(|label| row_can_run_headless(label))
+        {
+            chosen.retain(|label| row_can_run_headless(label));
         }
     }
     if chosen.is_empty() && machines.is_empty() {
@@ -6149,7 +6199,10 @@ fn run_accounts_renew(
             interactive_browser(&mut opener)
         };
         let mut renewal = renew_one(env, host, &store, row, own_dir, &browser, out, err);
-        if renewal != Renewal::Renewed && used_headless_profile_only && host.stdin_is_terminal() {
+        if renewal.can_retry_authentication()
+            && used_headless_profile_only
+            && host.stdin_is_terminal()
+        {
             let fallback = interactive_browser(&mut opener);
             renewal = renew_one(env, host, &store, row, own_dir, &fallback, out, err);
         }

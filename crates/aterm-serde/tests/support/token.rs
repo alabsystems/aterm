@@ -1,9 +1,5 @@
 // Copyright (c) Erick Tryzelaar, David Tolnay et al. (the serde authors)
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//
-// Derived from serde_test 1.0.177 src/token.rs (github.com/serde-rs/test) and
-// modified by the aterm project in 2026.
-// See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
 use std::fmt::{self, Debug, Display};
 
@@ -40,11 +36,11 @@ pub enum Token {
     BorrowedStr(&'static str),
     /// A serialized `String`.
     String(&'static str),
-    /// A serialized `[u8]`
+    /// A serialized `[u8]`.
     Bytes(&'static [u8]),
     /// A borrowed `[u8]`.
     BorrowedBytes(&'static [u8]),
-    /// A serialized `ByteBuf`
+    /// A serialized `ByteBuf`.
     ByteBuf(&'static [u8]),
     /// A serialized `Option<T>` containing none.
     None,

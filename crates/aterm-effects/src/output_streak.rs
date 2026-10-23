@@ -325,8 +325,13 @@ impl OutputStreak {
     #[inline]
     pub fn reset(&mut self) {
         let seed = self.seed;
+        let mut observed_rows = std::mem::take(&mut self.observed_rows);
+        for row in &mut observed_rows {
+            row.clear();
+        }
         *self = Self {
             seed,
+            observed_rows,
             ..Self::default()
         };
     }
@@ -335,7 +340,9 @@ impl OutputStreak {
     #[inline]
     pub fn rebase(&mut self) {
         self.last_token = None;
-        self.observed_rows.clear();
+        for row in &mut self.observed_rows {
+            row.clear();
+        }
         self.observed_viewport = None;
     }
 

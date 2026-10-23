@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! External tool runner for package builds ([`Tools`], [`HostTools`],
-//! [`super::relocate`], [`super::pack`], [`super::bundle`]).
+//! External tool runner for package builds.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -130,37 +129,31 @@ impl std::fmt::Display for RunError {
 pub trait Tools {
     /// Run a child to completion ([`RunError`]).
     /// # Errors
-    ///
     /// [`RunError`] when it could not start or outran its deadline.
     fn run(&self, run: &Run) -> Result<Ran, RunError>;
 
     /// Drop symbols from one object in place.
     /// # Errors
-    ///
     /// Why it failed.
     fn strip(&self, file: &Path, locals_and_debug: bool) -> Result<(), String>;
 
     /// Re-sign one Mach-O ad hoc (`codesign -f -s -`).
     /// # Errors
-    ///
     /// Why it failed, or that the signing service did not answer.
     fn resign(&self, file: &Path) -> Result<(), String>;
 
     /// Whether two Mach-O binaries are identical after stripping code signatures.
     /// # Errors
-    ///
     /// When the comparison could not be made.
     fn same_unsigned(&self, a: &Path, b: &Path) -> Result<bool, String>;
 
     /// Write the `arch` slice of a fat Mach-O to `out` (`lipo -thin`).
     /// # Errors
-    ///
     /// Why it failed.
     fn thin(&self, file: &Path, arch: &str, out: &Path) -> Result<(), String>;
 
     /// Pack-time relocation (`crate::artifact::relocate::relocate_stage`, donors already admitted).
     /// # Errors
-    ///
     /// The relocator's refusal.
     fn relocate(
         &self,
@@ -168,15 +161,12 @@ pub trait Tools {
         donors: &[PathBuf],
     ) -> Result<crate::artifact::relocate::Report, String>;
 
-    /// What compresses the pack's tar stream: the zstd CLI on `PATH` for a real pack
-    /// ([`super::tarwrite::ZstdCli`]), aterm-zstd's raw-block writer in a test that has no
-    /// CLI to run (`tarwrite::RawFrames`).
+    /// What compresses the pack's tar stream.
     fn compressor(&self) -> &dyn super::tarwrite::Compressor;
 }
 
 /// A compiler's `-vV`, bounded — the probe the client's lineage checker takes.
 /// # Errors
-///
 /// The text of why it did not answer.
 pub fn version(tools: &dyn Tools, compiler: &Path) -> Result<String, String> {
     let ran = tools

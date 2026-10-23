@@ -2,35 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! headless-lifeline: every throwaway `--headless` instance and `aterm link
-//! broker` a test, example, bench or dev tool starts holds a lifeline.
-//!
-//! An instance or a broker only its launcher's `Drop` ends outlives a launcher
-//! that is SIGKILLed or timed out. The launch hands the child the far end of a
-//! FIFO the launcher holds (`--lifeline-fd`, `aterm_uds::lifeline`), and the
-//! child ends when the launcher goes.
-//!
-//! Lexically, per file:
-//! * a Rust launch is an `.arg(…)`/`.args([…])` naming `"--headless"` or the
-//!   broker verb's consecutive `"link", "broker"`, or an `.args([` broken one
-//!   element to a line with `"--headless"`, or a `"link",` line then a
-//!   `"broker"` one, among them; the file is armed when it holds at least as
-//!   many arm calls handed a `&mut` command (`launch_isolation::lifeline`,
-//!   `Lifeline::arm`, `arm_for_process`, a local `arm_lifeline`) as unwaived
-//!   launches, since a `Command` is often built in one function and armed in
-//!   its caller;
-//! * a shell launch (in a script, or a script a Rust string holds) is a program
-//!   word (`"$B"`, `$A`, `${GUI}`, a path ending in an aterm name), bare flags,
-//!   then `--headless`; it is armed when its logical line carries
-//!   `--lifeline-fd`;
-//! * a Python launch is a `"--headless"` list element; it is armed when the
-//!   three lines on either side of it name the lifeline.
-//!
-//! Any launch is waived by a `NO LIFELINE …: <reason>` comment on its line or
-//! in the eight above (an instance meant to outlive its launcher, a stand-in
-//! that is no aterm, a broker run that ends before it serves). A launch spelled
-//! another way (the flag in a variable, a `format!`ed command line, a broker
-//! started from a script) is not seen.
+//! `headless-lifeline`: checks that `--headless` and `aterm link broker` launches arm a lifeline.
 
 use super::{Finding, Rule, Script, SourceFile, Tree, is_word};
 
@@ -44,8 +16,6 @@ pub(super) const HEADLESS_LIFELINE: Rule = Rule {
     check: headless_lifeline,
 };
 
-/// Is `rel` a launcher's source: a crate's tests, examples or benches, or a
-/// dev tool that starts instances or brokers (verify, release, the lab)?
 fn launcher_source(rel: &str) -> bool {
     let Some(rest) = rel.strip_prefix("crates/") else {
         return false;
@@ -59,10 +29,6 @@ fn launcher_source(rel: &str) -> bool {
         || rel.starts_with("crates/aterm-lab/src/")
 }
 
-/// The launch every live headless suite boots through. A read that does not
-/// reach it lost the tree (a moved `tests/`, a narrowed [`launcher_source`]),
-/// and a rule that reads no launch holds vacuously. An anchor, not a count: a
-/// launcher deleted on purpose moves no number.
 const ANCHOR_LAUNCH_FILE: &str = "crates/aterm/tests/support/headless_boot.rs";
 
 fn headless_lifeline(tree: &Tree<'_>, out: &mut Vec<Finding>) {
@@ -91,17 +57,12 @@ fn headless_lifeline(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// Is `rel` a script that may start instances: under `tools/`, or under a
-/// crate's tests, examples or benches?
 fn launcher_script(rel: &str) -> bool {
     rel.starts_with("tools/") || launcher_source(rel)
 }
 
-/// How many lines on either side of a Python launch may name its lifeline.
 const PY_REACH: usize = 3;
 
-/// Every unarmed, unwaived launch in one script: shell launches in any script,
-/// and `"--headless"` list elements in a Python one.
 fn script_findings(script: &Script) -> Vec<Finding> {
     let lines: Vec<&str> = script.raw.lines().collect();
     let waived = |i: usize| {
@@ -146,8 +107,6 @@ fn script_findings(script: &Script) -> Vec<Finding> {
     out
 }
 
-/// A `"--headless"` (or `'--headless'`) list element: first on its line, or
-/// after a `[`, `,` or `(`.
 fn python_launch(line: &str) -> bool {
     ["\"--headless\"", "'--headless'"].iter().any(|elem| {
         line.match_indices(elem).any(|(at, _)| {
@@ -157,7 +116,6 @@ fn python_launch(line: &str) -> bool {
     })
 }
 
-/// The logical line starting at `i`: backslash continuations joined.
 fn logical_line(lines: &[&str], i: usize) -> String {
     let mut logical = lines[i].to_string();
     let mut j = i;
@@ -169,17 +127,13 @@ fn logical_line(lines: &[&str], i: usize) -> String {
     logical
 }
 
-/// Is a shell launch's logical line armed (or only a `--help` probe)?
 fn armed_shell(logical: &str) -> bool {
     help_probe(logical) || logical.contains("--lifeline-fd")
 }
 
-/// How many lines above a launch its waiver may sit.
 const WAIVER_REACH: usize = 8;
-/// How many lines an `.args([` broken one element to a line is read for.
 const ARGS_REACH: usize = 40;
 
-/// Every unarmed, unwaived launch in one file.
 fn lifeline_findings(file: &SourceFile) -> Vec<Finding> {
     let raw: Vec<&str> = file.raw.lines().collect();
     let text: Vec<&str> = file.lexed().text.lines().collect();
@@ -235,11 +189,8 @@ fn lifeline_findings(file: &SourceFile) -> Vec<Finding> {
     out
 }
 
-/// The word that opens the broker verb's launch: a file without it starts no broker.
 const BROKER_WORD: &str = "\"broker\"";
 
-/// Line `i` of an `.args([` array broken one element to a line launches an instance or a
-/// broker: it is `"--headless"`, or `"broker"` right below a `"link",`.
 fn broken_launch(text: &[&str], i: usize) -> bool {
     let line = text[i];
     line.contains("\"--headless\"")
@@ -248,7 +199,6 @@ fn broken_launch(text: &[&str], i: usize) -> bool {
             && text[i - 1].trim() == "\"link\",")
 }
 
-/// `NO LIFELINE …: <reason>`, the reason at least ten characters.
 fn waiver(raw: &str) -> bool {
     raw.match_indices("NO LIFELINE").any(|(at, _)| {
         let rest = &raw[at + "NO LIFELINE".len()..];
@@ -260,7 +210,6 @@ fn waiver(raw: &str) -> bool {
     })
 }
 
-/// An arm call handed a `&mut` command.
 fn arms_a_lifeline(line: &str) -> bool {
     ["lifeline(", "Lifeline::arm(", "arm_for_process("]
         .iter()
@@ -273,8 +222,6 @@ fn arms_a_lifeline(line: &str) -> bool {
         })
 }
 
-/// `.arg(…)` or `.args(…)` whose parenthesis holds `"--headless"`, or the broker verb's
-/// `"link", "broker"`, before it closes.
 fn arg_names_launch(line: &str) -> bool {
     [".arg(", ".args("].iter().any(|open| {
         line.match_indices(open).any(|(at, _)| {
@@ -285,7 +232,6 @@ fn arg_names_launch(line: &str) -> bool {
     })
 }
 
-/// `"link", "broker"`: the broker verb's two words, consecutive in one list.
 fn names_broker(list: &str) -> bool {
     list.match_indices("\"link\"").any(|(at, word)| {
         list[at + word.len()..]
@@ -295,8 +241,6 @@ fn names_broker(list: &str) -> bool {
     })
 }
 
-/// A line that ends by opening an `.args(` array: `.args([`, `.args(&[`,
-/// `.args(vec![` or a bare `.args(`.
 fn opens_args(line: &str) -> bool {
     line.match_indices(".args(").any(|(at, _)| {
         let rest = line[at + 6..].trim();
@@ -304,8 +248,6 @@ fn opens_args(line: &str) -> bool {
     })
 }
 
-/// A line that closes the array (`]` then `)`, a `,` between allowed) or
-/// starts with `)`.
 fn closes_args(line: &str) -> bool {
     line.trim_start().starts_with(')')
         || line.match_indices(']').any(|(at, _)| {
@@ -315,7 +257,6 @@ fn closes_args(line: &str) -> bool {
         })
 }
 
-/// ` --help` as a word: a usage probe, not an instance.
 fn help_probe(logical: &str) -> bool {
     logical.match_indices("--help").any(|(at, _)| {
         at > 0
@@ -324,7 +265,6 @@ fn help_probe(logical: &str) -> bool {
     })
 }
 
-/// A shell launch: a program word, any bare flags, then `--headless`.
 fn shell_launch(line: &str) -> bool {
     let b = line.as_bytes();
     (0..b.len()).any(|i| {
@@ -337,8 +277,6 @@ fn shell_launch(line: &str) -> bool {
     })
 }
 
-/// Where each program word starting `s` may end: `"$X"`, `$X`, `${X}` (quoted
-/// or not), or a path whose last component is an aterm name.
 fn program_words(s: &str) -> Vec<usize> {
     let b = s.as_bytes();
     let mut ends = Vec::new();
@@ -389,7 +327,6 @@ fn program_words(s: &str) -> Vec<usize> {
     ends
 }
 
-/// Bare flags, then `--headless` followed by a space, a `\` or the line's end.
 fn flags_then_headless(mut rest: &str) -> bool {
     loop {
         let token_start = rest.trim_start();
@@ -442,13 +379,11 @@ mod tests {
 
         let armed = "fn boot(root: &Path) {\n    cmd.arg(\"--headless\");\n    \
                      let l = launch_isolation::lifeline(&mut cmd, root);\n}\n";
-        // Armed launches elsewhere do not stand in for the boot.
         let elsewhere = run(&HEADLESS_LIFELINE, &[("crates/aterm/tests/t.rs", armed)]);
         assert!(lost(&elsewhere), "{elsewhere:?}");
         assert!(run(&HEADLESS_LIFELINE, &[(ANCHOR_LAUNCH_FILE, armed)]).is_empty());
     }
 
-    /// Each unarmed launch shape, with the line and shape its finding prints.
     #[test]
     fn every_unarmed_launch_is_found() {
         let cases: &[(&str, &str, &str)] = &[
@@ -539,8 +474,6 @@ mod tests {
         assert!(found.is_empty(), "CRIES WOLF: {found:?}");
     }
 
-    /// Scripts under tools/ or a crate's tests: a shell launch armed by its
-    /// logical line, a Python one by the lines around it; both waivable.
     #[test]
     fn a_scripts_launches_hold_a_lifeline() {
         let shell = "#!/bin/bash\n\"$A\" --headless --control-sock \"$S\" &\n\

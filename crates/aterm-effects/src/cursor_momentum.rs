@@ -204,14 +204,36 @@ impl MomentumGlow {
     #[must_use]
     #[inline]
     pub const fn is_active(&self) -> bool {
-        self.latched >= MOMENTUM_GLOW_HOT && self.fp_last != self.fp_prev
+        self.hot() && self.changed()
     }
 
     /// Hot, but its last two frames were identical: not settled.
     #[must_use]
     #[inline]
     pub const fn settling(&self) -> bool {
-        self.latched >= MOMENTUM_GLOW_HOT && self.fp_last == self.fp_prev
+        self.hot() && !self.changed()
+    }
+
+    /// The last real tick latched an amplitude at or above [`MOMENTUM_GLOW_HOT`].
+    #[must_use]
+    #[inline]
+    pub(crate) const fn hot(&self) -> bool {
+        self.latched >= MOMENTUM_GLOW_HOT
+    }
+
+    /// The glass changed at the last tick.
+    #[must_use]
+    #[inline]
+    pub(crate) const fn changed(&self) -> bool {
+        self.fp_last != self.fp_prev
+    }
+
+    /// The instant of the last real tick; `None` once inert.
+    #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+    #[must_use]
+    #[inline]
+    pub(crate) const fn stamp(&self) -> Option<Instant> {
+        self.stamp
     }
 
     /// The analytic instant the latched amplitude decays below [`MOMENTUM_GLOW_HOT`] (`stamp + τ·ln(a/floor)`).
@@ -231,8 +253,16 @@ impl MomentumGlow {
         if !self.settling() {
             return None;
         }
+        let next = self.settle_forecast();
+        Some(next.map_or(floor, |at| (at + SETTLE_MARGIN).max(floor)))
+    }
+
+    /// The earlier of the latched amplitude's next `u8` step and [`Self::cold_at`].
+    #[must_use]
+    #[inline]
+    pub(crate) fn settle_forecast(&self) -> Option<Instant> {
         let step = (self.latched * 255.0).floor();
-        let next = [
+        [
             (step >= 1.0)
                 .then(|| self.decays_to(step / 255.0))
                 .flatten(),
@@ -240,8 +270,7 @@ impl MomentumGlow {
         ]
         .into_iter()
         .flatten()
-        .min();
-        Some(next.map_or(floor, |at| (at + SETTLE_MARGIN).max(floor)))
+        .min()
     }
 
     /// The instant the latched amplitude decays to `level`, from the last real

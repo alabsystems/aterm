@@ -1,25 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The self-feed floor: a process-wide token bucket on control-injected input, keyed by the
-//! target session's process-local id.
-//!
-//! `aterm-agent`'s `SelfGovernor` binds only drivers that link it; a raw control-socket client
-//! can `feed @.` in a loop without it. So every self-targeted injection passes [`allow`] first
-//! (`send`/`key`/`ctrl`/`feed`/`mouse`/`paste`/`turn` in control.rs's `handle`, `feed-bin` in
-//! `run_feed_bin_routed`), and a storm gets `ERR rate`. The cap is far above legitimate
-//! driving. Its `NoOverdraft` bound (a write is admitted only with a spare token; tokens never
-//! exceed the cap) is model-checked by `inject_floor_model` (`aterm-spec`).
+//! Self-feed floor: process-wide token bucket on control-injected input per local session id.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-/// Burst capacity in bytes (also the refill ceiling): a paste or long prompt
-/// passes at once while a storm's standing burst stays bounded.
 const CAP_BYTES: f64 = 256.0 * 1024.0;
 
-/// Sustained refill rate in bytes/sec once the burst is spent.
 const REFILL_BYTES_PER_SEC: f64 = 256.0 * 1024.0;
 
 struct Bucket {
@@ -27,17 +16,12 @@ struct Bucket {
     last: Instant,
 }
 
-/// Process-wide buckets, one per session local id. Created lazily; a session that
-/// is never self-driven costs one map probe and no bucket.
 static FLOOR: OnceLock<Mutex<HashMap<u64, Bucket>>> = OnceLock::new();
 
-/// Admit `nbytes` of self-targeted injection for `session`, or refuse when the
-/// floor is exhausted. Refills from the wall clock since the last call.
+/// Admit `nbytes` of self-targeted injection for `session`, or refuse when the floor is exhausted.
 #[must_use]
 pub(crate) fn allow(session: u64, nbytes: usize) -> bool {
     let now = Instant::now(); // control-layer rate limiter, not engine state
-    // A named local so the lock-order census resolves this acquisition to the `floor` identity
-    // (`forget` uses the same name).
     let floor = FLOOR.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = floor.lock().unwrap_or_else(|p| p.into_inner());
     let b = map.entry(session).or_insert(Bucket {
@@ -56,8 +40,7 @@ pub(crate) fn allow(session: u64, nbytes: usize) -> bool {
     }
 }
 
-/// Drop a session's bucket when it closes (`Wake::Exit` in `App::user_event`), so the map does
-/// not grow for the process lifetime.
+/// Drop a session's bucket when it closes (`Wake::Exit` in `App::user_event`).
 pub(crate) fn forget(session: u64) {
     if let Some(floor) = FLOOR.get() {
         floor
@@ -92,7 +75,6 @@ mod tests {
                 admitted += 1;
             }
         }
-        // The burst admits about four back-to-back chunks.
         assert!(admitted <= 5, "burst is bounded, got {admitted} admits");
         forget(s);
     }

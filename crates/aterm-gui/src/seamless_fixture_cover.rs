@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH FIELDS A SET OF VALUES WRITES, read off their serde derives: the cross-version guard checks only the shapes its desks carry, so a field the producer can write but no desk does is a field the next consumer's parse is never held to.
+//! Serde-derived field coverage checks for cross-version seamless update fixtures.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -111,8 +111,6 @@ impl FieldCover {
         }
     }
 
-    /// Every enum the walk named, with the externally tagged variants it
-    /// wrote (`Enum::Variant`, not a struct variant's `Enum::Variant.field`).
     fn walked_enums(&self) -> BTreeMap<&str, BTreeSet<&str>> {
         let mut walked: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for entry in &self.written {
@@ -285,15 +283,7 @@ impl DeskFields {
         out
     }
 
-    /// What these desks leave uncovered, one `<record> <field> (<why>)` each:
-    ///
-    /// * every field or variant a desk here passes over and no desk writes, unless
-    ///   `unhanded` names it, as `(record, field)`: one no handoff writes;
-    /// * every field or variant `baseline`'s desks wrote that no desk here writes,
-    ///   reached or not, unless `unhanded` names it (retired since);
-    /// * every `unhanded` row of `manifest`, `layout`, `meta` or `control` that a desk
-    ///   here writes, or that names no field a desk here passes over or `baseline`'s
-    ///   desks wrote.
+    /// What these desks leave uncovered, one `<record> <field> (<why>)` each.
     pub(crate) fn uncovered(
         &self,
         baseline: Option<&Recorded>,
@@ -362,35 +352,24 @@ pub(crate) fn newest_recorded(root: &Path, this_run: &Path) -> Option<(String, R
     Some((release, recorded))
 }
 
-/// How [`FieldCover::settle_variants`] reads a document back as its record's
-/// type.
 type Reread = fn(Doc) -> Result<(), Refused>;
 
 fn reread<T: serde::de::DeserializeOwned>(doc: Doc) -> Result<(), Refused> {
     T::deserialize(doc).map(drop)
 }
 
-/// What [`FieldCover::settle_variants`] puts where a value wrote a string or a
-/// key: a name no enum gives a variant.
 const NO_VARIANT: &str = "\u{1}no variant";
 
 thread_local! {
-    /// Every refusal a read back made since it was last cleared, whether or
-    /// not it reached the reader: an untagged or lenient field reads past one.
     static REFUSED: std::cell::RefCell<Vec<Refusal>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// A refusal [`FieldCover::settle_variants`] reads: an enum's variants, when
-/// it refused [`NO_VARIANT`], and what a visitor expected, when it refused a
-/// value of the wrong kind (an internally tagged enum says its own name).
 enum Refusal {
     Variants(&'static [&'static str]),
     Expected(String),
 }
 
-/// The enum the walk named whose externally tagged variants it wrote are
-/// exactly `took`, when one is.
 fn walked_name(walked: &BTreeMap<&str, BTreeSet<&str>>, took: &BTreeSet<String>) -> Option<String> {
     let mut named = walked
         .iter()
@@ -401,10 +380,6 @@ fn walked_name(walked: &BTreeMap<&str, BTreeSet<&str>>, took: &BTreeSet<String>)
         .filter(|_| named.next().is_none() && !took.is_empty())
 }
 
-/// A place a value wrote a string, or a table of one key, that
-/// [`FieldCover::settle_variants`] reads back with [`NO_VARIANT`] there: the
-/// first value that has it, the steps to it there, and what every value
-/// wrote at it.
 struct Place {
     doc: usize,
     steps: Vec<Step>,
@@ -419,7 +394,6 @@ enum Step {
 }
 
 impl Place {
-    /// What `doc` holds at this place.
     fn at<'v>(&self, doc: &'v mut aterm_json::Value) -> &'v mut aterm_json::Value {
         let mut at = doc;
         for step in &self.steps {
@@ -436,7 +410,6 @@ impl Place {
         at
     }
 
-    /// Put [`NO_VARIANT`] where this place's string or key was.
     fn unknown(&self, value: &mut aterm_json::Value) {
         match value {
             aterm_json::Value::Object(map) if self.key => {
@@ -448,8 +421,6 @@ impl Place {
         }
     }
 
-    /// The table this place's string is a field of: an internally tagged
-    /// enum's, when the string is its tag.
     fn tag_holder(&self) -> Option<Place> {
         let (Step::Key(_), holder) = self.steps.split_last()? else {
             return None;
@@ -463,8 +434,6 @@ impl Place {
     }
 }
 
-/// Every place in `value` (under `path`, its list positions erased) that
-/// holds a string, or a table of one key, with what it holds.
 fn places_in(
     value: &aterm_json::Value,
     doc: usize,
@@ -543,11 +512,8 @@ impl serde::de::Error for Refused {
     }
 }
 
-/// A document read back as a record's type, with [`Refused`] as the error
-/// every derive inside it builds its refusals with.
 struct Doc(aterm_json::Value);
 
-/// What a document holds, as a refusal names it.
 fn unexpected(value: &aterm_json::Value) -> serde::de::Unexpected<'_> {
     use serde::de::Unexpected;
     match value {
@@ -560,14 +526,10 @@ fn unexpected(value: &aterm_json::Value) -> serde::de::Unexpected<'_> {
     }
 }
 
-/// A table's key, read as the type its map is keyed by (a number is a string
-/// in JSON).
 struct Key(String);
 
-/// A list's or a table's entries, read one by one.
 struct Entries<I>(I, Option<aterm_json::Value>);
 
-/// An externally tagged variant written as a table of one key.
 struct Variant(String, aterm_json::Value);
 
 impl<'de> serde::de::IntoDeserializer<'de, Refused> for Doc {
@@ -715,7 +677,6 @@ impl<'de> serde::de::VariantAccess<'de> for Doc {
     }
 }
 
-/// A key read as a number when its map is keyed by one.
 macro_rules! numbered_keys {
     ($($method:ident: $as:ty => $visit:ident),* $(,)?) => {$(
         fn $method<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Refused> {
@@ -793,14 +754,10 @@ impl serde::ser::Error for Error {
     }
 }
 
-/// The serializer: each value answers whether it wrote anything (`false` for
-/// `None`, an empty list or an empty table).
 struct Walk<'a> {
     cover: &'a mut FieldCover,
 }
 
-/// A list, table or struct being walked: who owns its fields, and whether it
-/// has written an element or entry yet.
 struct Compound<'a> {
     cover: &'a mut FieldCover,
     owner: String,
@@ -1093,9 +1050,6 @@ mod tests {
         shapes: Vec<Shape>,
     }
 
-    /// A field or variant a baseline's desks wrote is held whether or not a
-    /// desk still reaches its struct: a desk that stops carrying a shape stops
-    /// writing every field and variant only it wrote.
     #[test]
     fn what_a_baseline_wrote_stays_written_reached_or_not() {
         let walked = |desk: &Desk| {
@@ -1154,8 +1108,6 @@ mod tests {
         shade: Option<Shade>,
     }
 
-    /// A shade, or none when the value is not one, like the engine state's
-    /// lenient fields: a refusal inside never reaches the reader.
     fn lenient_shade<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Shade>, D::Error> {
         #[derive(serde::Deserialize)]
         #[serde(untagged)]
@@ -1169,10 +1121,6 @@ mod tests {
         })
     }
 
-    /// Every variant of every enum a value reaches is named, taken or not:
-    /// an externally tagged one's inside an internally tagged enum's buffered
-    /// content, an internally tagged one's under its own name, and one a
-    /// lenient field reads a refusal past.
     #[test]
     fn every_variant_of_an_enum_a_value_reaches_is_named_taken_or_not() {
         let mut cover = FieldCover::default();
@@ -1194,9 +1142,6 @@ mod tests {
         assert_eq!(cover.never_written(), ["Mode::Fancy", "Mode::Wild"]);
     }
 
-    /// A field no desk writes is refused unless it is named as one no handoff
-    /// writes, whatever the baseline, and a name that is no longer true (a
-    /// desk writes the field, or nothing has it) is refused too.
     #[test]
     fn a_field_no_desk_writes_is_refused_unless_no_handoff_writes_it() {
         let walked = |hint: Option<u32>| {
@@ -1236,8 +1181,6 @@ mod tests {
         );
     }
 
-    /// The hand-run fallback writes `v<release>/` under the fixtures' root:
-    /// its own record is never its baseline, the release before it is.
     #[test]
     fn a_release_being_recorded_is_never_its_own_baseline() {
         let root = aterm_tempfile::tempdir().expect("a fixtures root");

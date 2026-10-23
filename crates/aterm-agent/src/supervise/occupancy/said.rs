@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE DOOR SAYS TO ITS HOST (`docs/DESIGN-harness-occupancy-2026-10-20.md` §6): the
-//! loop's one notification a change, [`OccupancySaid`] (`IdleHost::occupancy_said`, taped), and
-//! its `occupancy why` form ([`why_lines`]). The loop composes it from what it holds already —
-//! the mode it ran the break under, the hold's clock, what each rule last said, the guards the
-//! break judged and the reading the decider judged — and reads nothing for it, so under
-//! `observe` it changes no decision and types nothing. Plain numbers and closed words, as the
-//! reading is.
-//!
-//! The host keeps the last one a session's loop told: its status fields
-//! (`occupancy= occupancy_hold=`), the `why` it answers, and the Entries a spent cap raises
-//! under `prompt`.
+//! WHAT THE DOOR SAYS TO ITS HOST (`docs/DESIGN-harness-occupancy-2026-10-20.md` §6).
 
 use super::door::PaceGrant;
 use super::reading::OccupancyReading;
@@ -54,9 +44,7 @@ pub enum SaidVerdict {
 }
 
 impl SaidVerdict {
-    /// Its words, as the `OCCUPANCY` line spells them: `quiet`, `would`, `held:<guard>`,
-    /// `paced`, `spent`, `typed`, `skipped why=<word>`, `told`, `paced why=<word>` or
-    /// `refused why=<word>`.
+    /// Its words.
     #[must_use]
     pub fn words(self) -> String {
         match self {
@@ -94,26 +82,20 @@ pub struct OccupancySaid {
     pub mode: Occupancy,
     /// The open hold; `None` once it closed.
     pub hold: Option<SaidHold>,
-    /// THE READY PROXY (§6): the hold past `hold-room`'s two hours with its machine terms met
-    /// on the reading the break judged ([`rules::ready`]); false where none was asked.
+    /// THE READY PROXY (§6).
     pub ready: bool,
-    /// The guards the last break judged (§2.1's set, [`rules::Guards`]), whether or not a rule
-    /// was due: why nothing fired. `None` before a break was judged.
+    /// The guards the last break judged (§2.1's set, [`rules::Guards`]).
     pub guards: Option<Guards>,
-    /// Each rule's last word, in [`RuleId::ALL`]'s order: the rules the recording's doors carry
-    /// ([`told_rules`]). A list, whose `Debug` is an array's, so the word a tape compares holds
-    /// the bytes an older build's two-rule array printed.
+    /// Each rule's last word, in [`RuleId::ALL`]'s order.
     pub rules: Vec<SaidRule>,
     /// When this was told, unix ms. Not part of the change.
     pub at_ms: i64,
-    /// The reading the break's decider judged (the empty reading where none was asked). Not
-    /// part of the change: a new reading alone tells nothing.
+    /// The reading the break's decider judged (the empty reading where none was asked).
     pub reading: OccupancyReading,
 }
 
 impl OccupancySaid {
-    /// Whether `other` says what this says: the mode, the hold, the ready proxy, each guard
-    /// and each rule's word. The stamp and the reading are not the change.
+    /// Whether `other` says what this says.
     #[must_use]
     pub fn same_change(&self, other: &Self) -> bool {
         self.mode == other.mode
@@ -123,8 +105,7 @@ impl OccupancySaid {
             && self.rules == other.rules
     }
 
-    /// The first guard the last break judged holding a line ([`rules::Guards::held`] of
-    /// `wait-nudge`; both built-ins ask the one set): what the ring's row names.
+    /// The first guard the last break judged holding a line.
     #[must_use]
     pub fn guard(&self) -> Option<Guard> {
         self.guards
@@ -143,9 +124,7 @@ impl OccupancySaid {
         }
     }
 
-    /// The rules whose cap is spent while a hold is open under `prompt`: what an
-    /// `occupancy.hold` Entry names. Under `observe` or `off` none (nothing was typed, so
-    /// nothing was spent of what the owner sees).
+    /// The rules whose cap is spent while a hold is open under `prompt`.
     #[must_use]
     pub fn spent_under_prompt(&self) -> Vec<RuleId> {
         if self.mode != Occupancy::Prompt || self.hold.is_none() {
@@ -199,14 +178,11 @@ pub fn clock_words(at_ms: i64, offset_s: i64) -> String {
     format!("{:02}:{:02}", local_s / 3600, (local_s % 3600) / 60)
 }
 
-/// A term's mark: `✓` where it holds, `✗` where it does not.
 fn mark(holds: bool) -> &'static str {
     if holds { "✓" } else { "✗" }
 }
 
-/// THE `occupancy why` FORM of `said` at `now_ms` (unix), clocks at `offset_s` (§6): the mode
-/// and the hold, then a line a rule — its verdict, when, and each of its terms with its mark —
-/// and the guards' line, each guard with its mark. Plain words and numbers ([module docs](self)).
+/// THE `occupancy why` FORM of `said` at `now_ms` (unix).
 #[must_use]
 pub fn why_lines(said: &OccupancySaid, now_ms: i64, offset_s: i64) -> Vec<String> {
     let mut lines = Vec::new();
@@ -283,9 +259,6 @@ pub fn why_lines(said: &OccupancySaid, now_ms: i64, offset_s: i64) -> Vec<String
     lines
 }
 
-/// `why`'s guards line (§6): each guard the last break judged with its mark, `✗` where it
-/// holds a line — the break's brake first, then [`Guards::each`] of `wait-nudge` (the
-/// autopilot's with its mode) — or `none judged` before a break was.
 fn guards_line(guards: Option<Guards>) -> String {
     let Some(guards) = guards else {
         return "  guards: none judged".to_string();

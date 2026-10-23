@@ -10,8 +10,6 @@ use super::{Host, Spawn, Stamp};
 /// The prefix of every row's scratch under a cache root.
 pub const SCRATCH_PREFIX: &str = aterm_uds::host::TOOLING_SCRATCH;
 
-/// The most an unpacked tree may hold: twice the largest any row has measured (pwsh's
-/// 193 MB), with room for upstream to grow.
 const UNPACKED_CAP: u64 = 2 << 30;
 
 /// A row's scratch, removed on drop unless a program run from it, unproven, retains it.
@@ -89,9 +87,6 @@ impl Scratch {
         self.dir.keep()
     }
 
-    /// A new, kept `.replaced-<dest's name>-*` folder beside the scratch for what [`place`]
-    /// moves aside: that may be running, so no run removes it; the tooling reclaim takes
-    /// it once idle.
     fn kept_beside(&self, dest: &Path) -> Result<PathBuf, String> {
         let root = self
             .path()
@@ -106,9 +101,6 @@ impl Scratch {
     }
 }
 
-/// Retention is armed before execution. Only the run's proof (a copy's stdout, a build's
-/// successful exit) takes the scratch back; every other return or unwind leaves what ran
-/// in place.
 struct RetainedScratch(Option<Scratch>);
 
 impl Drop for RetainedScratch {
@@ -119,8 +111,6 @@ impl Drop for RetainedScratch {
     }
 }
 
-/// The last path segment of `url`, the name its download takes: `archive` where it has
-/// none a file may carry.
 fn file_name(url: &str) -> String {
     let last = url.rsplit('/').next().unwrap_or_default();
     if last.is_empty()

@@ -169,7 +169,15 @@ pub fn apply_resuming(
             Ok(target) => match places.prepare(&entry.name) {
                 Err(why) => {
                     spared.extend(fsx::file_id(&target));
-                    Err(why)
+                    if entry.if_absent && places.linked(&entry.name) {
+                        Ok(if held_digest.is_some() {
+                            Placed::Held
+                        } else {
+                            Placed::Left
+                        })
+                    } else {
+                        Err(why)
+                    }
                 }
                 Ok(()) => {
                     if held_digest.is_none() {
@@ -372,9 +380,7 @@ impl<'a> Places<'a> {
             secrets,
             secrets_ok: fsx::ensure_private_dir(secrets).map_err(|error| error.0),
             now,
-            own: std::fs::metadata(crate::client::Paths::for_home(home).dir)
-                .ok()
-                .map(|meta| (meta.dev(), meta.ino())),
+            own: own_dir(home),
         }
     }
 
@@ -383,6 +389,13 @@ impl<'a> Places<'a> {
             Some(rel) => make_parents(self.home, rel, self.own),
             None => self.secrets_ok.clone(),
         }
+    }
+
+    /// Whether a directory on the way to home path `name`'s file is a symlink (a dotfiles
+    /// setup's `~/.config`, say): an ` if-absent` entry there is the machine's own, never
+    /// written through the link and not a failure, as a link in the file's own place is.
+    fn linked(&self, name: &str) -> bool {
+        linked(self.home, name, self.own)
     }
 
     fn reachable(&self, name: &str) -> bool {
@@ -400,13 +413,15 @@ enum Placed {
     /// narrowed and kept, and still the machine's own (out of the manifest), so dropping the
     /// entry leaves it and a new value moves it aside first.
     Adopted,
-    /// An ` if-absent` entry whose target, or anchor, is the machine's own.
+    /// An ` if-absent` entry whose target, or anchor, is the machine's own, or whose target
+    /// is behind a symlinked directory ([`Places::linked`]).
     Left,
     /// An anchored ` if-absent` entry whose file the vault wrote and whose anchor is the
     /// machine's own: taken back, as a dropped entry is.
     Withdrawn,
-    /// An anchored ` if-absent` entry whose file the vault wrote and whose anchor could not
-    /// be looked at: left as it is, and still the vault's.
+    /// An ` if-absent` entry whose file the vault wrote and which could not be looked at (its
+    /// anchor, or its own file behind a symlinked directory): left as it is, and still the
+    /// vault's.
     Held,
 }
 
@@ -669,6 +684,28 @@ fn make_parents(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// aterm's own key and state directory under `home` by (device, inode) ([`Places`]).
+fn own_dir(home: &Path) -> Option<(u64, u64)> {
+    std::fs::metadata(crate::client::Paths::for_home(home).dir)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Whether home path `name`'s file is behind a symlinked directory ([`Places::linked`]).
+fn linked(home: &Path, name: &str, own: Option<(u64, u64)>) -> bool {
+    name.strip_prefix("~/").is_some_and(|rel| {
+        refused_dir(home, rel, own)
+            .is_some_and(|dir| fsx::kind(&dir).is_ok_and(|kind| kind == Kind::Symlink))
+    })
+}
+
+/// Whether entry `name`'s file under `home` is behind a symlinked directory: a pass never
+/// writes or looks through the link, and holds a file the vault wrote there as it was
+/// ([`Placed::Held`]), so whoever checks the vault's files are intact does not judge it either.
+pub fn behind_a_link(home: &Path, name: &str) -> bool {
+    linked(home, name, own_dir(home))
 }
 
 fn refused_dir(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Option<PathBuf> {
@@ -1793,8 +1830,8 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), home.path().join("link")).expect("link");
         let entries = [gap(anchor, b"v2"), anchored("profile", b"v2", anchor)];
         let (manifest, report) = apply(home.path(), &entries, &held, 2).expect("unseen");
-        assert_eq!(failed_names(&report), [anchor]);
-        assert_eq!(report.left, ["profile"]);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!(report.left, [anchor, "profile"]);
         assert!(report.written.is_empty() && report.removed.is_empty());
         assert_eq!(read(&home.path().join(".secrets/profile")), b"v1");
         assert_eq!(manifest, held, "still what the vault wrote");
@@ -1861,7 +1898,7 @@ mod tests {
         let (manifest, report) =
             apply(home.path(), &entries, &Manifest::default(), 1).expect("applied");
         assert_eq!(report.written, ["plain"]);
-        assert_eq!(failed_names(&report), ["a", "b", "~/link/key"]);
+        assert_eq!(failed_names(&report), ["a", "b"]);
         assert!(
             report.failed[0].1.contains("anchor `missing`"),
             "{:?}",
@@ -1872,7 +1909,7 @@ mod tests {
             "{:?}",
             report.failed
         );
-        assert_eq!(report.left, ["c"]);
+        assert_eq!(report.left, ["~/link/key", "c"]);
         let secrets = home.path().join(".secrets");
         for name in ["a", "b", "c"] {
             assert!(!secrets.join(name).exists(), "{name}");
@@ -2038,6 +2075,10 @@ mod tests {
         assert!(!last.files.contains_key("dropped"));
     }
 
+    /// An entry behind a symlinked directory is never written through it. A plain entry, and
+    /// any entry in a symlinked `~/.secrets`, is a failure; an ` if-absent` home file there is
+    /// the machine's own (a dotfiles setup's `~/.config`), left, and kept in the manifest
+    /// when the vault wrote it.
     #[test]
     fn an_entry_behind_a_symlinked_directory_is_refused_before_any_look() {
         let home = scratch();
@@ -2054,24 +2095,33 @@ mod tests {
         std::fs::create_dir(&target).expect("dir");
         plant(&target.join("x"), b"v", 0o600);
         std::os::unix::fs::symlink(&target, home.path().join("link")).expect("link");
+        plant(&deep.join("d"), b"held", 0o600);
         let entries = [
             gap("gh_token", b"vault"),
             gap("~/a/b/c", b"vault"),
+            gap("~/a/b/d", b"vault"),
             entry("~/link/x", b"v"),
             entry("~/target/x", b"v"),
         ];
-        let (manifest, report) =
-            apply(home.path(), &entries, &Manifest::default(), 1).expect("applied");
-        assert_eq!(failed_names(&report), ["gh_token", "~/a/b/c", "~/link/x"]);
-        for ((_, why), link) in report.failed.iter().zip([".secrets", "a/b", "link"]) {
+        let held = Manifest {
+            files: BTreeMap::from([("~/a/b/d".to_string(), digest_hex(b"held"))]),
+        };
+        let (manifest, report) = apply(home.path(), &entries, &held, 1).expect("applied");
+        assert_eq!(failed_names(&report), ["gh_token", "~/link/x"]);
+        for ((_, why), link) in report.failed.iter().zip([".secrets", "link"]) {
             let link = home.path().join(link).display().to_string();
             assert!(why.contains(&link) && why.contains("symlink"), "{why}");
         }
-        assert!(report.left.is_empty(), "{:?}", report.left);
+        assert_eq!(report.left, ["~/a/b/c", "~/a/b/d"]);
         assert_eq!(report.unchanged, ["~/target/x"]);
-        assert!(manifest.files.is_empty(), "{:?}", manifest.files);
+        assert_eq!(
+            manifest.files,
+            BTreeMap::from([("~/a/b/d".to_string(), digest_hex(b"held"))]),
+            "the vault's file behind the link stays the vault's"
+        );
         assert_eq!(read(&real.join("gh_token")), b"theirs");
         assert_eq!(read(&deep.join("c")), b"theirs");
+        assert_eq!(read(&deep.join("d")), b"held");
     }
 
     #[test]

@@ -5,21 +5,16 @@
 
 use crate::xdnd::{Error, X, fault, request, u16_at, u32_at};
 
-/// The core events `FakeInput` fakes, by code.
 const KEY_PRESS: u8 = 2;
 const KEY_RELEASE: u8 = 3;
 const BUTTON_PRESS: u8 = 4;
 const BUTTON_RELEASE: u8 = 5;
 const MOTION_NOTIFY: u8 = 6;
 
-/// XTEST's `FakeInput` minor opcode.
 const FAKE_INPUT: u8 = 2;
 
-/// The keysyms a keymap reply may hold per keycode; a larger count is a
-/// malformed reply.
 const MAX_PER_KEYCODE: usize = 64;
 
-/// `QueryExtension` (98) of `name`.
 fn query_extension(name: &str) -> Vec<u8> {
     let len = u16::try_from(name.len()).unwrap_or(u16::MAX);
     let mut body = len.to_le_bytes().to_vec();
@@ -28,34 +23,26 @@ fn query_extension(name: &str) -> Vec<u8> {
     request(98, 0, &body)
 }
 
-/// `GetKeyboardMapping` (101) of `count` keycodes from `first`.
 fn get_keyboard_mapping(first: u8, count: u8) -> Vec<u8> {
     request(101, 0, &[first, count, 0, 0])
 }
 
-/// `GetInputFocus` (43): a round trip, so every request sent before it has
-/// been handled once its reply is read.
 fn get_input_focus() -> Vec<u8> {
     request(43, 0, &[])
 }
 
-/// `QueryPointer` (38) of `window`.
 fn query_pointer(window: u32) -> Vec<u8> {
     request(38, 0, &window.to_le_bytes())
 }
 
-/// `QueryKeymap` (44): which keys are down, a bit per keycode.
 fn query_keymap() -> Vec<u8> {
     request(44, 0, &[])
 }
 
-/// The buttons a `QueryPointer` reply's key-and-button mask holds down
-/// (`Button1Mask` is bit 8, through `Button5Mask`).
 fn held_buttons(mask: u16) -> Vec<u8> {
     (1u8..=5).filter(|b| mask & (1 << (7 + b)) != 0).collect()
 }
 
-/// The keycodes a `QueryKeymap` reply's 32-byte bit vector holds down.
 fn held_keys(bits: &[u8]) -> Vec<u8> {
     bits.iter()
         .take(32)
@@ -70,9 +57,6 @@ fn held_keys(bits: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// XTEST `FakeInput` of a core event: its code, its detail (a keycode, a
-/// button, or for a motion 1 relative and 0 absolute), now (time 0), on the
-/// pointer's screen (root None), at `(x, y)` for a motion.
 fn fake_input(major: u8, kind: u8, detail: u8, x: i16, y: i16) -> Vec<u8> {
     let mut body = [0u8; 32];
     body[0] = kind;
@@ -92,7 +76,6 @@ struct Keymap {
 }
 
 impl Keymap {
-    /// Read a `GetKeyboardMapping` reply of `count` keycodes from `min`.
     fn parse(reply: &[u8], min: u8, count: u8) -> Result<Keymap, String> {
         let per = usize::from(*reply.get(1).ok_or("a short GetKeyboardMapping reply")?);
         if per == 0 || per > MAX_PER_KEYCODE {
@@ -106,8 +89,6 @@ impl Keymap {
         Ok(Keymap { min, per, syms })
     }
 
-    /// The lowest keycode whose first keysym (its first group's first level:
-    /// what the key types with no modifier) is `keysym`.
     fn keycode(&self, keysym: u32) -> Option<u8> {
         self.syms
             .chunks(self.per)
@@ -117,7 +98,6 @@ impl Keymap {
     }
 }
 
-/// The X button of an evdev button code (BTN_LEFT, BTN_MIDDLE, BTN_RIGHT).
 fn x_button(code: i32) -> Option<u8> {
     match code {
         0x110 => Some(1),
@@ -156,9 +136,6 @@ impl Xtest {
         Ok(Xtest { x, major, keymap })
     }
 
-    /// Send one fake event, then a round trip: the server has handled it (and
-    /// sent the window under the pointer its event) once this returns, and an
-    /// error it raised is this call's.
     fn fake(&mut self, kind: u8, detail: u8, at: (i16, i16)) -> Result<(), Error> {
         self.x
             .send(&fake_input(self.major, kind, detail, at.0, at.1))?;
@@ -227,7 +204,6 @@ impl Xtest {
 mod tests {
     use super::*;
 
-    /// Requests as XTEST 2.2 and the X11R7.7 core protocol encode them.
     #[test]
     fn requests_are_encoded_as_the_protocols_lay_them_out() {
         let q = query_extension("XTEST");

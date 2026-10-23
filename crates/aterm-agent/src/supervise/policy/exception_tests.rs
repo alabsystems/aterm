@@ -94,13 +94,10 @@ fn seen(st: &mut TurnEndState, r: &TurnEndReading, now: Instant) {
     st.observe(r, now);
 }
 
-/// The id of the notice `e` carries, if any.
 fn notice_id(e: Option<&Exception>) -> Option<&'static str> {
     e.and_then(|e| e.notice.as_ref()).map(|n| n.id)
 }
 
-/// Observes `r` at `now`, then what the point decides and the exception that
-/// stands there.
 fn point(
     st: &mut TurnEndState,
     r: &TurnEndReading,
@@ -114,8 +111,6 @@ fn point(
     )
 }
 
-/// A reading of a real 2.1.303 `/login` screen, the session's login a
-/// subscription.
 fn dialog(text: &str) -> TurnEndReading {
     let rows = screen(text);
     let read = aterm_phase::read(Some("claude"), &rows, Some(2));
@@ -125,7 +120,6 @@ fn dialog(text: &str) -> TurnEndReading {
     }
 }
 
-/// A state that saw the wall and typed `/login` into it at `t`.
 fn typed_login(t: Instant) -> TurnEndState {
     let mut st = TurnEndState::default();
     let wall = walled(WallKind::Auth, "Login expired · Please run /login");
@@ -135,9 +129,6 @@ fn typed_login(t: Instant) -> TurnEndState {
     st
 }
 
-/// THE NOTICE SAYS WHAT THE POINT DECIDES: a lost login's notice is chosen with
-/// the point's own decision, so none says `/login` ran, or that a browser opened,
-/// where nothing was typed.
 #[test]
 fn a_lost_logins_notice_is_what_the_point_decides() {
     let t = t0();
@@ -228,11 +219,6 @@ fn a_lost_logins_notice_is_what_the_point_decides() {
     not_run(&mut st, &met, &budget, notice::WHY_BUDGET);
 }
 
-/// THE SIGN-IN IS TOLD WHERE IT IS THE OWNER'S: the browser
-/// hand-off of the `/login` aterm typed is the one step only they can take,
-/// named for the roster row the session's login is; the picker aterm answers
-/// is aterm's, one it does not answer the owner's; a `/login` left or stopped
-/// is theirs to type again.
 #[test]
 fn the_sign_in_is_told_where_it_is_the_owners() {
     use aterm_phase::prompt::fixtures::{
@@ -331,11 +317,6 @@ fn the_sign_in_is_told_where_it_is_the_owners() {
     );
 }
 
-/// A PERSON'S OWN `/login`: on a working session it is no lost login —
-/// nothing told, its picker theirs; at a lost login they are going through
-/// it — nothing told — and one they left is told as theirs (`login-left`,
-/// never "aterm ran /login"), with no `/login` of aterm's after it, their
-/// next prompt answered by the wall again included.
 #[test]
 fn a_persons_own_login_is_theirs() {
     use aterm_phase::prompt::fixtures::{
@@ -382,9 +363,6 @@ fn a_persons_own_login_is_theirs() {
     );
 }
 
-/// A spend or credit limit no reset ends says so once, with the action the
-/// vendor's own words call for: the admin's, not "add credits", for a seat or
-/// an organization that cannot buy them.
 #[test]
 fn a_spend_wall_with_no_reset_says_so_once_and_the_action_is_the_strings() {
     let t = t0();
@@ -426,9 +404,6 @@ fn a_spend_wall_with_no_reset_says_so_once_and_the_action_is_the_strings() {
     assert_eq!(exception_for(&st, &r, &cfg(), t), None);
 }
 
-/// The state after a wall in `r` answered every continuation typed after
-/// its reset (`r.reset_at`, which is `t`), one try past
-/// [`FUTILE_AFTER_TRIES`].
 fn tried_past_the_reset(
     r: &mut TurnEndReading,
     cfg: &SupervisorConfig,
@@ -457,13 +432,6 @@ fn tried_past_the_reset(
     st
 }
 
-/// A CODEX SESSION'S WALLS GET WORDS THAT NAME NO VENDOR, never Claude Code's
-/// (the Codex harness is retired, so no Codex step is said, and aterm reads no
-/// Codex screen: the walls are built here): its spend walls (the words the
-/// 0.162.1 lab measured, `docs/measured/real-claude-lab-2026-10-15.md` M2)
-/// send the person to the program's own notice, never to claude.ai or "usage credits"; a usage limit
-/// futile past its reset to the program's account; a lost login to its own
-/// notice, never the page `/login` opened.
 #[test]
 fn a_codex_sessions_walls_get_words_that_name_no_vendor() {
     use aterm_phase::Program;
@@ -591,10 +559,6 @@ fn a_codex_sessions_walls_get_words_that_name_no_vendor() {
     }
 }
 
-/// `Goal cleared after an unrecoverable error (<label>)` names its cause —
-/// but where the error is Claude Code's lost login, the sign-in is told
-/// first: it is needed now, and nothing runs, the goal included, until it
-/// is made.
 #[test]
 fn a_cleared_goal_names_its_cause() {
     let t = t0();
@@ -629,8 +593,6 @@ fn a_cleared_goal_names_its_cause() {
     assert!(e.notice.is_some(), "{e:?}");
 }
 
-/// A bucket no reset ends is an exception only when the tab has not switched
-/// off it an hour on, and says why.
 #[test]
 fn a_bucket_no_reset_ends_is_an_exception_only_while_the_tab_cannot_switch() {
     let t = t0();
@@ -686,8 +648,6 @@ fn a_bucket_no_reset_ends_is_an_exception_only_while_the_tab_cannot_switch() {
     assert_eq!(exception_for(&st3, &named, &cfg(), t + 120 * MIN), None);
 }
 
-/// A limit that keeps answering the continuation an hour past its reset is
-/// futile, a bucket with a named reset too.
 #[test]
 fn a_wall_that_answers_three_tries_an_hour_past_its_reset_is_futile() {
     use crate::supervise::policy::turn_end::{TurnEndAction, decide_turn_end};
@@ -747,20 +707,16 @@ fn a_wall_that_answers_three_tries_an_hour_past_its_reset_is_futile() {
     }
 }
 
-/// A real Claude Code screen as the policy reads it.
 fn read_screen(fixture: &str, worked: Option<Duration>) -> TurnEndReading {
     let rows = screen(fixture);
     let reading = aterm_phase::read(Some("claude"), &rows, Some(2));
     TurnEndReading::of(&reading, &rows, false, worked, None, None)
 }
 
-/// The exception after each answer to a wall as the loop meets it: `wall`, an
-/// act typed at it on the ladder, the next of `answers` drawn, and again.
 fn answered(wall: &str, answers: &[&str]) -> Vec<Option<Exception>> {
     answered_from(read_screen(wall, Some(3 * MIN)), answers)
 }
 
-/// [`answered`] from the wall the loop first meets as `first`.
 fn answered_from(first: TurnEndReading, answers: &[&str]) -> Vec<Option<Exception>> {
     let (mut st, mut now) = (TurnEndState::default(), t0());
     let mut r = first;
@@ -785,8 +741,6 @@ fn answered_from(first: TurnEndReading, answers: &[&str]) -> Vec<Option<Exceptio
     told
 }
 
-/// A full context Claude Code says `/compact` cannot reduce, three `/compact`s
-/// running, is a person's; a request error on a later rung does not end it.
 #[test]
 fn a_full_context_three_compacts_leave_full_is_an_exception_with_the_way_back() {
     let told = answered(
@@ -822,10 +776,6 @@ fn a_full_context_three_compacts_leave_full_is_an_exception_with_the_way_back() 
     assert_eq!(answered(END_529, &[END_529; 3])[2], None);
 }
 
-/// A FULL CONTEXT THAT IMAGES OR ATTACHMENTS FILL is told with the way back
-/// its own notice names (limits: "the image notice's context
-/// wall reuses the context exception's wording (`go back a few messages`)
-/// after three `/compact`s do not help").
 #[test]
 fn a_full_context_images_fill_is_told_with_the_way_back_its_notice_names() {
     const IMAGES: &str = "An image in the conversation exceeds the dimension limit for many-image requests (2000px). Run /compact to remove old images from context, or start a new session.";
@@ -851,8 +801,6 @@ fn a_full_context_images_fill_is_told_with_the_way_back_its_notice_names() {
     assert_eq!(answered(CONTEXT_WALL_MEASURED, &failed)[2], Some(plain));
 }
 
-/// A wait is never an exception: a reset ahead, an API outage, the vendor's
-/// own countdown, a full context.
 #[test]
 fn a_wait_is_never_an_exception() {
     let t = t0();
@@ -874,10 +822,6 @@ fn a_wait_is_never_an_exception() {
     }
 }
 
-/// A REQUEST THE API REFUSES the same way each time is told with the remedy
-/// its notice names — by the typed kind Claude Code wrote with it where the
-/// session's transcript has one, else by its words — and every other with
-/// the tab's own: fixed aterm words, nothing of the notice quoted.
 #[test]
 fn a_refused_request_is_told_with_the_remedy_its_notice_names() {
     for (typed, message, wants) in [
@@ -943,8 +887,6 @@ fn a_refused_request_is_told_with_the_remedy_its_notice_names() {
     }
 }
 
-/// The long context's entitlement as 2.1.300 words it is the account limit
-/// the older words were, with its own why: told once, the action the same.
 #[test]
 fn the_long_contexts_usage_credits_are_an_account_limit() {
     let t = t0();
@@ -969,10 +911,6 @@ fn the_long_contexts_usage_credits_are_an_account_limit() {
     assert_ne!(e.why, old.why);
 }
 
-/// A weekly usage limit never raises a nag exception on the glass, while an
-/// explicit `/login` error at the limit still surfaces `login-stopped`, and a
-/// draft holding back a ready account switch is detected by
-/// [`draft_holds_limit_switch`].
 #[test]
 fn a_weekly_usage_limit_does_not_raise_a_nag_exception() {
     use crate::supervise::policy::turn_end::{Ready, RosterWord};

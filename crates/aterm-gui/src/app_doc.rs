@@ -25,8 +25,7 @@ use crate::{App, WindowId};
 pub(crate) enum DocNames {
     /// Its `doc=` id.
     Id(u64),
-    /// The file it is, in each spelling the lane found for the URI asked with: as given, the
-    /// codec's, and the realpath one, which the store keys documents by.
+    /// Resolved file paths for the URI (as given, codec-decoded, and canonicalized).
     Uri(Vec<String>),
 }
 
@@ -76,8 +75,7 @@ pub(crate) struct DocFacts {
     pub(crate) disk: Option<DiskProbe>,
 }
 
-/// The person's caret and selection in one view of a document, as byte offsets into `text`, the
-/// document's text at the row's `seq=`.
+/// Caret and selection in one document view as byte offsets into `text` at `seq=`.
 #[derive(Debug)]
 pub(crate) struct Caret {
     pub(crate) view: u64,
@@ -161,8 +159,6 @@ impl App {
         }
     }
 
-    /// Every document an Editor view shows, with those views and their
-    /// windows, each list ascending by view.
     fn editor_documents(&self) -> BTreeMap<DocumentId, Vec<(WindowId, ViewId)>> {
         let mut documents: BTreeMap<DocumentId, Vec<(WindowId, ViewId)>> = BTreeMap::new();
         for (wid, ws) in &self.windows {
@@ -191,14 +187,12 @@ impl App {
         documents
     }
 
-    /// Whether `document`'s canonical URI is one of `spellings`.
     fn document_spelled(&self, document: DocumentId, spellings: &[String]) -> bool {
         self.document_store
             .canonical_uri(document)
             .is_some_and(|uri| spellings.iter().any(|spelling| spelling == uri))
     }
 
-    /// `document`'s row, shown by `views`, its edit tickets read as of `now`.
     fn doc_facts(
         &self,
         document: DocumentId,
@@ -237,11 +231,6 @@ impl App {
         })
     }
 
-    /// The tickets holding one of this App's sessions through one of
-    /// `views` at `now`, ascending: a program in that session waits on each.
-    /// The hold map is process-wide and a view id names a view only in the
-    /// App that allocated it, so a hold of a session this App does not host
-    /// (one that has closed, its hold not lapsed yet) is left out.
     fn tickets_through(&self, views: &[u64], now: Instant) -> Vec<Ticket> {
         let mut tickets: Vec<Ticket> = hold::holds_through(views, now)
             .into_iter()
@@ -253,8 +242,6 @@ impl App {
         tickets
     }
 
-    /// Which of `views` the person is at: the front view of the front
-    /// window, else the front view of another window, else the first.
     fn person_view(&self, views: &[(WindowId, ViewId)]) -> Option<ViewId> {
         let front = |wid: WindowId| self.active_native_view(wid).map(|(_, view)| view);
         self.frontmost_window
@@ -269,7 +256,6 @@ impl App {
             .or_else(|| views.first().map(|(_, view)| *view))
     }
 
-    /// `document`'s file and its saver's version of it, when it has both.
     fn disk_probe(&self, document: DocumentId) -> Option<DiskProbe> {
         let persistence = &self.native_documents.persistence;
         let grant = self
@@ -297,7 +283,6 @@ mod tests {
     use crate::native_editor::Selection;
     use crate::tab_model::TabId;
 
-    /// One scratch file, removed with the fixture.
     struct Fixture {
         _dir: aterm_tempfile::TempDir,
         path: PathBuf,
@@ -320,23 +305,19 @@ mod tests {
         }
     }
 
-    /// The URI the store keys `path`'s document by: its realpath spelling.
     fn canonical(path: &Path) -> String {
         crate::native_document_host::path_to_file_uri(&std::fs::canonicalize(path).unwrap())
             .unwrap()
     }
 
-    /// A headless App with one window, `WindowId(0)`.
     fn app() -> App {
         App::headless_for_test()
     }
 
-    /// `doc <rest>`, served against `app` as the lane serves it.
     fn doc(app: &App, rest: &str) -> String {
         crate::control_doc::serve_doc(rest, &mut |query| Ok(app.doc_answer(query, Instant::now())))
     }
 
-    /// A `doc ls` reply's rows, parsed as a client parses them.
     fn rows(reply: &str) -> Vec<DocRow> {
         let mut lines = reply.lines();
         let count: usize = lines
@@ -351,7 +332,6 @@ mod tests {
         rows
     }
 
-    /// A `doc read` reply's `doc=` and body, checked against its `OK <nbytes>`.
     fn body(reply: &str) -> (u64, &str) {
         let (header, body) = reply
             .split_once('\n')
@@ -369,7 +349,6 @@ mod tests {
         (doc, body)
     }
 
-    /// An Editor tab of `f` in window 0, in front; its view.
     fn open(app: &mut App, f: &Fixture) -> ViewId {
         app.open_document_tab(AppKind::Editor, &f.uri).unwrap();
         app.active_native_view(WindowId(0)).unwrap().1
@@ -407,8 +386,6 @@ mod tests {
         app.sync_window(wid);
     }
 
-    /// A terminal tab in window 0 whose session no other test's App mints:
-    /// the edit-hold map `ticket=` reads is process-wide.
     fn caller(app: &mut App) -> u64 {
         static NEXT: AtomicU64 = AtomicU64::new(3 << 40);
         let sid = NEXT.fetch_add(1 << 12, Ordering::Relaxed);
@@ -418,9 +395,6 @@ mod tests {
         sid
     }
 
-    /// `@<session> edit <uri>`, answered inline, and a waiter parked on its
-    /// ticket, as `amacs` parks one: the hold stands while the waiter's
-    /// channel (returned) is kept, however long the test takes.
     fn edit_waited(app: &mut App, session: u64, uri: &str) -> (EditOk, Receiver<String>) {
         app.serve_edits_headless_for_test();
         let ticket = crate::control_edit::mint_ticket();
@@ -560,9 +534,6 @@ mod tests {
         hold::clear(session, edit.ticket);
     }
 
-    /// A read's anchors are FNV-1a/64's first 6 hex digits of each line
-    /// without its end-of-line, computed here from the hash itself, and the
-    /// read is the rows `amacs --read` prints of the same file.
     #[test]
     fn doc_read_prints_anchors_matching_fnv1a() {
         let bytes = b"fn main() {\r\n    run();\r\n}\r\n";

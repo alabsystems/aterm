@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Typed-word detector: the companion reacts to lexicon words typed at the prompt, in every
-//! language [`aterm_lexicon`] knows.
+//! Typed-word detector for companion lexicon reactions.
 
 use aterm_lexicon::{Class, Lexicon, Match, ScanOptions, ScanScratch};
 use aterm_time::Instant;
@@ -41,8 +40,6 @@ impl TypedHit {
     }
 }
 
-/// Rolling-window capacity in chars: must exceed the longest lexicon surface, plus backspace
-/// history. Small because the typing path scans it on every key.
 const BUF_CAP: usize = 48;
 
 /// Ident-namespace tag for typed-summon sightings (`b"typedKit"` as big-endian ASCII).
@@ -54,7 +51,7 @@ pub const FAVOURITE_IDENT_TAG: u64 = 0x6661_764B_6974_7479;
 /// Ident-namespace tag for typed dog summons (`b"typedDog"` as big-endian ASCII).
 pub const DOG_SUMMON_IDENT_TAG: u64 = 0x7479_7065_6444_6f67;
 
-/// Per-window detector state: rolling keystroke window, summon cooldown stamp, and resident scan buffers.
+/// Per-window detector state holding the rolling keystroke buffer, cooldown, and scan scratch.
 #[derive(Default)]
 pub struct TypedKittySummon {
     /// Rolling window of recent printed keystrokes (≤ [`BUF_CAP`] chars), stored raw: the
@@ -169,11 +166,6 @@ impl TypedKittySummon {
         }
     }
 
-    /// Byte offset into `buf` where the incremental scan starts: the trailing
-    /// token (when `last` is a token char) or trailing no-space run (when it is
-    /// a no-space-script char), extended by two preceding chars of left
-    /// context. Walks `buf.char_indices().rev()` directly in O(token_len) with
-    /// zero scratch storage.
     fn trailing_scan_start(buf: &str, last: char) -> usize {
         let mut rev = buf.char_indices().rev().peekable();
         if rev.next().is_none() {
@@ -236,12 +228,6 @@ mod tests {
         Lexicon::builtin().clone()
     }
 
-    /// The incremental detector (token-gated, trailing-token scan) matches a
-    /// whole-window rescan keystroke for keystroke: same completions, classes
-    /// and clears. The corpus covers joiners and possessives (`cat's`,
-    /// `cat-like`), code-adjacent context (`./cat`, `--cat`, `x.cat`),
-    /// `scat`/`concatenate`, tokens longer than any surface, CJK against
-    /// Latin, punctuation and spaces, and a long run that trims the window.
     #[test]
     fn incremental_scan_matches_a_whole_window_rescan_keystroke_for_keystroke() {
         let lexicon = lex();
@@ -344,7 +330,6 @@ mod tests {
         }
     }
 
-    /// Feed a string one char at a time; count the ledger-recorded summons.
     fn feed(d: &mut TypedKittySummon, now: Instant, session: u64, s: &str) -> usize {
         let lx = lex();
         let opts = ScanOptions::default();
@@ -353,7 +338,6 @@ mod tests {
             .count()
     }
 
-    /// Feed a string one char at a time; count the completions (either tier).
     fn feed_completions(d: &mut TypedKittySummon, now: Instant, session: u64, s: &str) -> usize {
         let lx = lex();
         let opts = ScanOptions::default();
@@ -362,7 +346,6 @@ mod tests {
             .count()
     }
 
-    /// Feed a string one char at a time; count profanity completions.
     fn feed_curses(d: &mut TypedKittySummon, now: Instant, session: u64, s: &str) -> usize {
         let lx = lex();
         let opts = ScanOptions::default();
@@ -371,9 +354,6 @@ mod tests {
             .count()
     }
 
-    /// The typed sequence fires exactly once, at the completing letter, and the
-    /// consumed completion's tail re-triggers nothing (a held `y` is not a new
-    /// word).
     #[test]
     fn typed_word_summons_once_at_completion() {
         let mut d = TypedKittySummon::default();
@@ -396,8 +376,6 @@ mod tests {
         );
     }
 
-    /// Word boundaries apply to the feline family: `hellokitty` does not
-    /// summon (see `innocent_words_containing_a_curse_never_fire`).
     #[test]
     fn a_feline_word_glued_to_another_is_not_the_word() {
         let t = Instant::now();
@@ -415,8 +393,6 @@ mod tests {
         );
     }
 
-    /// The profanity family reacts in every listed language too, and carries
-    /// no ledger tier.
     #[test]
     fn profanity_winces_multilingually_and_never_records() {
         let t = Instant::now();
@@ -436,8 +412,6 @@ mod tests {
         }
     }
 
-    /// Word-boundary matching means an ordinary word that merely contains a
-    /// curse (`pick`) never fires.
     #[test]
     fn innocent_words_containing_a_curse_never_fire() {
         let t = Instant::now();
@@ -451,9 +425,6 @@ mod tests {
         }
     }
 
-    /// Ledger tier rate limit: a completion inside the cooldown records nothing
-    /// and does not restamp the clock, so the next window opens
-    /// [`TYPED_SUMMON_COOLDOWN`] after the last record.
     #[test]
     fn cooldown_suppresses_the_record_without_restamping() {
         let mut d = TypedKittySummon::default();
@@ -473,9 +444,6 @@ mod tests {
         );
     }
 
-    /// `records` never stands alone: a recorded row is always a completion,
-    /// which the ledger drain relies on. Exercised over the real cooldown so
-    /// both tiers come from the detector.
     #[test]
     fn a_recorded_summon_is_always_a_completion() {
         let mut d = TypedKittySummon::default();
@@ -501,7 +469,6 @@ mod tests {
         );
     }
 
-    /// Feed a string one char at a time; count canine hits (gate-passed dogs).
     fn feed_dogs(d: &mut TypedKittySummon, now: Instant, session: u64, s: &str) -> usize {
         let lx = lex();
         let opts = ScanOptions::default();
@@ -510,8 +477,6 @@ mod tests {
             .count()
     }
 
-    /// Type `n` keystrokes of neutral filler (letters + spaces, never a
-    /// lexicon word) to walk the odometer forward.
     fn type_filler(d: &mut TypedKittySummon, now: Instant, session: u64, n: u64) {
         let lx = lex();
         let opts = ScanOptions::default();
@@ -526,9 +491,6 @@ mod tests {
         }
     }
 
-    /// `dog` and `puppy` summon nothing until the window has typed
-    /// [`DOG_SUMMON_KEYS`] keystrokes, then summon every time, with no ledger
-    /// tier and no companion reaction flags.
     #[test]
     fn dogs_arrive_only_after_a_lot_of_typing() {
         let mut d = TypedKittySummon::default();
@@ -558,8 +520,6 @@ mod tests {
         }
     }
 
-    /// The odometer is a lifetime count: session switches, breaks and
-    /// backspaces clear the word window but never un-type the keystrokes.
     #[test]
     fn the_gate_odometer_survives_window_resets() {
         let mut d = TypedKittySummon::default();
@@ -577,9 +537,6 @@ mod tests {
         );
     }
 
-    /// Fixing a typo mid-word keeps the run (`kitx⌫ty` summons), and a pop
-    /// alone never summons: deleting to (or past) empty then typing `y`
-    /// completes nothing.
     #[test]
     fn backspace_pops_typos_and_never_summons() {
         let mut d = TypedKittySummon::default();
@@ -605,8 +562,6 @@ mod tests {
         );
     }
 
-    /// Word-breaking keys clear the run: `kit` ⏎ `ty` was never the typed
-    /// word; the next contiguous `kitty` summons normally.
     #[test]
     fn break_clears_the_run() {
         let mut d = TypedKittySummon::default();
@@ -621,8 +576,6 @@ mod tests {
         assert_eq!(feed(&mut d, t, 7, " kitty"), 1);
     }
 
-    /// Letters typed into different sessions never assemble one word: the
-    /// window is keyed to the session it was typed into and clears on switch.
     #[test]
     fn session_switch_clears_the_window() {
         let mut d = TypedKittySummon::default();
@@ -640,8 +593,6 @@ mod tests {
         );
     }
 
-    /// The window stays bounded and valid UTF-8 under a long multi-byte run,
-    /// and a word completing at the very end still fires after trimming.
     #[test]
     fn window_stays_bounded_and_utf8() {
         let mut d = TypedKittySummon::default();
@@ -652,8 +603,6 @@ mod tests {
         assert_eq!(feed(&mut d, t, 7, " kitty"), 1, "and still completes");
     }
 
-    /// The window must hold the longest surface the compiled lexicon can
-    /// match, or that word could never complete inside it.
     #[test]
     fn the_window_holds_the_longest_lexicon_surface() {
         let longest = lex()

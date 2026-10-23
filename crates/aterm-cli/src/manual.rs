@@ -366,11 +366,12 @@ WHAT IT DOES
   assertions`): neither the system nor the display idle-sleeps (closing the lid or
   choosing Sleep still sleeps). A click toggles it; a right-click or Control-click
   opens the menu (1h, 8h, 24h, Forever, Enable at Startup, Quit Caffeine). Timed
-  spans end on the wall clock; a restart turns it off, a logout keeps it. Enable at
-  Startup works only while aterm's switch under Background App Activity (System
-  Settings > General > Login Items & Extensions) is on; while it is off, `startup`
-  reads `blocked` and the menu row opens Login Items. A job turned off with
-  `launchctl disable` reads `disabled`; turning Enable at Startup on lifts that.
+  spans count time asleep, and a change of the date or time neither lengthens nor
+  shortens one; a restart turns it off, a logout keeps it. Enable at Startup works
+  only while aterm's switch under Background App Activity (System Settings >
+  General > Login Items & Extensions) is on; while it is off, `startup` reads
+  `blocked` and the menu row opens Login Items. A job turned off with `launchctl
+  disable` reads `disabled`; turning Enable at Startup on lifts that.
 
 VERBS (`aterm caffeine --help` has each one)
   aterm caffeine [start] | on [1h|8h|24h|forever|<n>h|<n>m] | off | status

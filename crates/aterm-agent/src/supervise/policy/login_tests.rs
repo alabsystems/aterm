@@ -53,10 +53,7 @@ fn ctx(approve: Approve) -> ApprovalCtx {
     }
 }
 
-/// The subscription's row, where the dialog opens the focus (its first row);
-/// a focus a person's key moved off it — to Console, say, to bill a usage
-/// limit's work to the API — is their choice, never moved back (the review's
-/// F2).
+/// Selects the subscription row only when focus is still on the opening row.
 #[test]
 fn a_subscription_session_chooses_the_subscription_row_where_the_dialog_opens_it() {
     for text in [LOGIN_PICKER, LOGIN_PICKER_WARNED] {
@@ -82,10 +79,7 @@ fn an_unknown_console_or_platform_method_is_the_owners() {
     }
 }
 
-/// The picker of the `/login` the loop typed into a lost login is part of
-/// that act, answered at every power; any other picker — a person's own
-/// `/login`, on a working session or not — is theirs at every power (the
-/// review's F2, voluntary-login-false-alarm); Console's menu never.
+/// Answers only the picker opened by the loop's own `/login`, never a user's or Console's.
 #[test]
 fn the_approval_policy_answers_only_the_picker_of_its_own_login() {
     let now = Instant::now();
@@ -161,13 +155,7 @@ fn the_approval_policy_answers_only_the_picker_of_its_own_login() {
     }
 }
 
-/// THE PICKER OF THE LOOP'S OWN `/login` ONCE THE LOGIN CAME BACK IN ANOTHER
-/// TAB (the review's harness-login-misled-dialog): nothing is left to sign
-/// in, so the gate gives it to nobody ([`PickerGate::Back`]) and the approval
-/// policy escalates it with the step that closes it, at every power and with
-/// the method known. NEGATIVE CONTROLS: the login carried there or nowhere,
-/// the same picker is aterm's (answered with the method); a person's own
-/// picker stays theirs whatever the host says.
+/// Escalates the loop's picker with `Esc` once another tab has restored the login.
 #[test]
 fn the_picker_of_a_login_back_elsewhere_is_answered_by_nobody() {
     let back = LoginShared::Back {
@@ -207,17 +195,7 @@ fn the_picker_of_a_login_back_elsewhere_is_answered_by_nobody() {
     }
 }
 
-/// THE PICKER OF THE LOOP'S OWN `/login` ONCE A RENEWAL THE TAB FOLLOWS
-/// REPLACED ITS LOGIN (the review of the login carry, acct3-3): nothing is
-/// left to sign in — a method chosen opens a browser sign-in that brings back
-/// the replaced login — so the gate gives it to nobody
-/// ([`PickerGate::Renewed`]) and the approval policy escalates it with the
-/// step that closes it, at every power and with the method known. The
-/// renewal is followed only with the logins' lifecycle on and a relaunch in
-/// reach ([`renewal_followed`]). NEGATIVE CONTROLS: no renewal, or one out of
-/// reach (`relaunch` or `resume_limits` off, no host that relaunches, the
-/// lifecycle off), and the same picker is aterm's; a person's own picker
-/// stays theirs; a login back in another tab is the back gate's.
+/// Escalates the loop's picker with `Esc` once a followed renewal replaces its login.
 #[test]
 fn the_picker_over_a_renewed_login_is_answered_by_nobody() {
     let cfg = SupervisorConfig::default();
@@ -280,10 +258,7 @@ fn walled() -> TurnEndState {
     st
 }
 
-/// Over a lost login, only the success gets a key (its Enter); every other
-/// state nothing — the owner is told by the login's notice, never by an
-/// escalation beside it (the review's double-telling). A `/login` a person
-/// opened on a working session (no lost login) gets nothing at all.
+/// Over a lost login, only `LOGIN_SUCCESS` sends `Enter`; user-initiated dialogs send nothing.
 #[test]
 fn each_dialog_state_gets_its_act() {
     let fresh = TurnEndState::default();
@@ -371,9 +346,7 @@ fn the_success_enter_goes_once() {
     );
 }
 
-/// The dialog short of its success stands (a busy read of it is no agent
-/// working); its success, a wall under a composer and an ordinary busy turn
-/// do not.
+/// Pre-success login dialog screens report `dialog_stands` as true.
 #[test]
 fn the_dialog_short_of_its_success_stands() {
     for text in [

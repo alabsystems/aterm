@@ -390,28 +390,39 @@ pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, Seed
     rows
 }
 
-/// When (unix ms, oldest first) each stuck line a loop before this one typed at a break went,
-/// from ledger `body`: session `sid`'s `fact-no-progress@v1` rows `typed` at `door=break` (a
-/// rider's `door=turn-end` row is no line of its own). A successor counts them toward the
-/// session's pace, as [`super::rules::would_rows_in`] carries the door's own lines.
+/// When (unix ms, oldest first) each line of aterm's own a loop before this one typed at a break
+/// went, from ledger `body`: session `sid`'s `fact-no-progress@v1` rows `typed` at `door=break`
+/// (a rider's `door=turn-end` row is no line of its own) and its `fact-hold@v1` rows `typed`
+/// (the door's lines under `prompt`; a `fact-would@v1` row never went). A successor paces the
+/// stuck line by them, as [`super::rules::would_rows_in`] seeds the door's own books; each comes
+/// with its kind (`NoProgress` or `Hold`).
 #[must_use]
-pub fn stuck_lines_in(body: &str, sid: Option<&str>) -> Vec<i64> {
-    let rule = FactKind::NoProgress.rule();
+pub fn break_lines_in(body: &str, sid: Option<&str>) -> Vec<(i64, FactKind)> {
+    let (stuck, hold) = (FactKind::NoProgress.rule(), FactKind::Hold.rule());
     let want = sid.map(|s| s.trim_start_matches('@'));
     body.lines()
-        .filter(|line| line.contains(rule) && want.is_none_or(|sid| line.contains(sid)))
-        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
-        .filter(|v| {
-            let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
-            text("sid") == want
-                && text("rule_id") == Some(rule)
-                && text("decision") == Some("typed")
-                && text("reason").is_some_and(|r| {
-                    r.split(' ')
-                        .any(|w| w.strip_prefix("door=") == Some(FactDoor::Break.word()))
-                })
+        .filter(|line| {
+            (line.contains(stuck) || line.contains(hold))
+                && want.is_none_or(|sid| line.contains(sid))
         })
-        .filter_map(|v| v.get("ts").and_then(aterm_json::Value::as_i64))
+        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+        .filter_map(|v| {
+            let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+            let kind = match text("rule_id") {
+                Some(rule) if rule == hold => Some(FactKind::Hold),
+                Some(rule) if rule == stuck => text("reason")
+                    .is_some_and(|r| {
+                        r.split(' ')
+                            .any(|w| w.strip_prefix("door=") == Some(FactDoor::Break.word()))
+                    })
+                    .then_some(FactKind::NoProgress),
+                _ => None,
+            };
+            if text("sid") != want || text("decision") != Some("typed") {
+                return None;
+            }
+            Some((v.get("ts").and_then(aterm_json::Value::as_i64)?, kind?))
+        })
         .collect()
 }
 

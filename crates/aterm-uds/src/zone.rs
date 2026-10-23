@@ -1,26 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A zone's offset from UTC at an instant, read in this process: the offset daylight saving
-//! gives that instant, in seconds east of UTC, with no `date +%z` child per question.
-//!
-//! * The local clock's ([`local_offset_at`](crate::zone::local_offset_at)) is `localtime_r`'s
-//!   `tm_gmtoff`, after a `tzset` so a replaced system zone is followed (glibc keeps its first
-//!   zone otherwise). This process's `TZ` wins, as it would for a `date` child.
-//! * A named zone's ([`zone_offset_at`](crate::zone::zone_offset_at)) is read from its TZif file
-//!   under `/usr/share/zoneinfo` (RFC 8536), the file `TZ=<zone> date` reads: the transition in
-//!   force at the instant, and past the last transition the file's footer rule (a POSIX `TZ`
-//!   string, [`posix_offset_at`](crate::zone::posix_offset_at)). No `TZ` is set: a process's
-//!   `TZ` is shared by every thread, and setting it beside a reader is undefined.
+//! A zone's offset from UTC at an instant, read in this process in seconds east of UTC.
 
 use std::path::Path;
 
-/// Where the system's zone files are: what `TZ=<zone>` names under.
+/// Where the system's zone files are.
 pub const ZONEINFO: &str = "/usr/share/zoneinfo";
 
-/// The local clock's offset from UTC at the instant `unix`, in seconds east of UTC:
-/// `localtime_r`'s `tm_gmtoff` under this process's `TZ` (else the system zone), after
-/// `tzset`. `None` where the C library cannot say, and off Unix.
+/// The local clock's offset from UTC at `unix`, in seconds east of UTC.
 #[must_use]
 pub fn local_offset_at(unix: i64) -> Option<i64> {
     imp::local_offset_at(unix)
@@ -35,8 +23,7 @@ pub fn local_offset_now() -> Option<i64> {
     local_offset_at(i64::try_from(now.as_secs()).ok()?)
 }
 
-/// Whether `zone` is a plain zone name (`America/New_York`, `Etc/GMT+5`, `UTC`): what
-/// [`zone_offset_at`] reads a file under [`ZONEINFO`] for. Never a path out of it.
+/// Whether `zone` is a plain zone name (`America/New_York`, `Etc/GMT+5`, `UTC`).
 #[must_use]
 pub fn plain_zone_name(zone: &str) -> bool {
     !zone.is_empty()
@@ -47,10 +34,7 @@ pub fn plain_zone_name(zone: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'))
 }
 
-/// The named zone's offset from UTC at the instant `unix`, in seconds east of UTC, from its
-/// TZif file under [`ZONEINFO`] ([`tzif_offset_at`]). `None` for a name that is no plain
-/// zone name ([`plain_zone_name`]), a zone the machine has no file for, or a file that does
-/// not parse.
+/// The named zone's offset from UTC at `unix`, in seconds east of UTC, from [`ZONEINFO`].
 #[must_use]
 pub fn zone_offset_at(zone: &str, unix: i64) -> Option<i64> {
     zone_offset_in(Path::new(ZONEINFO), zone, unix)
@@ -62,7 +46,6 @@ pub fn zone_offset_in(root: &Path, zone: &str, unix: i64) -> Option<i64> {
     if !plain_zone_name(zone) {
         return None;
     }
-    // A zone file is a few KiB; anything past this is not one.
     const MOST: u64 = 1 << 20;
     let file = std::fs::File::open(root.join(zone)).ok()?;
     let mut bytes = Vec::new();
@@ -70,10 +53,7 @@ pub fn zone_offset_in(root: &Path, zone: &str, unix: i64) -> Option<i64> {
     tzif_offset_at(&bytes, unix)
 }
 
-/// A TZif file's (RFC 8536) offset from UTC at `unix`, in seconds east of UTC: the time type
-/// of the last transition at or before `unix`; time type 0 before the first; and, from the
-/// last transition on, the footer's rule where the file has one (version 2 and later). A
-/// version 2+ file is read from its 64-bit block. `None` where the bytes are no TZif.
+/// A TZif file's (RFC 8536) offset from UTC at `unix`, in seconds east of UTC.
 #[must_use]
 pub fn tzif_offset_at(bytes: &[u8], unix: i64) -> Option<i64> {
     let first = Header::read(bytes)?;
@@ -120,7 +100,6 @@ pub fn tzif_offset_at(bytes: &[u8], unix: i64) -> Option<i64> {
     if count == 0 || unix < time(0)? {
         return utoff(0);
     }
-    // The last transition at or before `unix`: the times ascend (RFC 8536 §3.2).
     let (mut lo, mut hi) = (0usize, count);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
@@ -137,7 +116,6 @@ pub fn tzif_offset_at(bytes: &[u8], unix: i64) -> Option<i64> {
     utoff(kind)
 }
 
-/// A TZif header's length.
 const HEADER: usize = 44;
 
 /// A TZif header's version and counts (RFC 8536 §3.1).
@@ -173,7 +151,6 @@ impl Header {
         })
     }
 
-    /// The data block's length after this header, with `width`-byte times.
     fn block_len(self, width: usize) -> Option<usize> {
         let leap = width.checked_add(4)?;
         self.timecnt
@@ -187,7 +164,6 @@ impl Header {
     }
 }
 
-/// The footer's POSIX `TZ` string (`\n<TZ>\n`), `None` when it is empty or absent.
 fn footer_of(rest: &[u8]) -> Option<&str> {
     let rest = rest.strip_prefix(b"\n")?;
     let end = rest.iter().position(|b| *b == b'\n')?;
@@ -195,17 +171,13 @@ fn footer_of(rest: &[u8]) -> Option<&str> {
     (!tz.is_empty()).then_some(tz)
 }
 
-/// A POSIX `TZ` string's offset from UTC at `unix`, in seconds east of UTC: `std offset [dst
-/// [offset] [,start[/time],end[/time]]]`, with RFC 8536's extensions (a rule time of -167 to
-/// 167 hours). A `dst` with no rule takes the US rule (`M3.2.0,M11.1.0`), as tzcode does.
-/// `None` where the string does not parse.
+/// A POSIX `TZ` string's offset from UTC at `unix`, in seconds east of UTC.
 #[must_use]
 pub fn posix_offset_at(tz: &str, unix: i64) -> Option<i64> {
     let mut p = Posix {
         rest: tz.as_bytes(),
     };
     p.name()?;
-    // POSIX offsets are west of UTC: `EST5` is five hours behind.
     let std_off = -p.clock(24)?;
     if p.rest.is_empty() {
         return Some(std_off);
@@ -227,7 +199,6 @@ pub fn posix_offset_at(tz: &str, unix: i64) -> Option<i64> {
         return None;
     }
     let (year, _, _) = civil_from_days((unix + std_off).div_euclid(86_400));
-    // The start is said in standard time, the end in daylight time.
     let starts = start.local_seconds(year)? - std_off;
     let ends = end.local_seconds(year)? - dst_off;
     let daylight = if starts < ends {
@@ -238,7 +209,6 @@ pub fn posix_offset_at(tz: &str, unix: i64) -> Option<i64> {
     Some(if daylight { dst_off } else { std_off })
 }
 
-/// The unread rest of a POSIX `TZ` string.
 struct Posix<'a> {
     rest: &'a [u8],
 }
@@ -262,7 +232,6 @@ struct Rule {
 }
 
 impl Rule {
-    /// When this rule changes the clock in `year`, in local seconds since the epoch.
     fn local_seconds(self, year: i64) -> Option<i64> {
         let jan1 = days_from_civil(year, 1, 1);
         let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
@@ -289,7 +258,6 @@ impl Rule {
 }
 
 impl Posix<'_> {
-    /// A zone abbreviation: `<...>` quoted, or three or more letters.
     fn name(&mut self) -> Option<()> {
         if let Some(rest) = self.rest.strip_prefix(b"<") {
             let end = rest.iter().position(|b| *b == b'>')?;
@@ -315,7 +283,6 @@ impl Posix<'_> {
         digits.parse().ok()
     }
 
-    /// `[+|-]hh[:mm[:ss]]` as seconds, `hh` at most `most` hours.
     fn clock(&mut self, most: i64) -> Option<i64> {
         let sign = match self.rest.first() {
             Some(b'-') => -1,
@@ -344,7 +311,6 @@ impl Posix<'_> {
         Some(if sign < 0 { -seconds } else { seconds })
     }
 
-    /// `,date[/time]`.
     fn rule(&mut self) -> Option<Rule> {
         self.rest = self.rest.strip_prefix(b",")?;
         let day = match self.rest.first()? {
@@ -379,10 +345,6 @@ impl Posix<'_> {
     }
 }
 
-/// (year, month, day) → days since 1970-01-01, proleptic Gregorian (Hinnant's
-/// `days_from_civil`). `aterm_types::rfc3339`, the workspace's calendar, depends on this
-/// crate, so the zone rules carry their own two lines of it; `the_calendar_is_civil` holds
-/// it to known dates.
 const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -393,7 +355,6 @@ const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// Days since 1970-01-01 → (year, month, day), the inverse of [`days_from_civil`].
 const fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);

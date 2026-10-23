@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aos-repair`: Aos M2 proof runner for live momentum-glow fault detection and hot-swap repair.
+//! `aos-repair`: Aos proof runner for live momentum-glow fault detection, hot-swap repair and plan publication against a control.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -9,8 +9,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aterm_agent::RelayClient;
+use aterm_aos::Digest;
+use aterm_effects::aos_momentum::bundle::{BUNDLE_DOMAIN, CandidateBundle, UncheckedBundle};
+use aterm_effects::aos_momentum::m4::Evaluator;
+use aterm_effects::aos_momentum::plan::{PLAN_LEN, PLAN_NAME, SchedulePlan};
 use aterm_uds::CtlStream;
 
+use crate::aos_phase::{self, ms};
+use crate::aos_search::LAB_BUILD;
 use crate::instance::{self, Instance, Launch, World, take_flag, take_value};
 use crate::paths::{from_caller, paths};
 use crate::pyjson::J;
@@ -19,7 +25,7 @@ use crate::{Fail, Res};
 
 /// The verb's own help (`aos-repair --help`).
 pub const HELP: &str = "\
-usage: targo --unverified lab aos-repair [--aterm PATH] [--control] [--keep] [--out DIR]
+usage: targo --unverified lab aos-repair [--aterm PATH] [--control | --publish PLAN_HEX] [--keep] [--out DIR]
 
 OPENS ONE WINDOW. Aos M2's live repair on a private windowed aterm (a debug build: `aos` is refused in a release one):
 the front window's momentum glow attached under the demonstration fault demo-stranded-settle, 24 keys typed through
@@ -33,7 +39,15 @@ hold exactly its 24 keys and no reset. A host whose `aos trace` lacks sealed=/ke
   --aterm PATH  the aterm to run (default: the lab's pick, `targo --unverified lab paths`; with CARGO_TARGET_DIR set,
                 the aterm beside this program in that target dir)
   --control     the negative control: attach the shipped code, skip the repair, and require the glow to clear by
-                itself
+                itself; then the 12-key phase of --publish with no publication (the caret moved once with no key in
+                its settling tail, 3 s after the last key in both modes), measured from its exported trace (MEASURED
+                lines, never gates; `aos-phase` re-derives them from the kept trace)
+  --publish PLAN_HEX
+                Aos M4: the control's first 24 keys, then `aos publish plan=PLAN_HEX` (a plan's 12 bytes as 24 hex
+                digits), the plan live, `aos bundle` decoded and verified in the lab (only when the window's build
+                names this lab's clean commit; else verify=skipped(foreign build), a FAIL), then the same 12-key
+                phase measured: T, P and Z, presents, the slot rounding of the settle answers, and the moved caret's
+                lag
   --keep        keep the scratch world (and the frames in it when --out is not given)
   --out DIR     where the frames, sidecars, contrast reports and the transcript go, OUTSIDE the repository
 
@@ -159,6 +173,10 @@ pub struct Status {
     pub window: u64,
     pub attached: bool,
     pub code: String,
+    /// The build the window's code was compiled into (`build=`), when the line names one.
+    pub build: Option<String>,
+    /// An attached plan's presentation guard (`guard=moved:<b>,firings:<n>`) as printed.
+    pub guard: Option<String>,
     pub hot: bool,
     pub active: bool,
     pub settling: bool,
@@ -204,6 +222,8 @@ pub fn parse_status(line: &str) -> Result<Status, String> {
     if !s.attached {
         return Ok(s);
     }
+    s.build = f.get("build").map(|b| (*b).to_string());
+    s.guard = f.get("guard").map(|g| (*g).to_string());
     s.rev = num(&f, "rev")?;
     s.paused = flag(&f, "paused")?;
     s.log = num(&f, "log")?;
@@ -675,15 +695,32 @@ pub struct Cooled {
 /// Evaluate the self-cooling glow verification gates.
 #[must_use]
 pub fn cooled_gates(e: &Cooled) -> Vec<Gate> {
+    cooled_gates_in(Burst::First, "shipped", e)
+}
+
+/// Which typed burst a self-cooling glow's gates judge: the first after the attach (or the repair's fresh keys), or the 12 fresh keys after it, whose gates are named `fresh-…`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Burst {
+    First,
+    Fresh,
+}
+
+/// [`cooled_gates`] for `burst`, under the live code whose status name is `code` (`shipped`, or [`PLAN_NAME`] for a published plan).
+#[must_use]
+pub fn cooled_gates_in(burst: Burst, code: &str, e: &Cooled) -> Vec<Gate> {
     let c = &e.cold;
+    let name = |first: &'static str, fresh: &'static str| match burst {
+        Burst::First => first,
+        Burst::Fresh => fresh,
+    };
     vec![
         gate(
-            "keys-heat",
-            e.hot.hot && e.hot.code == "shipped",
+            name("keys-heat", "fresh-keys-heat"),
+            e.hot.hot && e.hot.code == code,
             format!("hot={} code={}", e.hot.hot, e.hot.code),
         ),
         gate(
-            "settling-names-wake",
+            name("settling-names-wake", "fresh-settling-names-wake"),
             e.settling.settling && e.settling.deadline.is_some(),
             format!(
                 "settling={} query_at={} deadline={} cold_at={}",
@@ -694,7 +731,7 @@ pub fn cooled_gates(e: &Cooled) -> Vec<Gate> {
             ),
         ),
         gate(
-            "cleared-by-itself",
+            name("cleared-by-itself", "fresh-cleared-by-itself"),
             e.frames_cold > e.frames_settling && !c.hot && !c.active && !c.settling,
             format!(
                 "frames {} -> {} with no key; hot={} active={} settling={}",
@@ -702,7 +739,7 @@ pub fn cooled_gates(e: &Cooled) -> Vec<Gate> {
             ),
         ),
         gate(
-            "last-tick-inert",
+            name("last-tick-inert", "fresh-last-tick-inert"),
             c.frame.as_ref().is_some_and(Frame::inert) && e.trail.block_fill == "none",
             format!(
                 "{} block_fill={}",
@@ -711,12 +748,12 @@ pub fn cooled_gates(e: &Cooled) -> Vec<Gate> {
             ),
         ),
         gate(
-            "cooled-pixels",
+            name("cooled-pixels", "fresh-cooled-pixels"),
             e.outside_caret_px == Some(0),
             format!("outside_caret_px={}", px_word(e.outside_caret_px)),
         ),
         gate(
-            "admitted",
+            name("admitted", "fresh-admitted"),
             c.refused == 0 && !c.broken,
             format!("refused={} broken={}", c.refused, c.broken),
         ),
@@ -726,6 +763,18 @@ pub fn cooled_gates(e: &Cooled) -> Vec<Gate> {
 /// Evaluate the post-repair continuation gates.
 #[must_use]
 pub fn continuation_gates(
+    committed: &Status,
+    after: &Status,
+    beside: &Status,
+    trace: &TraceLine,
+) -> Vec<Gate> {
+    continuation_gates_for("shipped", committed, after, beside, trace)
+}
+
+/// [`continuation_gates`] for the live code whose status name is `code`: [`PLAN_NAME`] after a publication, or `shipped` in the control (`committed` then the reading before its fresh keys).
+#[must_use]
+pub fn continuation_gates_for(
+    code: &str,
     committed: &Status,
     after: &Status,
     beside: &Status,
@@ -744,7 +793,7 @@ pub fn continuation_gates(
     vec![
         gate(
             "same-published-pair",
-            after.code == "shipped" && after.rev == committed.rev,
+            after.code == code && after.rev == committed.rev,
             format!("code={} rev {} -> {}", after.code, committed.rev, after.rev),
         ),
         gate(
@@ -794,15 +843,19 @@ pub fn log_kinds_gate(name: &'static str, trace: &TraceLine, keys: u64) -> Gate 
 /// Evaluate the `aos trace` gates immediately after commit before fresh keys.
 #[must_use]
 pub fn post_commit_gates(r: &Repair, trace: &TraceLine) -> Vec<Gate> {
+    post_commit_gates_at(r.log_epoch, &r.range, trace)
+}
+
+/// [`post_commit_gates`] for a commit whose witness read the log epoch `log_epoch` over the range `range` (`a..b`): a repair's, or a publication's.
+#[must_use]
+pub fn post_commit_gates_at(log_epoch: u64, range: &str, trace: &TraceLine) -> Vec<Gate> {
     vec![
         gate(
             "post-commit-log",
-            trace.log_epoch > r.log_epoch
-                && range_end(&r.range) == Some(trace.first)
-                && !trace.broken,
+            trace.log_epoch > log_epoch && range_end(range) == Some(trace.first) && !trace.broken,
             format!(
-                "log_epoch {} -> {} range={} first={} broken={}",
-                r.log_epoch, trace.log_epoch, r.range, trace.first, trace.broken
+                "log_epoch {log_epoch} -> {} range={range} first={} broken={}",
+                trace.log_epoch, trace.first, trace.broken
             ),
         ),
         log_kinds_gate("post-commit-no-key-or-reset", trace, 0),
@@ -828,6 +881,294 @@ pub fn control_gates(attached: &Status, cold: &Status) -> Vec<Gate> {
                 "publications={} replays={} rejections={} rev={}",
                 cold.publications, cold.replays, cold.rejections, cold.rev
             ),
+        ),
+    ]
+}
+
+/// An `aos publish` reply (the verb's `publish_line`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PublishLine {
+    pub window: u64,
+    pub paused_first: bool,
+    pub rev: u64,
+    /// The plan's 12 bytes in lowercase hex, and its candidate id's first 12 digits.
+    pub plan: String,
+    pub plan_digest: String,
+    pub useful: bool,
+    pub gain_ppm: i64,
+    pub s0_gain_ppm: i64,
+    /// The published (candidate) code's artifact name, the live code's, and their verdicts.
+    pub code: String,
+    pub live: String,
+    pub live_verdict: String,
+    pub candidate_verdict: String,
+    pub trace: String,
+    pub ancestor: String,
+    pub range: String,
+    pub log_epoch: u64,
+    pub grade: String,
+    /// The bundle's digest, its first 12 digits.
+    pub bundle: String,
+    pub delivered: u64,
+}
+
+/// Parse an `aos publish` reply, whose witness half (`code=` to `log_epoch=`) is required.
+///
+/// # Errors
+/// Not an OK `published` reply (a refusal is an `ERR …` line), or a field missing or malformed.
+pub fn parse_publish(line: &str) -> Result<PublishLine, String> {
+    let b = body(line)?;
+    if !b.split_whitespace().any(|w| w == "published") {
+        return Err(format!("not a publish reply: {b}"));
+    }
+    let f = fields(b);
+    Ok(PublishLine {
+        window: num(&f, "window")?,
+        paused_first: flag(&f, "paused_first")?,
+        rev: num(&f, "rev")?,
+        plan: req(&f, "plan")?.to_string(),
+        plan_digest: req(&f, "plan_digest")?.to_string(),
+        useful: flag(&f, "useful")?,
+        gain_ppm: num(&f, "gain_ppm")?,
+        s0_gain_ppm: num(&f, "s0_gain_ppm")?,
+        code: req(&f, "code")?.to_string(),
+        live: req(&f, "live")?.to_string(),
+        live_verdict: req(&f, "live_verdict")?.to_string(),
+        candidate_verdict: req(&f, "candidate_verdict")?.to_string(),
+        trace: req(&f, "trace")?.to_string(),
+        ancestor: req(&f, "ancestor")?.to_string(),
+        range: req(&f, "range")?.to_string(),
+        log_epoch: num(&f, "log_epoch")?,
+        grade: req(&f, "grade")?.to_string(),
+        bundle: req(&f, "bundle")?.to_string(),
+        delivered: num(&f, "delivered")?,
+    })
+}
+
+/// The plan's artifact name, as a publication names its candidate code.
+pub const PLAN_CODE: &str = "momentum-glow.schedule-plan";
+
+/// The publication gates: paused first with nothing queued, the plan the run named, useful with a gain, a new revision of the plan over the shipped code, both verdicts passing at grade `tested`, and the bundle's digest named.
+#[must_use]
+pub fn publish_gates(p: &PublishLine, plan_hex: &str, before: &Status) -> Vec<Gate> {
+    vec![
+        gate(
+            "publish-paused-first",
+            p.paused_first && p.delivered == 0,
+            format!("paused_first={} delivered={}", p.paused_first, p.delivered),
+        ),
+        gate(
+            "publish-plan",
+            p.plan == plan_hex.to_ascii_lowercase(),
+            format!("plan={} named={plan_hex}", p.plan),
+        ),
+        gate("publish-useful", p.useful, format!("useful={}", p.useful)),
+        gate(
+            "publish-gain",
+            p.gain_ppm > 0,
+            format!("gain_ppm={} s0_gain_ppm={}", p.gain_ppm, p.s0_gain_ppm),
+        ),
+        gate(
+            "publish-new-revision",
+            p.rev > before.rev,
+            format!("rev {} -> {}", before.rev, p.rev),
+        ),
+        gate(
+            "plan-over-shipped",
+            p.code == PLAN_CODE && p.live == "momentum-glow.shipped",
+            format!("code={} live={}", p.code, p.live),
+        ),
+        gate(
+            "publish-witness",
+            p.live_verdict == "pass" && p.candidate_verdict == "pass" && p.grade == "tested",
+            format!(
+                "live_verdict={} candidate_verdict={} grade={}",
+                p.live_verdict, p.candidate_verdict, p.grade
+            ),
+        ),
+        gate(
+            "publish-bundle-digest",
+            aterm_codec::hex::is_lower(&p.bundle, 12),
+            format!("bundle={}", p.bundle),
+        ),
+    ]
+}
+
+/// The plan live after its publication: the status names the plan at the published revision, running, and published once.
+#[must_use]
+pub fn plan_live_gate(s: &Status, p: &PublishLine) -> Gate {
+    gate(
+        "plan-live",
+        s.attached && s.code == PLAN_NAME && s.rev == p.rev && !s.paused && s.publications == 1,
+        format!(
+            "attached={} code={} rev={} published_rev={} paused={} publications={} guard={}",
+            s.attached,
+            s.code,
+            s.rev,
+            p.rev,
+            s.paused,
+            s.publications,
+            s.guard.as_deref().unwrap_or("none")
+        ),
+    )
+}
+
+/// An `aos bundle` reply (the verb's `bundle_line`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BundleLine {
+    pub window: u64,
+    /// The bundle's full digest (64 hex digits).
+    pub bundle: String,
+    /// The revision it published.
+    pub rev: u64,
+    pub bytes: usize,
+    /// Its bytes in lowercase hex.
+    pub hex: String,
+}
+
+/// Parse an `aos bundle` reply.
+///
+/// # Errors
+/// Not an OK reply, or a field missing or malformed.
+pub fn parse_bundle_line(line: &str) -> Result<BundleLine, String> {
+    let f = fields(body(line)?);
+    Ok(BundleLine {
+        window: num(&f, "window")?,
+        bundle: req(&f, "bundle")?.to_string(),
+        rev: num(&f, "rev")?,
+        bytes: num(&f, "bytes")?,
+        hex: req(&f, "hex")?.to_string(),
+    })
+}
+
+/// A bundle reply's bytes: its hex decoded, exactly as long as `bytes=` says.
+///
+/// # Errors
+/// Not hex, or another length.
+pub fn bundle_bytes(b: &BundleLine) -> Result<Vec<u8>, String> {
+    let bytes = aterm_codec::hex::decode_vec(b.hex.as_bytes())
+        .ok_or_else(|| "hex= is not an even run of hex digits".to_string())?;
+    if bytes.len() != b.bytes {
+        return Err(format!(
+            "hex= holds {} bytes, bytes={}",
+            bytes.len(),
+            b.bytes
+        ));
+    }
+    Ok(bytes)
+}
+
+/// What the lab's own verification of a window's bundle came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verify {
+    /// `CandidateBundle::verify` accepted it under an evaluator of the window's build.
+    Verified,
+    /// It refused the bundle, or no evaluator could be built, as a line.
+    Refused(String),
+    /// Not run, and never a pass: the window's build and this lab's do not name the same clean commit, so the lab's evaluator is not shown to be the window's interpreter.
+    Foreign { instance: String, lab: String },
+}
+
+impl Verify {
+    /// `verify=verified`, `verify=refused(<why>)` or `verify=skipped(foreign build) …`.
+    #[must_use]
+    pub fn word(&self) -> String {
+        match self {
+            Verify::Verified => "verify=verified".to_string(),
+            Verify::Refused(why) => format!("verify=refused({why})"),
+            Verify::Foreign { instance, lab } => {
+                format!("verify=skipped(foreign build) instance={instance} lab={lab}")
+            }
+        }
+    }
+}
+
+/// The commit a build id names: the text after its last `+g`, when it is a clean commit of at least 12 lowercase hex digits.
+fn clean_commit(build: &str) -> Option<&str> {
+    let (_, commit) = build.rsplit_once("+g")?;
+    (commit.len() >= 12
+        && commit
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    .then_some(commit)
+}
+
+/// The window's bundle `bytes` verified under an evaluator of the window's own build `instance`, but only when `instance` and the lab's build `lab` name the same clean commit (otherwise [`Verify::Foreign`], never run).
+/// `aos-search --verify` takes only the lab's exact build name, which no window's `build_id()` is, so a window's publication is verified here or not at all.
+#[must_use]
+pub fn verify_in_lab(bytes: &[u8], instance: &str, lab: &str) -> Verify {
+    match (clean_commit(instance), clean_commit(lab)) {
+        (Some(a), Some(b)) if a == b => {}
+        _ => {
+            return Verify::Foreign {
+                instance: instance.to_string(),
+                lab: lab.to_string(),
+            };
+        }
+    }
+    match Evaluator::v1(instance, Instant::now()) {
+        Err(e) => Verify::Refused(format!("no evaluator of {instance}: {e}")),
+        Ok(ev) => match CandidateBundle::verify(bytes, &ev) {
+            Ok(_) => Verify::Verified,
+            Err(e) => Verify::Refused(e.to_string()),
+        },
+    }
+}
+
+/// The bundle gates: the bundle exported whole at the published revision, its plan the run's, its publication part naming that revision, and the lab's own verification of it (a skipped one fails).
+#[must_use]
+pub fn bundle_gates(
+    b: &BundleLine,
+    p: &PublishLine,
+    plan: &[u8; PLAN_LEN],
+    verify: &Verify,
+) -> Vec<Gate> {
+    let bytes = bundle_bytes(b);
+    let digest = bytes
+        .as_ref()
+        .map_or_else(Clone::clone, |v| Digest::of(BUNDLE_DOMAIN, &[v]).hex());
+    let decoded = bytes
+        .and_then(|v| UncheckedBundle::decode(&v).map_err(|e| format!("does not decode: {e}")));
+    let (plan_word, publication_word) = match &decoded {
+        Ok(d) => (
+            aterm_codec::hex::encode_lower(&d.plan),
+            d.publication
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |x| x.revision.to_string()),
+        ),
+        Err(e) => (e.clone(), e.clone()),
+    };
+    vec![
+        gate(
+            "bundle-exported",
+            digest == b.bundle
+                && aterm_codec::hex::is_lower(&p.bundle, 12)
+                && b.bundle.starts_with(&p.bundle)
+                && b.rev == p.rev,
+            format!(
+                "bytes={} digest={digest} named={} published={} rev={} published_rev={}",
+                b.bytes, b.bundle, p.bundle, b.rev, p.rev
+            ),
+        ),
+        gate(
+            "bundle-plan",
+            decoded.as_ref().is_ok_and(|d| d.plan == plan[..]),
+            format!(
+                "plan={plan_word} named={}",
+                aterm_codec::hex::encode_lower(plan)
+            ),
+        ),
+        gate(
+            "bundle-publication",
+            decoded
+                .as_ref()
+                .is_ok_and(|d| d.publication.as_ref().map(|x| x.revision) == Some(p.rev)),
+            format!("publication_rev={publication_word} published_rev={}", p.rev),
+        ),
+        gate(
+            "bundle-verifies",
+            *verify == Verify::Verified,
+            verify.word(),
         ),
     ]
 }
@@ -891,6 +1232,10 @@ struct Drive<'a> {
     polls: u32,
     /// OS key focus before the first key (`trail status` `focused=`, no typed wake yet).
     key_window: bool,
+    /// The build the window's code names (the attach reply's `build=`).
+    build: Option<String>,
+    /// The `MEASURED …` lines, in order (never a gate).
+    measured: Vec<String>,
 }
 
 impl Drive<'_> {
@@ -1009,8 +1354,39 @@ impl Drive<'_> {
         self.attach_answered + Duration::from_nanos(ns)
     }
 
+    /// A lower bound of `t`'s offset from the attach epoch, in ns (the epoch is no later than the attach reply).
+    fn offset_lower(&self, t: Instant) -> i128 {
+        i128::try_from(t.saturating_duration_since(self.attach_answered).as_nanos())
+            .unwrap_or(i128::MAX)
+    }
+
     fn keep(&self, suffix: &str, text: &str) {
         let _ = std::fs::write(self.out.join(format!("{}.{suffix}", self.stem)), text);
+    }
+
+    fn keep_bytes(&self, suffix: &str, bytes: &[u8]) {
+        let _ = std::fs::write(self.out.join(format!("{}.{suffix}", self.stem)), bytes);
+    }
+
+    /// One request whose reply ends with a `hex=` run (`aos bundle`, `aos trace hex`), transcribed with the run's length in place of its digits.
+    fn ask_hex(&mut self, request: &str) -> Result<String, Halt> {
+        let reply = self
+            .wire
+            .request_line(request)
+            .map_err(|e| format!("`{request}`: the held control connection failed: {e}"))?;
+        let shown = match reply.split_once(" hex=") {
+            Some((head, hex)) => format!("{head} hex=<{} digits>", hex.trim_end().len()),
+            None => reply.clone(),
+        };
+        self.note(format!("> {request}\n< {shown}"));
+        Ok(reply)
+    }
+
+    /// A figure the run measured: printed and kept as `MEASURED <line>`.
+    fn measure(&mut self, line: String) {
+        let line = format!("MEASURED {line}");
+        self.note(line.clone());
+        self.measured.push(line);
     }
 
     /// `ctl image …` copied to `dest`; its parsed reply.
@@ -1184,8 +1560,8 @@ fn cool(d: &mut Drive<'_>, after_keys: i128, frame: &str) -> Result<Cooled, Halt
     })
 }
 
-/// The run after the instance is up: attach, keys, then the story or the control.
-fn story(d: &mut Drive<'_>, control: bool) -> Result<Vec<Gate>, Halt> {
+/// The run after the instance is up: the attach and the first 24 keys, then the repair story, or the first burst cooled by itself and the 12-key phase (with the publication between them under `--publish`).
+fn story(d: &mut Drive<'_>, mode: Mode) -> Result<Vec<Gate>, Halt> {
     let dims = d.inst.ctl(&["dims"]);
     d.keep("dims.txt", &format!("{}{}", dims.stdout, dims.stderr));
     d.note(format!("> dims\n< {}", dims.first()));
@@ -1197,11 +1573,7 @@ fn story(d: &mut Drive<'_>, control: bool) -> Result<Vec<Gate>, Halt> {
             "the glow was attached before the drive: {before:?}"
         )));
     }
-    let code = if control {
-        "shipped"
-    } else {
-        "demo-stranded-settle"
-    };
+    let code = mode.attaches();
     d.attach_sent = Instant::now();
     let line = d.ask(&format!("aos attach code={code}"))?;
     d.attach_answered = Instant::now();
@@ -1211,27 +1583,416 @@ fn story(d: &mut Drive<'_>, control: bool) -> Result<Vec<Gate>, Halt> {
             "aos attach did not attach {code}: {line}"
         )));
     }
+    d.build.clone_from(&attached.build);
+    d.measure(format!(
+        "attach_rtt_ms={} build={}",
+        ms(
+            i128::try_from(d.attach_answered.duration_since(d.attach_sent).as_nanos())
+                .unwrap_or(i128::MAX)
+        ),
+        d.build.as_deref().unwrap_or("none")
+    ));
     let last_key = d.type_keys(STRAND_KEYS)?;
-    if control {
-        let cooled = cool(d, d.offset_upper(last_key), "cleared")?;
-        let trace = read_trace(d)?;
-        let mut gates = control_gates(&attached, &cooled.cold);
-        gates.extend(cooled_gates(&cooled));
-        gates.push(log_kinds_gate(
-            "keys-recorded-once",
-            &trace,
-            typed(STRAND_KEYS),
-        ));
+    if mode == Mode::Repair {
+        let hot = d.wait_for("the keys heat the glow", |s| s.hot)?;
+        let mut gates = vec![gate(
+            "keys-heat-the-fault",
+            hot.hot && hot.code == "demo-stranded-settle",
+            format!("hot={} code={}", hot.hot, hot.code),
+        )];
+        gates.extend(repair_story(d, last_key)?);
         return Ok(gates);
     }
-    let hot = d.wait_for("the keys heat the glow", |s| s.hot)?;
-    let mut gates = vec![gate(
-        "keys-heat-the-fault",
-        hot.hot && hot.code == "demo-stranded-settle",
-        format!("hot={} code={}", hot.hot, hot.code),
-    )];
-    gates.extend(repair_story(d, last_key)?);
+    let cooled = cool(d, d.offset_upper(last_key), "cleared")?;
+    let trace = read_trace(d)?;
+    let mut gates = control_gates(&attached, &cooled.cold);
+    gates.extend(cooled_gates(&cooled));
+    gates.push(log_kinds_gate(
+        "keys-recorded-once",
+        &trace,
+        typed(STRAND_KEYS),
+    ));
+    let fresh = if let Mode::Publish(plan) = mode {
+        let Some(committed) = publish_story(d, &plan, &mut gates)? else {
+            return Ok(gates);
+        };
+        Fresh {
+            code: PLAN_NAME,
+            committed,
+            keys_before: 0,
+            plan: SchedulePlan::decode(&plan).ok(),
+        }
+    } else {
+        Fresh {
+            code: "shipped",
+            committed: d.status()?,
+            keys_before: typed(STRAND_KEYS),
+            plan: None,
+        }
+    };
+    gates.extend(fresh_phase(d, &fresh)?);
     Ok(gates)
+}
+
+/// `--publish`'s publication over the cold glow the first burst left, gated from `aos publish` through the plan live and its bundle verified in the lab to the log it started; returns the status read last, or `None` when the window refused the plan.
+fn publish_story(
+    d: &mut Drive<'_>,
+    plan: &[u8; PLAN_LEN],
+    gates: &mut Vec<Gate>,
+) -> Result<Option<Status>, Halt> {
+    let before = d.status()?;
+    let plan_hex = aterm_codec::hex::encode_lower(plan);
+    let asked = Instant::now();
+    let line = d.ask(&format!("aos publish plan={plan_hex}"))?;
+    d.measure(format!(
+        "publish_rtt_ms={}",
+        ms(i128::try_from(asked.elapsed().as_nanos()).unwrap_or(i128::MAX))
+    ));
+    let p = match parse_publish(&line) {
+        Ok(p) => p,
+        Err(why) => {
+            gates.push(gate("publish-admitted", false, why));
+            return Ok(None);
+        }
+    };
+    gates.push(gate(
+        "publish-admitted",
+        true,
+        format!("rev={} plan={} bundle={}", p.rev, p.plan, p.bundle),
+    ));
+    gates.extend(publish_gates(&p, &plan_hex, &before));
+    let live = d.status()?;
+    gates.push(plan_live_gate(&live, &p));
+    let reply = d.ask_hex("aos bundle")?;
+    let b = parse_bundle_line(&reply).map_err(|e| format!("aos bundle: {e}"))?;
+    let verify = match bundle_bytes(&b) {
+        Ok(bytes) => {
+            d.keep_bytes("bundle", &bytes);
+            let started = Instant::now();
+            let v = verify_in_lab(&bytes, d.build.as_deref().unwrap_or("none"), LAB_BUILD);
+            d.note(format!(
+                "# the lab's verification of the bundle: {} in {} ms",
+                v.word(),
+                started.elapsed().as_millis()
+            ));
+            v
+        }
+        Err(why) => Verify::Refused(why),
+    };
+    gates.extend(bundle_gates(&b, &p, plan, &verify));
+    let committed = read_trace(d)?;
+    gates.extend(post_commit_gates_at(p.log_epoch, &p.range, &committed));
+    Ok(Some(d.status()?))
+}
+
+/// What the 12-key phase runs under.
+struct Fresh {
+    /// The live code's status name (`shipped`, or [`PLAN_NAME`] after a publication).
+    code: &'static str,
+    /// The status read just before its keys: the continuation's base.
+    committed: Status,
+    /// The keys the exported log holds before the phase's: none after a commit, the first burst's in the control.
+    keys_before: u64,
+    /// The plan the run published, so the lab can replay its trace.
+    plan: Option<SchedulePlan>,
+}
+
+/// The trace file an `aos trace hex` reply carries: its `hex=` decoded, exactly as long as `file_bytes=` says.
+///
+/// # Errors
+/// Not an OK reply, a field missing, not hex, or another length.
+pub fn trace_file(line: &str) -> Result<Vec<u8>, String> {
+    let f = fields(body(line)?);
+    let n: usize = num(&f, "file_bytes")?;
+    let bytes = aterm_codec::hex::decode_vec(req(&f, "hex")?.as_bytes())
+        .ok_or_else(|| "hex= is not an even run of hex digits".to_string())?;
+    if bytes.len() != n {
+        return Err(format!("hex= holds {} bytes, file_bytes={n}", bytes.len()));
+    }
+    Ok(bytes)
+}
+
+/// The 12-key phase of the control and of `--publish`: the first burst's witnesses under `fresh-` names, the continuation and the log's keys, the caret moved once in the settling tail, and the phase measured from the exported trace.
+fn fresh_phase(d: &mut Drive<'_>, f: &Fresh) -> Result<Vec<Gate>, Halt> {
+    let frames_before = d.frames()?;
+    let last_key = d.type_keys(FRESH_KEYS)?;
+    let after_keys = d.offset_upper(last_key);
+    let hot = d.wait_for("the fresh keys heat the glow", |s| s.hot)?;
+    let settling = d.wait_for("the glow settles, asked after the last fresh key", |s| {
+        s.settling && s.query_at.is_some_and(|q| q > after_keys)
+    })?;
+    let moved = move_caret(d, last_key, &settling)?;
+    // From the move's present on, every present has no key and no move behind it.
+    let frames_settling = moved.frames_after;
+    let cold = d.wait_for("the glow cools by itself", |s| !s.hot)?;
+    let frames_cold = d.frames()?;
+    let trail = d.trail()?;
+    let outside_caret_px = d.capture("fresh-cleared")?;
+    let beside = d.status()?;
+    let reply = d.ask_hex("aos trace hex")?;
+    let trace = parse_trace(&reply).map_err(|e| format!("aos trace hex: {e}"))?;
+    let file = trace_file(&reply).map_err(|e| format!("aos trace hex: {e}"))?;
+    d.keep_bytes("fresh.trace", &file);
+    let cooled = Cooled {
+        hot,
+        settling,
+        frames_settling,
+        cold,
+        frames_cold,
+        trail,
+        outside_caret_px,
+    };
+    let mut gates = cooled_gates_in(Burst::Fresh, f.code, &cooled);
+    gates.extend(continuation_gates_for(
+        f.code,
+        &f.committed,
+        &cooled.cold,
+        &beside,
+        &trace,
+    ));
+    gates.push(log_kinds_gate(
+        if f.keys_before == 0 {
+            "fresh-keys-recorded-once"
+        } else {
+            "all-keys-recorded-once"
+        },
+        &trace,
+        f.keys_before.saturating_add(typed(FRESH_KEYS)),
+    ));
+    gates.push(measure_phase(
+        d,
+        f,
+        &file,
+        &moved,
+        frames_cold.saturating_sub(frames_before),
+    ));
+    Ok(gates)
+}
+
+/// When the drive moves the caret: this long after it sent the phase's last key, the same instant in both modes, so the move does not depend on when the code's settling reading came.
+/// It falls after every settling reading measured (at most 2.632 s after the last key) and before the glow's cold instant (about 4.6 s after it).
+const MOVE_AFTER_LAST_KEY: Duration = Duration::from_secs(3);
+
+/// How long the drive waits, asked at `now`, before moving the caret: until `last_key` plus [`MOVE_AFTER_LAST_KEY`], or none once that instant has passed.
+///
+/// # Errors
+/// A wait past [`HANG`] (a hang detector), or a move instant no earlier than the glow's cold instant `cold`.
+fn move_wait(now: Instant, last_key: Instant, cold: Option<Instant>) -> Result<Duration, String> {
+    let at = last_key + MOVE_AFTER_LAST_KEY;
+    if cold.is_some_and(|cold| cold <= at) {
+        return Err(format!(
+            "the move, {} ms after the last key, is not before the glow's cold instant",
+            MOVE_AFTER_LAST_KEY.as_millis()
+        ));
+    }
+    let wait = at.saturating_duration_since(now);
+    if wait > HANG {
+        return Err(format!(
+            "the move lies {} s ahead (a hang detector)",
+            wait.as_secs()
+        ));
+    }
+    Ok(wait)
+}
+
+/// How long the drive watches for the moved caret's present.
+const MOVE_WATCH: Duration = Duration::from_secs(2);
+/// Between two `metrics` reads of that watch (`metrics` is answered off the main loop).
+const MOVE_POLL: Duration = Duration::from_millis(1);
+
+/// What the drive saw of the caret moved with no key while the glow settled (design §10.8's lag case).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Moved {
+    /// The status read just before the move, and the first after its present.
+    pub before: Status,
+    pub after: Status,
+    /// `cursor`'s (row, col) before and after.
+    pub cursor_before: Option<(u16, u16)>,
+    pub cursor_after: Option<(u16, u16)>,
+    /// `frames` just before the move, and the first reading past it (the last reading when none was).
+    pub frames_before: u64,
+    pub frames_after: u64,
+    /// The first present after the move as `(lo, hi)` ns after the move's send (later than `lo`, no later than `hi`); `None` when none came within [`MOVE_WATCH`].
+    pub present: Option<(u64, u64)>,
+    /// The move's offset from the attach epoch: no earlier than `at_lo` (its send) and no later than `at_hi` (its reply).
+    pub at_lo: i128,
+    pub at_hi: i128,
+    /// The move's send after the phase's last key's, on the drive's clock ([`MOVE_AFTER_LAST_KEY`] unless the settling reading came later).
+    pub after_last_key: Duration,
+    /// The glow's cold instant the settling reading named (ns from the attach epoch).
+    pub cold_at: Option<i128>,
+    /// The `metrics` reads made watching for the present.
+    pub polls: u32,
+}
+
+/// A `cursor` reply's `(row, col)`.
+fn parse_cursor(line: &str) -> Option<(u16, u16)> {
+    let mut w = body(line).ok()?.split_whitespace();
+    Some((w.next()?.parse().ok()?, w.next()?.parse().ok()?))
+}
+
+/// ns of a duration, saturating.
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The caret moved once with no key in the settling tail, [`MOVE_AFTER_LAST_KEY`] after `last_key`: `feed 0d` echoes a carriage return that moves the caret a line down, and `metrics` `frames` is read every [`MOVE_POLL`] until the next present.
+fn move_caret(d: &mut Drive<'_>, last_key: Instant, settling: &Status) -> Result<Moved, Halt> {
+    let cold = settling.cold_at.map(|ns| d.instant_after(ns));
+    let wait = move_wait(Instant::now(), last_key, cold)
+        .map_err(|why| Halt::Broke(format!("{why} (cold_at={})", opt(settling.cold_at))))?;
+    d.note(format!(
+        "# the settling tail: waiting {} ms, to {} ms after the last key (cold_at={})",
+        wait.as_millis(),
+        MOVE_AFTER_LAST_KEY.as_millis(),
+        opt(settling.cold_at)
+    ));
+    stop::sleep(wait)?;
+    let before = d.status()?;
+    let cursor_before = parse_cursor(&d.ask("cursor")?);
+    let frames_before = d.frames()?;
+    let sent = Instant::now();
+    let after_last_key = sent.saturating_duration_since(last_key);
+    let reply = d
+        .wire
+        .request_line("feed 0d")
+        .map_err(|e| format!("`feed 0d`: the held control connection failed: {e}"))?;
+    let answered = Instant::now();
+    d.note(format!("> feed 0d\n< {reply}"));
+    if !reply.starts_with("OK") {
+        return Err(Halt::Broke(format!("feed 0d refused: {reply}")));
+    }
+    let (mut polls, mut present) = (0u32, None);
+    let mut unchanged_at: Option<Instant> = None;
+    let frames_after = loop {
+        let asked = Instant::now();
+        let line = d
+            .wire
+            .request_line("metrics")
+            .map_err(|e| format!("`metrics`: the held control connection failed: {e}"))?;
+        let read = Instant::now();
+        polls += 1;
+        let frames = count(body(&line)?, "frames").map_err(|e| format!("metrics: {e}"))?;
+        if frames > frames_before {
+            let lo = unchanged_at.map_or(Duration::ZERO, |t| t.saturating_duration_since(sent));
+            present = Some((nanos(lo), nanos(read.duration_since(sent))));
+            break frames;
+        }
+        if read.duration_since(sent) >= MOVE_WATCH {
+            break frames;
+        }
+        unchanged_at = Some(asked);
+        stop::sleep(MOVE_POLL)?;
+    };
+    d.note(format!(
+        "# watched the move with {polls} metrics reads: frames {frames_before} -> \
+         {frames_after}, present {}",
+        present.map_or_else(
+            || format!("none within {} ms", MOVE_WATCH.as_millis()),
+            |(lo, hi)| format!(
+                "{}..{} ms after the move",
+                ms(i128::from(lo)),
+                ms(i128::from(hi))
+            )
+        )
+    ));
+    let after = d.status()?;
+    let cursor_after = parse_cursor(&d.ask("cursor")?);
+    Ok(Moved {
+        before,
+        after,
+        cursor_before,
+        cursor_after,
+        frames_before,
+        frames_after,
+        present,
+        at_lo: d.offset_lower(sent),
+        at_hi: d.offset_upper(answered),
+        after_last_key,
+        cold_at: settling.cold_at,
+        polls,
+    })
+}
+
+/// A caret cell as `row,col`, or `none`.
+fn cell_word(c: Option<(u16, u16)>) -> String {
+    c.map_or_else(|| "none".to_string(), |(r, c)| format!("{r},{c}"))
+}
+
+/// The 12-key phase measured from the exported trace `file`, each figure a `MEASURED` line, gated only by `phase-trace-replays`: the lab's replay reached the recorded head and the phase ends on its clearing tick.
+fn measure_phase(d: &mut Drive<'_>, f: &Fresh, file: &[u8], m: &Moved, presents: u64) -> Gate {
+    let build = d.build.clone().unwrap_or_default();
+    let replayed = match aos_phase::replay_trace(file, &build, f.plan) {
+        Ok(r) => r,
+        Err(why) => return gate("phase-trace-replays", false, why),
+    };
+    let keys_in_log = aos_phase::keys_in(&replayed.steps);
+    let prior = keys_in_log.saturating_sub(aos_phase::phase_keys());
+    let Some(p) = aos_phase::phase(&replayed.steps, prior) else {
+        return gate(
+            "phase-trace-replays",
+            false,
+            format!("no phase: the log holds {keys_in_log} keys"),
+        );
+    };
+    d.measure(aos_phase::replay_line(&replayed, &p));
+    for line in aos_phase::measured_lines(&p, Some(presents)) {
+        d.measure(line);
+    }
+    let ticks = aos_phase::move_ticks(
+        &replayed.steps,
+        m.at_lo,
+        m.cursor_after.unwrap_or((u16::MAX, u16::MAX)),
+    );
+    let since = |at: i128| format!("{}..{}", ms(at - m.at_hi), ms(at - m.at_lo));
+    d.measure(format!(
+        "lag settling_read_before_move={} deadline_read_before_move={} cold_at={} \
+         move_at_ms={}..{} move_after_last_key_ms={} planned_ms={} move_before_cold_at_ms={} \
+         cursor={}->{} present_after_move_ms={} metrics_reads={} tick_before_move={} \
+         next_tick_after_move_ms={} next_tick_cell={} carries_new_cell={} \
+         next_tick_inside_move_bracket={} first_new_cell_tick_after_move_ms={} guard={}->{}",
+        m.before.settling,
+        opt(m.before.deadline),
+        opt(m.before.cold_at),
+        ms(m.at_lo),
+        ms(m.at_hi),
+        ms(i128::try_from(m.after_last_key.as_nanos()).unwrap_or(i128::MAX)),
+        ms(i128::try_from(MOVE_AFTER_LAST_KEY.as_nanos()).unwrap_or(i128::MAX)),
+        m.cold_at.map_or_else(
+            || "none".to_string(),
+            |cold| format!("{}..{}", ms(cold - m.at_hi), ms(cold - m.at_lo))
+        ),
+        cell_word(m.cursor_before),
+        cell_word(m.cursor_after),
+        m.present.map_or_else(
+            || "none".to_string(),
+            |(lo, hi)| format!("{}..{}", ms(i128::from(lo)), ms(i128::from(hi)))
+        ),
+        m.polls,
+        ticks.before.map_or_else(
+            || "none".to_string(),
+            |(at, cur)| format!("{}ms@{}", ms(at), cell_word(cur))
+        ),
+        ticks
+            .next
+            .map_or_else(|| "none".to_string(), |(at, _)| since(at)),
+        cell_word(ticks.next.and_then(|(_, cur)| cur)),
+        ticks
+            .next
+            .is_some_and(|(_, cur)| cur.is_some() && cur == m.cursor_after),
+        ticks.next.is_some_and(|(at, _)| at <= m.at_hi),
+        ticks.at_cell.map_or_else(|| "none".to_string(), since),
+        m.before.guard.as_deref().unwrap_or("none"),
+        m.after.guard.as_deref().unwrap_or("none"),
+    ));
+    gate(
+        "phase-trace-replays",
+        p.cleared,
+        format!(
+            "code={} T={} P={} cleared={} (the lab's replay reached the recorded head)",
+            replayed.code, p.counts.ticks, p.counts.presented, p.cleared
+        ),
+    )
 }
 
 /// The aterm processes of a windowed instance: the keeper's descendants whose command
@@ -1244,6 +2005,101 @@ fn aterm_pids(inst: &Instance) -> Vec<i32> {
         .collect()
 }
 
+/// What a run does after its attach and its first 24 keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// The demonstration fault, stranded, then `aos repair code=shipped` (the default).
+    Repair,
+    /// `--control`: the shipped code, never replaced, through the same script as [`Mode::Publish`] with no publication.
+    Control,
+    /// `--publish PLAN_HEX`: the shipped code, then `aos publish plan=<these bytes>`.
+    Publish([u8; PLAN_LEN]),
+}
+
+impl Mode {
+    /// Its name in the result line.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Mode::Repair => "repair",
+            Mode::Control => "control",
+            Mode::Publish(_) => "publish",
+        }
+    }
+
+    /// The stem of its files under `--out`.
+    #[must_use]
+    pub const fn stem(self) -> &'static str {
+        match self {
+            Mode::Repair => "aos-repair",
+            Mode::Control => "aos-control",
+            Mode::Publish(_) => "aos-publish",
+        }
+    }
+
+    /// The code it attaches.
+    #[must_use]
+    pub const fn attaches(self) -> &'static str {
+        match self {
+            Mode::Repair => "demo-stranded-settle",
+            Mode::Control | Mode::Publish(_) => "shipped",
+        }
+    }
+}
+
+/// `aos-repair`'s arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Args {
+    pub aterm: Option<String>,
+    pub out: Option<String>,
+    pub mode: Mode,
+    pub keep: bool,
+}
+
+/// Parse `aos-repair`'s arguments (`--help` aside): `--publish` takes a plan's 12 bytes as 24 hex digits of either case, and `--control` and `--publish` are two modes, not one.
+///
+/// # Errors
+/// Usage (2): a flag without its value, a plan that is not 24 hex digits, both modes, or an unexpected word.
+pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
+    let mut a = args.to_vec();
+    let aterm = take_value(&mut a, "--aterm")?;
+    let out = take_value(&mut a, "--out")?;
+    let publish = take_value(&mut a, "--publish")?;
+    let control = take_flag(&mut a, "--control");
+    let keep = take_flag(&mut a, "--keep");
+    if let Some(extra) = a.first() {
+        return Err(Fail::usage(format!(
+            "aos-repair: unexpected '{extra}' (aos-repair --help)"
+        )));
+    }
+    let mode = match (control, publish) {
+        (true, Some(_)) => {
+            return Err(Fail::usage(
+                "aos-repair: --control and --publish are two modes; give one (aos-repair --help)",
+            ));
+        }
+        (true, None) => Mode::Control,
+        (false, None) => Mode::Repair,
+        (false, Some(hex)) => {
+            let mut plan = [0u8; PLAN_LEN];
+            if !aterm_codec::hex::decode_into(hex.as_bytes(), &mut plan) {
+                return Err(Fail::usage(format!(
+                    "aos-repair: --publish takes a plan's {PLAN_LEN} bytes as {} hex digits, \
+                     not '{hex}'",
+                    PLAN_LEN * 2
+                )));
+            }
+            Mode::Publish(plan)
+        }
+    };
+    Ok(Args {
+        aterm,
+        out,
+        mode,
+        keep,
+    })
+}
+
 /// `aos-repair`.
 ///
 /// # Errors
@@ -1254,16 +2110,12 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
         return Ok(0);
     }
     stop::install();
-    let mut a = args.to_vec();
-    let aterm = take_value(&mut a, "--aterm")?;
-    let out = take_value(&mut a, "--out")?;
-    let control = take_flag(&mut a, "--control");
-    let keep = take_flag(&mut a, "--keep");
-    if let Some(extra) = a.first() {
-        return Err(Fail::usage(format!(
-            "aos-repair: unexpected '{extra}' (aos-repair --help)"
-        )));
-    }
+    let Args {
+        aterm,
+        out,
+        mode,
+        keep,
+    } = parse_args(args)?;
     let out = out
         .map(|o| {
             crate::trail_gallery::resolve_out(
@@ -1281,7 +2133,7 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
     let out = out.unwrap_or_else(|| world.dir.join("frames"));
     std::fs::create_dir_all(&out)
         .map_err(|e| Fail::die(format!("aos-repair: cannot make {}: {e}", out.display())))?;
-    let stem = if control { "aos-control" } else { "aos-repair" };
+    let stem = mode.stem();
     let mut args: Vec<String> = GRID.iter().map(|s| (*s).to_string()).collect();
     args.extend(["-e", "/bin/sh", "-c", PROGRAM].map(str::to_string));
     let mut inst = Instance::start(
@@ -1300,7 +2152,7 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
         aterm.display(),
         inst.pid,
         inst.sock.display(),
-        if control { "control" } else { "repair" },
+        mode.name(),
         out.display()
     );
     let booted = inst.await_socket(instance::BOOT).and_then(|()| {
@@ -1315,6 +2167,7 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
     let mut gates = Vec::new();
     let mut extra: Vec<(&str, String)> = Vec::new();
     let mut transcript = Vec::new();
+    let mut measured: Vec<String> = Vec::new();
     let mut stopped = None;
     match booted {
         Err(f) => {
@@ -1338,8 +2191,10 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
                 transcript: Vec::new(),
                 polls: 0,
                 key_window: false,
+                build: None,
+                measured: Vec::new(),
             };
-            match story(&mut d, control) {
+            match story(&mut d, mode) {
                 Ok(g) => gates = g,
                 Err(Halt::Stopped(sig)) => stopped = Some(sig),
                 Err(Halt::Broke(why)) => {
@@ -1377,6 +2232,7 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
                 extra.push(("key_window", d.key_window.to_string()));
             }
             transcript = std::mem::take(&mut d.transcript);
+            measured = std::mem::take(&mut d.measured);
         }
     }
     inst.stop();
@@ -1414,7 +2270,7 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
         );
     }
     extra.push(("out", out.display().to_string()));
-    let result = result_line(if control { "control" } else { "repair" }, &gates, &extra);
+    let result = result_line(mode.name(), &gates, &extra);
     print!("{report}");
     println!("{result}");
     transcript.push(report);
@@ -1423,6 +2279,12 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
         out.join(format!("{stem}.transcript.txt")),
         transcript.join("\n") + "\n",
     );
+    if !measured.is_empty() {
+        let _ = std::fs::write(
+            out.join(format!("{stem}.measured.txt")),
+            measured.join("\n") + "\n",
+        );
+    }
     if !keep && out.starts_with(&world.dir) {
         println!("aos-repair: the frames go with the world (pass --keep or --out to keep them)");
     }
@@ -1562,6 +2424,8 @@ mod tests {
                 window: 0,
                 attached: true,
                 code: "demo-stranded-settle".into(),
+                build: Some("0.110.0+geee60c4e22d2".into()),
+                guard: None,
                 hot: true,
                 active: true,
                 settling: false,
@@ -2195,6 +3059,522 @@ mod tests {
                 .chars()
                 .chain(FRESH_KEYS.chars())
                 .all(|c| c.is_ascii_lowercase())
+        );
+    }
+
+    /// The grid winner's 12 bytes, as `--publish` and `publish plan=` spell them.
+    const WINNER_HEX: &str = "010100000000000000000000";
+
+    fn args(words: &[&str]) -> Result<Args, Fail> {
+        parse_args(&words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>())
+    }
+
+    fn usage(words: &[&str]) -> String {
+        let f = args(words).expect_err("a usage error");
+        assert_eq!(f.code, 2, "{words:?}: usage");
+        f.msg.unwrap_or_default()
+    }
+
+    /// The arguments name one mode (no flag the repair, `--control`, or `--publish` with a plan's 24 hex digits of either case), and every malformed form is a usage error.
+    #[test]
+    fn the_arguments_name_one_mode_and_publish_takes_a_plans_24_hex_digits() {
+        let plain = args(&[]).expect("no flag");
+        assert_eq!(
+            plain,
+            Args {
+                aterm: None,
+                out: None,
+                mode: Mode::Repair,
+                keep: false
+            }
+        );
+        assert_eq!(args(&["--control"]).expect("control").mode, Mode::Control);
+        let winner = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            args(&["--publish", WINNER_HEX]).expect("publish").mode,
+            Mode::Publish(winner)
+        );
+        assert_eq!(
+            args(&["--publish", "0101000000000000000000AB"])
+                .expect("upper case")
+                .mode,
+            Mode::Publish([1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xab])
+        );
+        assert_eq!(
+            args(&[
+                "--keep",
+                "--publish",
+                WINNER_HEX,
+                "--aterm",
+                "/a/aterm",
+                "--out",
+                "/o"
+            ])
+            .expect("every flag"),
+            Args {
+                aterm: Some("/a/aterm".into()),
+                out: Some("/o".into()),
+                mode: Mode::Publish(winner),
+                keep: true
+            }
+        );
+        assert_eq!(usage(&["--publish"]), "--publish needs a value");
+        for bad in [
+            "0101",
+            "0101000000000000000000000",
+            "01010000000000000000000000",
+            "zz0100000000000000000000",
+            "",
+        ] {
+            assert_eq!(
+                usage(&["--publish", bad]),
+                format!(
+                    "aos-repair: --publish takes a plan's 12 bytes as 24 hex digits, not '{bad}'"
+                )
+            );
+        }
+        assert!(
+            usage(&["--control", "--publish", WINNER_HEX]).contains("two modes; give one"),
+            "both modes"
+        );
+        assert!(usage(&["--bogus"]).starts_with("aos-repair: unexpected '--bogus'"));
+        for (mode, name, stem, code) in [
+            (Mode::Repair, "repair", "aos-repair", "demo-stranded-settle"),
+            (Mode::Control, "control", "aos-control", "shipped"),
+            (Mode::Publish(winner), "publish", "aos-publish", "shipped"),
+        ] {
+            assert_eq!(
+                (mode.name(), mode.stem(), mode.attaches()),
+                (name, stem, code)
+            );
+        }
+    }
+
+    /// A window's publish reply, in the verb's `publish_line` shape.
+    fn publish_reply() -> String {
+        format!(
+            "OK window=0 published paused_first=true rev=1 plan={WINNER_HEX} \
+             plan_digest=4e3c0f2a9b1d useful=true gain_ppm=234255 s0_gain_ppm=118000 \
+             code=momentum-glow.schedule-plan live=momentum-glow.shipped live_verdict=pass \
+             candidate_verdict=pass trace=9f00aa11bb22 ancestor=00ff00ff00ff range=0..1742 \
+             log_epoch=1 grade=tested bundle=c0ffee0123ab delivered=0"
+        )
+    }
+
+    /// A publish reply parses with its witness half, and a refusal, a repair reply and a reply without the witness are errors naming why.
+    #[test]
+    fn a_publish_reply_parses_with_its_witness_and_a_refusal_is_an_error() {
+        let p = parse_publish(&publish_reply()).expect("a publish reply");
+        assert_eq!(
+            p,
+            PublishLine {
+                window: 0,
+                paused_first: true,
+                rev: 1,
+                plan: WINNER_HEX.into(),
+                plan_digest: "4e3c0f2a9b1d".into(),
+                useful: true,
+                gain_ppm: 234_255,
+                s0_gain_ppm: 118_000,
+                code: PLAN_CODE.into(),
+                live: "momentum-glow.shipped".into(),
+                live_verdict: "pass".into(),
+                candidate_verdict: "pass".into(),
+                trace: "9f00aa11bb22".into(),
+                ancestor: "00ff00ff00ff".into(),
+                range: "0..1742".into(),
+                log_epoch: 1,
+                grade: "tested".into(),
+                bundle: "c0ffee0123ab".into(),
+                delivered: 0,
+            }
+        );
+        assert!(
+            parse_publish("ERR aos: the plan is not useful over the shipped code")
+                .expect_err("a refusal")
+                .starts_with("not an OK reply: ERR aos:")
+        );
+        assert!(
+            parse_publish("OK window=0 repaired paused_first=true rev=1")
+                .expect_err("a repair reply")
+                .starts_with("not a publish reply")
+        );
+        let unwitnessed = publish_reply().replace(" code=momentum-glow.schedule-plan", "");
+        assert_eq!(parse_publish(&unwitnessed), Err("no code=".to_string()));
+        let signed = publish_reply().replace("gain_ppm=234255", "gain_ppm=-5");
+        assert_eq!(parse_publish(&signed).map(|p| p.gain_ppm), Ok(-5));
+    }
+
+    /// One word of a publish reply made wrong.
+    type Spoil = fn(&mut PublishLine);
+
+    /// A publication over the shipped code passes every gate, each wrong word fails its own, and the plan named in upper case is the same plan.
+    #[test]
+    fn a_publication_passes_its_gates_and_each_wrong_word_fails_its_own() {
+        let p = parse_publish(&publish_reply()).expect("a publish reply");
+        let before = cold_status(0, 0, 700);
+        assert_eq!(
+            failed(&publish_gates(&p, WINNER_HEX, &before)),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            failed(&publish_gates(
+                &p,
+                &WINNER_HEX.to_ascii_uppercase(),
+                &before
+            )),
+            Vec::<&str>::new()
+        );
+        let cases: [(&str, Spoil); 9] = [
+            ("publish-paused-first", |p| p.paused_first = false),
+            ("publish-paused-first", |p| p.delivered = 1),
+            ("publish-plan", |p| {
+                p.plan = "010100000000000000000001".into()
+            }),
+            ("publish-useful", |p| p.useful = false),
+            ("publish-gain", |p| p.gain_ppm = 0),
+            ("publish-new-revision", |p| p.rev = 0),
+            ("plan-over-shipped", |p| {
+                p.code = "momentum-glow.shipped".into()
+            }),
+            ("publish-witness", |p| {
+                p.candidate_verdict = "fail:HotHasWake@3".into()
+            }),
+            ("publish-bundle-digest", |p| {
+                p.bundle = "C0FFEE0123AB".into()
+            }),
+        ];
+        for (name, wrong) in cases {
+            let mut q = p.clone();
+            wrong(&mut q);
+            assert_eq!(failed(&publish_gates(&q, WINNER_HEX, &before)), vec![name]);
+        }
+        let mut graded = p.clone();
+        graded.grade = "replayed".into();
+        assert_eq!(
+            failed(&publish_gates(&graded, WINNER_HEX, &before)),
+            vec!["publish-witness"]
+        );
+
+        let live = Status {
+            code: PLAN_NAME.into(),
+            guard: Some("moved:false,firings:0".into()),
+            ..cold_status(1, 1, 700)
+        };
+        assert!(plan_live_gate(&live, &p).pass);
+        assert!(
+            plan_live_gate(&live, &p)
+                .observed
+                .ends_with(" guard=moved:false,firings:0")
+        );
+        for wrong in [
+            Status {
+                code: "shipped".into(),
+                ..live.clone()
+            },
+            Status {
+                rev: 2,
+                ..live.clone()
+            },
+            Status {
+                paused: true,
+                ..live.clone()
+            },
+            Status {
+                publications: 2,
+                ..live.clone()
+            },
+        ] {
+            assert!(!plan_live_gate(&wrong, &p).pass, "{wrong:?}");
+        }
+    }
+
+    /// A bundle reply parses; its bytes are its hex decoded, exactly as long as it says.
+    #[test]
+    fn a_bundle_reply_parses_and_its_bytes_are_as_long_as_it_says() {
+        let digest = "ab".repeat(32);
+        let line = format!("OK window=0 bundle={digest} rev=1 bytes=3 hex=00ff7a");
+        let b = parse_bundle_line(&line).expect("a bundle reply");
+        assert_eq!(
+            b,
+            BundleLine {
+                window: 0,
+                bundle: digest,
+                rev: 1,
+                bytes: 3,
+                hex: "00ff7a".into()
+            }
+        );
+        assert_eq!(bundle_bytes(&b), Ok(vec![0x00, 0xff, 0x7a]));
+        let long = BundleLine {
+            bytes: 4,
+            ..b.clone()
+        };
+        assert_eq!(
+            bundle_bytes(&long),
+            Err("hex= holds 3 bytes, bytes=4".to_string())
+        );
+        let odd = BundleLine {
+            hex: "00f".into(),
+            ..b
+        };
+        assert!(bundle_bytes(&odd).is_err());
+        assert!(parse_bundle_line("ERR aos: the live code was published by no plan").is_err());
+        assert_eq!(
+            parse_bundle_line("OK window=0 bundle=ab rev=1 bytes=0"),
+            Err("no hex=".to_string())
+        );
+    }
+
+    /// A trace hex reply carries the trace file: its hex decoded, as long as it says.
+    #[test]
+    fn a_trace_hex_reply_carries_the_trace_file_it_counts() {
+        let line = "OK window=0 log=3 log_epoch=2 first=10 end=13 trace=ab checkpoint=cd \
+                    identity=ef broken=false bytes=1+2 sealed=true keys=0 resets=0 ticks=2 \
+                    queries=1 file_bytes=3 hex=414f53";
+        assert_eq!(trace_file(line), Ok(b"AOS".to_vec()));
+        assert_eq!(
+            parse_trace(line).map(|t| (t.log, t.ticks, t.queries)),
+            Ok((3, 2, 1)),
+            "the summary half is an `aos trace` line"
+        );
+        assert_eq!(
+            trace_file(&line.replace("file_bytes=3", "file_bytes=4")),
+            Err("hex= holds 3 bytes, file_bytes=4".to_string())
+        );
+        assert_eq!(
+            trace_file(&line.replace(" hex=414f53", "")),
+            Err("no hex=".to_string())
+        );
+        assert_eq!(parse_cursor("OK 3 17 1 steady_block\n"), Some((3, 17)));
+        assert_eq!(parse_cursor("ERR no tab"), None);
+        assert_eq!(cell_word(Some((3, 17))), "3,17");
+        assert_eq!(cell_word(None), "none");
+    }
+
+    /// The 12 fresh keys after a publication are judged by the first burst's gates under their own `fresh-` names and the plan's status name, and the continuation holds the plan's revision.
+    #[test]
+    fn the_fresh_burst_is_judged_by_the_first_bursts_gates_under_its_own_names() {
+        let mut e = cooled();
+        e.hot.code = PLAN_NAME.into();
+        let gates = cooled_gates_in(Burst::Fresh, PLAN_NAME, &e);
+        assert_eq!(failed(&gates), Vec::<&str>::new());
+        assert_eq!(
+            gates.iter().map(|g| g.name).collect::<Vec<_>>(),
+            [
+                "fresh-keys-heat",
+                "fresh-settling-names-wake",
+                "fresh-cleared-by-itself",
+                "fresh-last-tick-inert",
+                "fresh-cooled-pixels",
+                "fresh-admitted"
+            ]
+        );
+        assert_eq!(
+            failed(&cooled_gates_in(Burst::Fresh, "shipped", &e)),
+            vec!["fresh-keys-heat"]
+        );
+        assert_eq!(
+            cooled_gates(&cooled()),
+            cooled_gates_in(Burst::First, "shipped", &cooled())
+        );
+        let committed = Status {
+            code: PLAN_NAME.into(),
+            ..cold_status(1, 1, 400)
+        };
+        let after = Status {
+            code: PLAN_NAME.into(),
+            ..cold_status(1, 1, 700)
+        };
+        let trace = TraceLine {
+            log: 500,
+            end: 500,
+            trace: "ab".repeat(32),
+            ..TraceLine::default()
+        };
+        assert_eq!(
+            failed(&continuation_gates_for(
+                PLAN_NAME, &committed, &after, &after, &trace
+            )),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            failed(&continuation_gates(&committed, &after, &after, &trace)),
+            vec!["same-published-pair"],
+            "the repair's continuation is the shipped code's"
+        );
+        let r = Repair {
+            range: "0..169".into(),
+            log_epoch: 1,
+            ..repaired()
+        };
+        let t = TraceLine {
+            log: 12,
+            log_epoch: 2,
+            first: 169,
+            end: 181,
+            sealed: true,
+            ticks: 9,
+            queries: 3,
+            ..TraceLine::default()
+        };
+        assert_eq!(
+            post_commit_gates(&r, &t),
+            post_commit_gates_at(1, "0..169", &t)
+        );
+    }
+
+    /// The caret moves at one instant after the last key whenever the settling reading came, and a move at or past the cold instant or past the hang detector is refused.
+    #[test]
+    fn the_caret_moves_at_one_instant_after_the_last_key_whatever_the_code() {
+        let last_key = Instant::now();
+        let after = |ms: u64| last_key + Duration::from_millis(ms);
+        let cold = Some(after(4_600));
+        for read in [105, 630, 2_632] {
+            let wait = move_wait(after(read), last_key, cold).expect("in the tail");
+            assert_eq!(
+                after(read) + wait,
+                last_key + MOVE_AFTER_LAST_KEY,
+                "a settling reading {read} ms after the last key"
+            );
+        }
+        assert_eq!(
+            move_wait(after(3_500), last_key, cold),
+            Ok(Duration::ZERO),
+            "a reading past the move's instant moves at once"
+        );
+        for early_cold in [after(3_000), after(2_000)] {
+            let why = move_wait(after(105), last_key, Some(early_cold)).expect_err("past cold");
+            assert!(why.contains("cold instant"), "{why}");
+        }
+        let why = move_wait(last_key, after(61_000), None).expect_err("a hang");
+        assert!(why.contains("hang detector"), "{why}");
+    }
+
+    /// A real publication's bundle as a window of the build `build` exports it: the grid winner admitted by an evaluator of that build and published over a paused shipped glow.
+    fn published_bundle(build: &str) -> (Vec<u8>, u64) {
+        use aterm_effects::aos_momentum::{MomentumCode, MomentumHost};
+        let origin = Instant::now();
+        let ev = Evaluator::v1(build, origin).expect("the pinned policy");
+        let winner = SchedulePlan::decode(&[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).expect("a plan");
+        let admitted = ev
+            .admit_one(&winner.encode())
+            .expect("the winner is admitted");
+        let mut host = MomentumHost::default();
+        host.aos_attach(origin, MomentumCode::Shipped, build, 1);
+        host.aos_pause(origin, Duration::from_nanos(16_666_667))
+            .expect("a running glow pauses");
+        let published = host.aos_publish(admitted).expect("the winner publishes");
+        (published.bundle().encode(), published.revision().0)
+    }
+
+    /// A window's bundle is verified in the lab only under the same clean commit and refused offline at any commit, and the bundle gates pass only on the exported, verified bundle the publication names.
+    #[test]
+    fn a_published_bundle_passes_its_gates_and_is_verified_only_under_the_same_clean_commit() {
+        let build = "0.0.0+g0123456789ab";
+        let lab = "aterm-lab 0.0.0+g0123456789ab";
+        let (bytes, rev) = published_bundle(build);
+        assert_eq!(verify_in_lab(&bytes, build, lab), Verify::Verified);
+        for offline_lab in [lab, "aterm-lab 0.0.0+g0123456789ac"] {
+            let (code, r) = crate::aos_search::verify_bundle(
+                &bytes,
+                "w.bundle",
+                offline_lab,
+                || -> Result<&Evaluator, aterm_effects::aos_momentum::policy::PolicyRefusal> {
+                    panic!("an evaluator was built for a window's bundle")
+                },
+            );
+            assert_eq!(code, 1, "{r}");
+            assert!(
+                r.ends_with("aos-search verify=fail reason=ForeignBuild\n"),
+                "{offline_lab}: {r}"
+            );
+        }
+        assert!(matches!(
+            verify_in_lab(&bytes[..bytes.len() - 1], build, lab),
+            Verify::Refused(_)
+        ));
+        for (instance, lab) in [
+            (build, "aterm-lab 0.0.0+g0123456789ac"),
+            (build, "aterm-lab 0.0.0+g0123456789ab-dirty"),
+            (
+                "0.0.0+g0123456789ab-dirty",
+                "aterm-lab 0.0.0+g0123456789ab-dirty",
+            ),
+            ("0.0.0+gunknown", "aterm-lab 0.0.0+gunknown"),
+            ("none", lab),
+        ] {
+            let v = verify_in_lab(&bytes, instance, lab);
+            assert_eq!(
+                v,
+                Verify::Foreign {
+                    instance: instance.into(),
+                    lab: lab.into()
+                }
+            );
+            assert!(
+                v.word().starts_with("verify=skipped(foreign build) "),
+                "{}",
+                v.word()
+            );
+        }
+
+        let digest = Digest::of(BUNDLE_DOMAIN, &[&bytes]).hex();
+        let b = BundleLine {
+            window: 0,
+            bundle: digest.clone(),
+            rev,
+            bytes: bytes.len(),
+            hex: aterm_codec::hex::encode_lower(&bytes),
+        };
+        let p = PublishLine {
+            rev,
+            bundle: digest[..12].to_string(),
+            ..parse_publish(&publish_reply()).expect("a publish reply")
+        };
+        let plan = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            failed(&bundle_gates(&b, &p, &plan, &Verify::Verified)),
+            Vec::<&str>::new()
+        );
+        let skipped = Verify::Foreign {
+            instance: build.into(),
+            lab: "aterm-lab 0.0.0+g0123456789ac".into(),
+        };
+        assert_eq!(
+            failed(&bundle_gates(&b, &p, &plan, &skipped)),
+            vec!["bundle-verifies"]
+        );
+        let later = PublishLine {
+            rev: rev + 1,
+            ..p.clone()
+        };
+        assert_eq!(
+            failed(&bundle_gates(&b, &later, &plan, &Verify::Verified)),
+            vec!["bundle-exported", "bundle-publication"]
+        );
+        let other = PublishLine {
+            bundle: "000000000000".into(),
+            ..p.clone()
+        };
+        assert_eq!(
+            failed(&bundle_gates(&b, &other, &plan, &Verify::Verified)),
+            vec!["bundle-exported"]
+        );
+        let mut another = plan;
+        another[11] = 1;
+        assert_eq!(
+            failed(&bundle_gates(&b, &p, &another, &Verify::Verified)),
+            vec!["bundle-plan"]
+        );
+        let cut = BundleLine {
+            hex: aterm_codec::hex::encode_lower(&bytes[..bytes.len() - 1]),
+            bytes: bytes.len() - 1,
+            ..b
+        };
+        assert_eq!(
+            failed(&bundle_gates(&cut, &p, &plan, &Verify::Verified)),
+            vec!["bundle-exported", "bundle-plan", "bundle-publication"]
         );
     }
 }

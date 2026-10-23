@@ -95,8 +95,6 @@ pub enum LoginScreen {
     Failed,
 }
 
-/// A full-width rule row: `─` and nothing else, wider than a dialog's own
-/// inner rules could be mistaken for a word.
 fn rule(row: &str) -> bool {
     let t = trim(row);
     t.chars().count() >= 20 && t.chars().all(|c| c == '─')
@@ -166,7 +164,6 @@ pub fn login_screen(rows: &[String]) -> Option<LoginScreen> {
     Some(LoginScreen::Failed)
 }
 
-/// [`anchor_text`] by a runtime id.
 fn anchor_text_of(id: &str) -> &'static str {
     crate::anchors::anchor(id)
 }
@@ -193,17 +190,14 @@ pub fn login_interrupted(rows: &[String]) -> bool {
     interrupted_row(out) && said.len() >= 2 && trim_end(said[said.len() - 2]) == LOGIN_ROW
 }
 
-/// The row a typed `/login` leaves in the conversation.
 const LOGIN_ROW: &str = "❯ /login";
 
-/// Whether `row` is `⎿  Login interrupted`.
 fn interrupted_row(row: &str) -> bool {
     trim(row)
         .strip_prefix('⎿')
         .is_some_and(|rest| trim(rest) == anchor_text("login.interrupted"))
 }
 
-/// The nearest row above `i` that is not blank.
 fn said_above(rows: &[String], i: usize) -> Option<usize> {
     rows[..i].iter().rposition(|r| !trim(r).is_empty())
 }

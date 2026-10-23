@@ -15,8 +15,7 @@ pub(crate) fn read_ahead_own_code() {
     let _ = read_ahead(&file, offset, length);
 }
 
-/// `fcntl(F_RDADVISE)` of `length` bytes of `file` from `offset`: the kernel starts reading
-/// them into the page cache and the call returns. `false` when it refuses.
+/// Issues `fcntl(F_RDADVISE)` for `length` bytes of `file` from `offset`.
 #[cfg(target_os = "macos")]
 fn read_ahead(file: &std::fs::File, offset: u64, length: u64) -> bool {
     use std::os::fd::AsRawFd as _;
@@ -39,9 +38,7 @@ fn read_ahead(file: &std::fs::File, offset: u64, length: u64) -> bool {
     unsafe { libc::fcntl(file.as_raw_fd(), F_RDADVISE, &raw const advice) == 0 }
 }
 
-/// The running slice's `__TEXT` as (file offset, length): the slice's offset in its file from
-/// the kernel, `__TEXT`'s file size from this image's mapped header. `None` if either is
-/// missing.
+/// Returns the running Mach-O slice's `__TEXT` segment as `(file_offset, length)`.
 #[cfg(target_os = "macos")]
 fn own_code_range() -> Option<(u64, u64)> {
     const MH_MAGIC_64: u32 = 0xfeed_facf;
@@ -129,8 +126,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// How many of `file`'s first `len` bytes' pages are in the page cache: `mincore` over a
-    /// fresh read-only mapping, which takes no fault.
+    /// Returns `(resident_pages, total_pages)` for the first `len` bytes of `file`.
     fn resident_pages(file: &std::fs::File, len: usize) -> (usize, usize) {
         use std::os::fd::AsRawFd as _;
         unsafe extern "C" {
@@ -161,8 +157,7 @@ mod tests {
         (resident, vec.len())
     }
 
-    /// The range is this test binary's own `__TEXT` as its file records it: a thin Mach-O, so
-    /// the slice starts at 0, and `__TEXT`'s load command read from the file, not memory.
+    /// `own_code_range` matches the `__TEXT` segment parsed from the on-disk executable.
     #[test]
     fn own_code_range_is_the_running_slices_text() {
         let exe = std::fs::read(std::env::current_exe().expect("current_exe")).expect("read");
@@ -182,9 +177,7 @@ mod tests {
         assert_eq!(own_code_range(), Some(text));
     }
 
-    /// `read_ahead` brings a range whose pages are out of the page cache into it with no read
-    /// of ours: a file written with `F_NOCACHE` holds no resident page until the advice, and
-    /// every page of the range after it (the wait is a hang detector).
+    /// `read_ahead` faults an uncached file range into the page cache.
     #[test]
     fn read_ahead_brings_a_cold_range_into_the_page_cache() {
         use std::io::Write as _;

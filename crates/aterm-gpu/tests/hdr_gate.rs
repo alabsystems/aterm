@@ -2,7 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance and on-GPU clamp laws for the HDR glow present gate.
-//! Tests [`aterm_gpu::hdr_swapchain_wants_f16`] and [`aterm_gpu::hdr_present_plan`].
 
 use aterm_gpu::{
     hdr_present_plan, hdr_screen_upgrade_decision, hdr_screen_upgrade_wants_f16,
@@ -16,7 +15,6 @@ use {
     aterm_render::{GlowQuad, RenderInput, hdr, premul_rgb},
 };
 
-/// Iterate every (hdr_glow, supports_f16, glow_nonempty) tuple over {false,true}^3.
 fn all_inputs() -> impl Iterator<Item = (bool, bool, bool)> {
     (0u32..8).map(|bits| {
         let b = |i: u32| (bits >> i) & 1u32 == 1;
@@ -24,9 +22,6 @@ fn all_inputs() -> impl Iterator<Item = (bool, bool, bool)> {
     })
 }
 
-/// Chain the attach decision into the present plan for every input and check
-/// the three invariants, plus the raw plan over all surface states
-/// (including live-flip mismatches no attach chain reaches).
 #[test]
 fn hdr_gate_exhaustive_attach_present_chain() {
     let mut boosted = 0usize;
@@ -102,10 +97,6 @@ fn gpu(px: f32) -> GpuRenderer {
     g
 }
 
-/// Grid clamp on the real pipeline: with `hdr_glow` on and headroom, the blit
-/// (no aurora) stays in [0, 1], and each channel equals
-/// `aterm_render::hdr::hdr_grid_encode` of the SDR readback byte within f16
-/// quantization.
 #[test]
 #[cfg(wgpu_arm)]
 fn gpu_hdr_blit_grid_clamped_and_linear() {
@@ -139,10 +130,6 @@ fn gpu_hdr_blit_grid_clamped_and_linear() {
     );
 }
 
-/// Reference-white scale on grid and bands: an scRGB present at
-/// `sdr_white_scale = 3.0` into a destination 7 px larger than the grid. Content
-/// pixels equal `scrgb_present_channel(sdr byte, 3.0)` and band pixels the same
-/// encode of the theme background.
 #[test]
 #[cfg(wgpu_arm)]
 fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
@@ -210,9 +197,6 @@ fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
     );
 }
 
-/// Additive clamp: with the aurora pass on a 2.0x panel, no channel exceeds
-/// the sanitized EDR max and the aurora emits above 1.0. On an SDR panel
-/// (`edr_max = 1.0`) the output equals the pass-less present.
 #[test]
 #[cfg(wgpu_arm)]
 fn gpu_hdr_aurora_bounded_by_edr_and_nonvacuous() {
@@ -255,8 +239,6 @@ fn gpu_hdr_aurora_bounded_by_edr_and_nonvacuous() {
     }
 }
 
-/// SDR invariance at present: with `hdr_glow` off the plan keeps the aurora
-/// pass off even when asked and glow exists; no channel exceeds 1.0.
 #[test]
 #[cfg(wgpu_arm)]
 fn gpu_hdr_off_never_boosts() {
@@ -424,16 +406,6 @@ fn palette_input(
     (input, cells)
 }
 
-/// The HDR crown boosts each fragment by its white part,
-/// `1 + 2*smoothstep(0.35, 0.60, min(r, g, b))` capped at 3x and clamped to the
-/// headroom. Measured on the real pipeline as crowned minus pass-less, over the
-/// palette:
-///
-///   * every coloured mark is multiplied by exactly 1.0;
-///   * every white core climbs, and a white core is brighter than a coloured
-///     mark of the same coverage on the same channel;
-///   * the pixels over reference white are exactly the predicted ones, none
-///     within 3 % of the boundary.
 #[test]
 #[cfg(wgpu_arm)]
 fn only_the_whitest_cores_exceed_reference_white() {
@@ -546,14 +518,6 @@ fn only_the_whitest_cores_exceed_reference_white() {
     );
 }
 
-/// The live half of the screen gate: a window that attached 8-bit on a non-EDR
-/// screen is re-picked by `GpuRenderer::upgrade_surface_for_screen` (from the
-/// frontend's monitor-change hook and throttled headroom re-query). The re-pick
-/// decides through `hdr_screen_upgrade_decision`, which reads the screen only
-/// past the cheap gates: an f16 surface or a gate-refused window never pays the
-/// AppKit read the throttled re-query would make for every 8-bit window. Over
-/// every input it equals `hdr_screen_upgrade_wants_f16`, whose implication of
-/// the attach gate and need of a resolved screen are `format_plan`'s unit tests.
 #[test]
 fn metal_monitor_change_upgrade_is_the_attach_gate_on_positive_evidence() {
     for (hdr_glow, supports_f16, _) in all_inputs() {

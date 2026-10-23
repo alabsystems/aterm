@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Harness act and landing projections shared across the wire: [`Act`]
-//! ([`crate::supervise::IdleHost::act_taken`]), [`Counter`] ([`super::stats::HarnessStats`]),
-//! [`TaskFace`] ([`crate::supervise::IdleHost::task_face`]), [`LandHeld`] ([`HoldLeg`],
-//! [`OpenWord`]), [`self_claim_act`] ([`RULE_LANDED`]), and [`sort`]
-//! ([`super::stats::fold_ledger_line`]).
+//! Harness act and landing projections shared across the wire.
 
 use crate::supervise::approvals::Outcome;
 use crate::supervise::policy::approval::{
@@ -133,15 +129,10 @@ pub fn sort(rule_id: &str, outcome: Outcome, command: &str) -> Sorted {
     }
 }
 
-/// Whether an `approved` row under `rule` is one key of a question dialog
-/// (its tab, a toggle, its submit) rather than a box's press.
 fn is_dialog_key(rule: &str) -> bool {
     is_question_rule(rule) || rule == RULE_LAND_ANSWER
 }
 
-/// Whether a `typed` row under `rule` answers a question asked in prose:
-/// `answer_text` under any priority ([`QuestionPriority::prose_rule_id`]),
-/// or Land's answer.
 fn is_prose_answer(rule: &str) -> bool {
     rule == RULE_LAND_ANSWER
         || QuestionPriority::ALL
@@ -149,8 +140,6 @@ fn is_prose_answer(rule: &str) -> bool {
             .any(|p| p.prose_rule_id() == rule)
 }
 
-/// The act and counter of a `typed` row under `rule`, typing `command`;
-/// `None`: one the page counts only by its rule.
 fn typed_act(rule: &str, command: &str) -> Option<(Act, Counter)> {
     if matches!(
         rule,
@@ -201,8 +190,6 @@ pub fn log_mark(rule_id: &str, outcome: Outcome, command: &str) -> Option<String
     })
 }
 
-/// A rule id as a session log `rule=`: `@` mapped to `.` (a mark's `rule=`
-/// holds no `@`), only the bytes a log id keeps, cut at 40.
 fn log_rule(rule_id: &str) -> String {
     rule_id
         .chars()
@@ -254,7 +241,6 @@ pub fn relaunch_act(row: &str, step: &str) -> Option<String> {
     (!rule.is_empty()).then_some(rule)
 }
 
-/// codex-alab's approval of an escalated box (the proof's `approval` leg).
 const RULE_APPROVE_ALL: &str = "approve-all@v1";
 /// Codex-alab's re-exec onto a re-linked build (the proof's `upgrade` leg).
 pub const RULE_UPGRADE: &str = "upgrade@v1";
@@ -263,7 +249,6 @@ pub const RULE_POLICY_CONTINUE: &str = "policy-continue@v1";
 /// Codex-alab's landing under its own Land (the contract's Land row).
 pub const RULE_LANDED: &str = "landed@v1";
 
-/// The longest `rule=` a session log id holds (`aterm_slog::ShortId::MAX`).
 const LOG_RULE_MAX: usize = 40;
 
 /// The task's face, told by the loop as it moves.
@@ -299,8 +284,7 @@ pub struct LandHeld {
     pub since_ms: Option<i64>,
     /// The nudges (`land-nudge@v1`) typed since that act.
     pub nudges: u32,
-    /// A land act's yield was judged, and no other turn ran since: the
-    /// legs below are that yield's.
+    /// Whether a land act's yield was judged and no other turn ran since.
     pub read: bool,
     /// What held the landing at that yield, a bit per [`HoldLeg`].
     pub legs: u8,
@@ -396,7 +380,6 @@ impl OpenWord {
     /// The word, as the strict reading spelled it.
     #[must_use]
     pub fn word(self) -> &'static str {
-        // An index is only ever made by `of`, from the same tables.
         crate::supervise::policy::turn_end::open_word_at(self.0).unwrap_or("open work")
     }
 }
@@ -411,10 +394,6 @@ impl std::fmt::Debug for OpenWord {
 mod tests {
     use super::*;
 
-    /// Each act's glyph and word are its own pair (Land's two share the
-    /// glyph and differ in the word), and its spoken words carry no glyph:
-    /// the label's word, as §9.2.1 says it (`approved`), but Land's
-    /// instruction (`started landing`), and no two acts say the same.
     #[test]
     fn every_act_has_its_face_and_words_with_no_glyph() {
         let mut faces = std::collections::BTreeSet::new();
@@ -447,8 +426,6 @@ mod tests {
         RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE, RULE_USAGE_PROBE,
     };
 
-    /// The counter each act's family adds to, were an act its own counter:
-    /// what [`sort`] gives everywhere but a dialog's key.
     fn family(act: Act) -> Counter {
         match act {
             Act::Approved => Counter::Approved,
@@ -460,12 +437,6 @@ mod tests {
         }
     }
 
-    /// THE SORT IS THE STATS TABLE'S: every rule each family counts lights
-    /// that family's act and adds to its counter; a question dialog's key
-    /// lights `Answered` and counts nothing; `context-compact@v1` typing
-    /// `/compact` is nothing, and typing anything else is `Resumed` for
-    /// both; the rules counted only by rule, and every `skipped`,
-    /// `deferred`, `waiting` and `escalated` row, are nothing.
     #[test]
     fn the_sort_is_the_stats_tables() {
         let lit = |act, counter| Sorted {
@@ -623,7 +594,6 @@ mod tests {
         assert_eq!(parted, want);
     }
 
-    /// The three faces print three words.
     #[test]
     fn every_face_prints_its_own_status_word() {
         let words: std::collections::BTreeSet<_> =
@@ -634,10 +604,6 @@ mod tests {
         );
     }
 
-    /// THE SESSION LOG'S `act` WORDS (addendum A17): each act's row maps to
-    /// the log's act vocabulary — Continued and Resumed both `continue`,
-    /// Land's two `dispatch` — an escalated row to `escalate`, and a row
-    /// that lights nothing to no mark.
     #[test]
     fn each_act_is_one_log_word() {
         use crate::supervise::policy::turn_end::RULE_LAND_NUDGE;
@@ -701,13 +667,6 @@ mod tests {
         assert_eq!(mark, format!("act word=escalate rule={}", "r".repeat(40)));
     }
 
-    /// A SELF-SUPERVISED AGENT'S ACTS ARE THE LOG'S ACT WORDS (plan 5C-2):
-    /// every act codex-alab's proof shows (`docs/measured/
-    /// codex-alab-proof-2026-10-16.md`), and every act of its own FOREVER
-    /// CRUISE / Autopilot Land (the contract's §5 Cruise and Land rows), maps
-    /// to one word, `rule=` the act with `@` written `.`; the acts that are
-    /// no act of the log's (`finished@v1`, the retired token's end; a word
-    /// nobody measured; a near miss) map to none, and the table counts them.
     #[test]
     fn a_self_claims_acts_are_the_logs_act_words() {
         let cases = [
@@ -785,12 +744,6 @@ mod tests {
         }
     }
 
-    /// A SELF-CLAIM'S ACT TYPES A TURN ONLY WHERE IT STARTS ONE (review of
-    /// codex-alab parity-4, R1): every act codex-alab records that begins a
-    /// turn of its own types one, and the acts that begin none (an approval
-    /// or a box's answer inside a turn, a report mailed, a login escalated,
-    /// the landing, the point left to a person, the re-exec, the retired
-    /// token, a near miss) type none.
     #[test]
     fn a_self_claims_act_types_a_turn_only_where_it_starts_one() {
         let cases = [
@@ -832,10 +785,6 @@ mod tests {
         assert!(!worded("plan-approve@v2") && !worded("mail-report@v1"));
     }
 
-    /// THE HOSTED LANES' ACT MARK (plan 5F-2, T25): a relaunch or upgrade
-    /// row whose step moved the session (typed a turn, or ended or relaunched
-    /// the agent) is one `act word=relaunch rule=<row>`; a row that moved
-    /// nothing is none.
     #[test]
     fn a_hosted_relaunch_row_that_moved_the_session_is_a_relaunch_act() {
         let cases = [
@@ -879,13 +828,6 @@ mod tests {
         assert_eq!(RELAUNCH_WORD, "relaunch");
     }
 
-    /// ONLY A STEP THAT BROUGHT A NEW AGENT UP STARTED ONE:
-    /// of the hosted rows' steps that moved the session,
-    /// the relaunch line typed, the relaunched process adopted and a fresh
-    /// start brought a new agent process up; a turn typed into the running
-    /// agent (a notice, a carry-on, a release, a restore line, the done
-    /// check) and a stop with no start yet did not, and a step that moved
-    /// nothing started nothing.
     #[test]
     fn only_a_step_that_brought_a_new_agent_up_started_one() {
         use super::super::upgrade_drive::{moved, started};

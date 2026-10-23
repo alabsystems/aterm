@@ -6,7 +6,6 @@
 use super::*;
 use aterm_core::terminal::RenderCell;
 
-/// [`enter_at_the_bottom`]'s answer.
 type Entered = (
     CursorGlow,
     Vec<GlowQuad>,
@@ -15,7 +14,6 @@ type Entered = (
     GlowConfig,
 );
 
-/// A hot run typed on the last row of a `tall_geom` pane, then Enter.
 fn enter_at_the_bottom(style: GlowStyle, dark: bool, after_ms: u64) -> Entered {
     let g = tall_geom();
     let bottom = g.rows as u16 - 1;
@@ -87,7 +85,6 @@ fn enter_at_the_bottom(style: GlowStyle, dark: bool, after_ms: u64) -> Entered {
     (glow, out, rows, (bottom - 2, start + keys), c)
 }
 
-/// The light the frame lays in cell `(row, col)`.
 fn light_in_cell(glow: &CursorGlow, out: &[GlowQuad], (row, col): (u16, u16)) -> (u64, usize) {
     let g = tall_geom();
     let (x0, y0) = (i32::from(col) * g.cw as i32, i32::from(row) * g.ch as i32);
@@ -116,14 +113,6 @@ fn light_in_cell(glow: &CursorGlow, out: &[GlowQuad], (row, col): (u16, u16)) ->
     (lum(out) + lum(glow.under_quads()), halos)
 }
 
-/// THE CELL A CARET LEAVES KEEPS NO MARK: an Enter at the bottom of a full
-/// pane carries the typed command up two rows and the caret leaps home. The
-/// cell the caret stood on after the command's last letter is the caret's,
-/// not the trail's: by 160 ms after the Enter neither Beam, nor Comet, nor
-/// Laser lays any light there (a clipped white half-disc and a lavender bar
-/// after `fox`, a white dash, a blocky mosaic), and Beam and Comet none in
-/// the first frame either. Negative control: before the Enter, with the
-/// caret on that cell, each style's head lights it.
 #[test]
 fn the_cell_a_caret_leaves_keeps_no_mark() {
     for style in [GlowStyle::Beam, GlowStyle::Comet, GlowStyle::Laser] {
@@ -147,7 +136,6 @@ fn the_cell_a_caret_leaves_keeps_no_mark() {
     }
 }
 
-/// [`enter_at_the_bottom`]'s run up to the last key.
 fn typed_at_the_bottom(style: GlowStyle) -> (CursorGlow, Vec<GlowQuad>, (u16, u16)) {
     let g = tall_geom();
     let bottom = g.rows as u16 - 1;
@@ -173,11 +161,6 @@ fn typed_at_the_bottom(style: GlowStyle) -> (CursorGlow, Vec<GlowQuad>, (u16, u1
     (glow, out, (bottom, start + keys))
 }
 
-/// ON PAPER A LASER'S LEAP GOES WITH ITS STRIKE: an Enter at the bottom of a
-/// full pane, the laser on GitHub Light: 160 ms after it (past the strike's
-/// one flash) no ink lies under the command's output, which only the leap
-/// crosses, where the fired beam once stood through its letters as a
-/// struck-through rule.
 #[test]
 fn the_light_laser_leap_is_gone_with_its_strike() {
     let g = tall_geom();
@@ -217,7 +200,6 @@ fn the_light_laser_leap_is_gone_with_its_strike() {
     );
 }
 
-/// The laser's Enter at the bottom of a full pane, at a host's geometry.
 fn laser_enter_on_a_host_pane(unheld: bool, after_ms: u64) -> (CursorGlow, Geom, (f32, f32)) {
     let g = Geom {
         cw: 14,
@@ -295,16 +277,6 @@ fn laser_enter_on_a_host_pane(unheld: bool, after_ms: u64) -> (CursorGlow, Geom,
     (glow, g, caret)
 }
 
-/// A LASER'S AURA IS ITS HEAD'S: after an Enter at the bottom of a full
-/// pane, at 32 and 128 ms, every halo of the frame stands within
-/// [`CursorGlow::LASER_AURA_REACH_CELLS`] of the caret (the landing ring's
-/// bloom, fitted a cell inward at the edge, included), and none reaches past
-/// the grid's bottom edge, where it would be cut square. The aura laid on
-/// every air sample of the leap stood as a fat white-lilac slab along the
-/// prompt row, cut at the grid's bottom, and as a detached grey-violet block
-/// on the blank after the printed output. Negative control: the unheld aura
-/// lays halos farther out (on that blank and along the prompt) and past the
-/// bottom edge.
 #[test]
 fn the_laser_aura_stays_on_its_head() {
     let far = |glow: &CursorGlow, g: Geom, (hx, hy): (f32, f32)| -> (usize, usize) {

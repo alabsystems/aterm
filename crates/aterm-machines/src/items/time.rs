@@ -16,7 +16,6 @@ pub const SYSTEMSETUP: &str = "/usr/sbin/systemsetup";
 /// Where the zone files live (a link to the current tz database on 27).
 pub const ZONEINFO: &str = "/var/db/timezone/zoneinfo";
 
-/// What `systemsetup` prints, exit 0, when it is not run as root.
 const NOT_ROOT: &str = "You need administrator access";
 
 /// The table.
@@ -35,7 +34,6 @@ pub struct Table {
 }
 
 /// The items `table` asks for.
-///
 /// # Errors
 /// One line naming a zone or server that is not a name.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
@@ -114,7 +112,6 @@ impl Setting {
         }
     }
 
-    /// The `systemsetup` run that sets `value` (the zone, `on`/`off`, the server).
     fn set(&self, value: &str) -> Cmd {
         let verb = match self.kind {
             Kind::Zone(_) => "-settimezone",
@@ -131,7 +128,6 @@ impl Setting {
         }
     }
 
-    /// The current value, in the form [`Setting::set`] takes.
     fn read(&self, sys: &dyn System) -> Result<String, String> {
         match &self.kind {
             Kind::Zone(_) => {
@@ -160,7 +156,6 @@ impl Setting {
 
     fn same(&self, now: &str) -> bool {
         match &self.kind {
-            // Host names are case-insensitive.
             Kind::Server(s) => now.eq_ignore_ascii_case(s),
             _ => now == self.wanted(),
         }
@@ -171,8 +166,6 @@ const fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
 
-/// `cmd`'s standard output, refused when it exited nonzero or `systemsetup` said it is not
-/// root (it exits 0 then).
 fn out_of(sys: &dyn System, cmd: &Cmd) -> Result<String, String> {
     let ran: Ran = sys
         .run(cmd)
@@ -226,7 +219,6 @@ impl Item for Setting {
             return Probe::Ok { now };
         }
         if let Kind::Zone(zone) = &self.kind {
-            // A plan must not promise a zone this Mac does not have.
             let file = Path::new(ZONEINFO).join(zone);
             match sys.stat(&file) {
                 Ok(s) if !s.dir => {}
@@ -277,7 +269,6 @@ mod tests {
         }
     }
 
-    /// What `systemsetup -settimezone` writes to standard error in the VM, exit 0.
     const NOISE: &str = "2026-10-16 23:07:26.027 systemsetup[2456:28578] ### Error:-99 File:/AppleInternal/Library/BuildRoots/4~CV23ugBcSuPoqTCv2d4ySbycsdbOG37Qm_PyGCo/Library/Caches/com.apple.xbs/TemporaryDirectory.ALqQnw/Sources/Admin/InternetServices.m Line:395";
 
     fn set_ok(stdout: &str) -> Ran {

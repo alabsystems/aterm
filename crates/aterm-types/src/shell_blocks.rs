@@ -47,9 +47,9 @@ pub struct OutputBlock {
     pub commandline: Option<Box<str>>,
     /// Whether the output portion of this block is collapsed.
     pub collapsed: bool,
-    /// A full clear of the main screen (ED 2, or ED 0 from home: `clear`, Ctrl-L) blanked rows this block reads its text from after its command finished: a prompt had archived it, or its D had come and the next prompt not yet.
+    /// Whether a full-screen clear (`ED 2` or `ED 0` from home) blanked rows after completion.
     pub text_cleared: bool,
-    /// This block's command rows were lost while it was being built, and they were a non-empty range then: a full clear of the main screen blanked some of them while its command ran (`clear; make`, a program that clears the screen it writes to), or a scrollback erase (ED 3, Cmd-K) took some of them before its command finished.
+    /// Whether a full-screen clear or scrollback erase (`ED 3`) lost command rows mid-run.
     pub command_text_cleared: bool,
     /// Timestamp when prompt was received (milliseconds since Unix epoch).
     pub prompt_time_ms: Option<u64>,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LAUNCHER'S HALF OF `aterm --headless --ready-fd <n>`.
+//! Launcher half of `aterm --headless --ready-fd <n>`.
 
 use std::fs::File;
 use std::io::{self, Read as _};
@@ -185,10 +185,6 @@ mod tests {
     use std::io::Write as _;
     use std::time::Duration;
 
-    /// The byte reads as ready; a write end closed with nothing written reads
-    /// as closed; a write end still held somewhere reads as a hang — never as
-    /// ready. Within the process: the child's copy is a duplicate of the write
-    /// end, as `fork` makes it.
     #[test]
     fn the_byte_is_ready_a_bare_close_is_closed_and_a_held_end_is_a_hang() {
         let dir = crate::supervise::test_scratch_path("ready", "signal");

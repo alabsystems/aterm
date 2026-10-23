@@ -4,7 +4,7 @@
 //! Caffeine status-item click classification, right-click menu composition, and menu item tags.
 
 use crate::launchd::Startup;
-use crate::model::{Choice, Mode, describe_left};
+use crate::model::{Choice, Clocks, Mode, describe_left};
 
 /// What a click on the mug does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,7 +114,7 @@ pub const STARTUP_BLOCKED_LABEL: &str = "Enable at Startup \u{2014} Allow in Log
 
 /// Compose the menu rows at `now` for `mode`, `startup`, and `version`.
 #[must_use]
-pub fn compose(mode: Mode, now: u64, startup: Startup, version: &str) -> Vec<Row> {
+pub fn compose(mode: Mode, now: Clocks, startup: Startup, version: &str) -> Vec<Row> {
     let current = mode.choice(now);
     let left = mode.remaining(now);
     let mut rows = vec![Row::Info(about_line(version)), Row::Separator];
@@ -154,13 +154,13 @@ pub fn compose(mode: Mode, now: u64, startup: Startup, version: &str) -> Vec<Row
 
 /// Status-item tooltip for `mode` at `now`.
 #[must_use]
-pub fn tooltip(mode: Mode, now: u64) -> String {
+pub fn tooltip(mode: Mode, now: Clocks) -> String {
     match mode.settled(now) {
         Mode::Off => "Caffeine is off \u{2014} click to keep this Mac awake".to_string(),
         Mode::Forever => "Caffeine is keeping this Mac awake until you click".to_string(),
         Mode::Until { deadline, .. } => format!(
             "Caffeine is keeping this Mac awake for {} more",
-            describe_left(deadline - now)
+            describe_left(deadline - now.since_boot)
         ),
     }
 }
@@ -170,7 +170,10 @@ mod tests {
     use super::*;
     use crate::model::HOUR;
 
-    const NOW: u64 = 1_790_000_000;
+    const NOW: Clocks = Clocks {
+        since_boot: 300_000,
+        wall: 1_790_000_000,
+    };
 
     #[test]
     fn tags_round_trip_and_unknown_is_inert() {
@@ -297,5 +300,23 @@ mod tests {
         let timed = tooltip(Mode::chosen(Choice::Hours1, NOW), NOW + 8 * 60);
         assert!(timed.contains(&describe_left(52 * 60)), "{timed}");
         assert!(tooltip(Mode::chosen(Choice::Hours1, NOW), NOW + HOUR).contains("off"));
+    }
+
+    /// Eight minutes into Activate for 1 Hour, the wall clock set back a day: the checked row and
+    /// the tooltip say the 52 minutes it has left, not a day more.
+    #[test]
+    fn a_clock_set_back_shows_the_time_really_left() {
+        let mode = Mode::chosen(Choice::Hours1, NOW);
+        let back = Clocks {
+            since_boot: NOW.since_boot + 8 * 60,
+            wall: NOW.wall - 24 * HOUR + 8 * 60,
+        };
+        let items = actions(&compose(mode, back, Startup::Off, "1"));
+        assert_eq!(items[0].0, "Activate for 1 Hour \u{2014} 52 min left");
+        assert!(items[0].2);
+        assert_eq!(
+            tooltip(mode, back),
+            "Caffeine is keeping this Mac awake for 52 min more"
+        );
     }
 }

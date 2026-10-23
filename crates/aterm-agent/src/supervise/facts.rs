@@ -137,10 +137,10 @@ pub const FACT_FRESH_MS: i64 = 5_000;
 
 /// How old a no-progress reading may be and still forget a told episode it no longer names: the
 /// jobs board's own bound (`aterm-gui`'s `vitals_jobs::JOBS_FRESH`). A fact is told only from a
-/// reading [`FACT_FRESH_MS`] old ([`FactsReading::tells_at`]), which the board meets: its view of
-/// a call at no progress is read every 2 s while the call stands suspect (every 5 s at most in a
-/// background window showing the bars), and the host re-proves at the ask that every leader it
-/// names still lives with the same birth.
+/// reading [`FACT_FRESH_MS`] old ([`FactsReading::tells_at`]), counted from when the probe read
+/// it, which the board meets: its view of a call at no progress is read about every 2 s, a window
+/// in view or none (`vitals_jobs::told_after`, `windowless_after`), and the host re-proves at the
+/// ask that every leader it names still lives with the same birth.
 pub const NO_PROGRESS_FRESH_MS: i64 = 60_000;
 
 /// After a restart, a kind told this recently waits for its condition to clear once before any

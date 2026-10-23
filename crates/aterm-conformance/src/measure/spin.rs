@@ -2,17 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The spin matrix: an idle instance must stay idle.
-//!
-//! The witness is `past_deadline_arms` from `ctl metrics`: a wake armed at an
-//! instant its own observation gate has already passed. Healthy idle banks
-//! zero; a spin banks tens of thousands a second. The claude-shaped row also
-//! bounds `timer_wakes`, because the structural clamp turns a stale owed wake
-//! into an observation-rate poll that arms nothing in the past.
-//!
-//! The counter is zeroed after the launch settles and before the client
-//! starts, so the client's arrival is counted and startup's own arming is not.
-//! Nothing else is sent inside the window: no capture and no recording, whose
-//! present loop would manufacture the activity this row exists to find absent.
 
 use std::time::Duration;
 
@@ -25,10 +14,7 @@ use super::starvation::ShapeVerdict;
 /// What sits on the instance while it is measured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpinScene {
-    /// The steady repainter: one second of real writes (so the session reaches
-    /// Running), then bytes that mark no cell ~6x/s, so output keeps Running
-    /// alive while the movement clock goes stale. Verified at the end of the
-    /// window.
+    /// The steady repainter.
     ClaudeShaped,
     /// A bare `/bin/sh` prompt: the floor.
     Idle,
@@ -44,11 +30,9 @@ pub struct SpinRow {
     pub max_timer_wakes: Option<u64>,
 }
 
-/// The settle before the counter is zeroed: the session quiet this long.
 const SETTLE_QUIET_MS: &str = "3000";
 
-/// A take's wall-clock limit: every wait and request on the instance ends
-/// with it.
+/// A take's wall-clock limit: every wait and request on the instance ends with it.
 pub const BUDGET_SECS: u64 = 90;
 
 /// One row's outcome.
@@ -59,8 +43,7 @@ pub struct SpinReport {
     pub stale_arm_heals: Option<u64>,
     pub frames: Option<u64>,
     pub timer_wakes: Option<u64>,
-    /// The status reasons at the end of the window (the claude scene's proof
-    /// that it was output without movement).
+    /// The status reasons at the end of the window.
     pub reasons: Option<String>,
     pub verdict: ShapeVerdict,
 }
@@ -101,7 +84,6 @@ pub const fn judge(row: &SpinRow, arms: u64, timer_wakes: Option<u64>) -> ShapeV
 }
 
 /// Measure one row.
-///
 /// # Errors
 /// [`CouldNotRun`] when the instance did not start, a counter is missing, or
 /// the claude scene was not the shape it claims (off the alt screen, or its
@@ -110,7 +92,6 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     let _one = super::ONE_TAKE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // The client's first exec is paid here, outside the window it arrives in.
     super::instance::first_exec(&rig.fake_tui);
     let budget = Budget::from_now(BUDGET_SECS);
     let mut scratch = Scratch::new("atspin")

@@ -1,25 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`super::System::catch_stops`]'s live arm: SIGINT, SIGTERM and SIGHUP noted instead of ending
-//! the process, so `screen` can close its relay and lock a session the admin logged in to over it
-//! before it exits (design §6).
+//! [`super::System::catch_stops`]'s live arm: catches SIGINT, SIGTERM, and SIGHUP.
 
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-/// The signals a person or the system stops a command with.
 const STOPS: [c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
-/// The first of [`STOPS`] caught while a [`Catching`] lives; 0 for none.
 static CAUGHT: AtomicI32 = AtomicI32::new(0);
 
-/// The handler: keep the first signal, nothing else (async-signal-safe).
 extern "C" fn note(sig: c_int) {
     let _ = CAUGHT.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
 }
 
-/// The dispositions [`catch`] replaced, put back whole when this drops.
 struct Catching([(c_int, Option<libc::sigaction>); 3]);
 
 impl Drop for Catching {
@@ -85,7 +79,6 @@ pub fn name(sig: i32) -> String {
 mod tests {
     use super::*;
 
-    /// The disposition of `sig` now.
     fn disposition(sig: c_int) -> libc::sighandler_t {
         // SAFETY: as in `catch`.
         let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -97,7 +90,6 @@ mod tests {
         now.sa_sigaction
     }
 
-    /// Send this thread SIGHUP: nothing else in the test binary sends or catches it.
     fn hang_up() {
         #[expect(
             clippy::disallowed_methods,

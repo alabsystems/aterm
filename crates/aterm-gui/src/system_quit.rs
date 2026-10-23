@@ -1,37 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! System-requested quit tracking (logout, restart, shutdown, or lost window system).
+//! The quit the system asked for: a logout, a restart or a shutdown, after which the agents aterm
+//! hosted relaunch at the next start.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aterm_window::error::EventLoopError;
 
-/// `keyAEQuitReason`, `'why?'`. The quit reason is read only off macOS's quit
-/// Apple Event (`menu::terminate_is_the_systems`).
+/// `keyAEQuitReason`, `'why?'`.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const KEY_QUIT_REASON: u32 = u32::from_be_bytes(*b"why?");
 
-/// The quit reasons that are the system's: `kAELogOut` (`logo`),
-/// `kAEReallyLogOut` (`rlgo`), `kAEShowRestartDialog` (`rrst`), `kAERestart`
-/// (`rest`), `kAEShowShutdownDialog` (`rsdn`), `kAEShutDown` (`shut`).
+/// The quit reasons that are the system's.
 #[cfg(any(target_os = "macos", test))]
 const SYSTEM_REASONS: [[u8; 4]; 6] = [*b"logo", *b"rlgo", *b"rrst", *b"rest", *b"rsdn", *b"shut"];
 
-/// The generation of the quit the system asked for, or `0` for none (the
-/// arbiter mints generations from `1`).
 static SYSTEM_QUIT: AtomicU64 = AtomicU64::new(0);
 
-/// The event loop ended with an error under this process ([`note_event_loop_failed`]).
 static EVENT_LOOP_FAILED: AtomicBool = AtomicBool::new(false);
 
-/// The exit status of a run whose window system went away under it:
-/// `EX_UNAVAILABLE` (sysexits), nonzero, so whatever started aterm sees an end
-/// nobody chose.
+/// The exit status of a run whose window system went away under it.
 pub(crate) const EXIT_WINDOW_SYSTEM_GONE: i32 = 69;
 
-/// The exit status of a run whose event loop failed some other way:
-/// `EX_SOFTWARE` (sysexits), aterm's own failure, not the display's.
+/// The exit status of a run whose event loop failed some other way.
 pub(crate) const EXIT_EVENT_LOOP_FAILED: i32 = 70;
 
 /// Whether quit reason `code` is a logout, a restart or a shutdown.
@@ -42,8 +34,7 @@ pub(crate) fn reason_is_the_systems(code: u32) -> bool {
         .any(|reason| u32::from_be_bytes(*reason) == code)
 }
 
-/// The system asked this process to quit, through the `terminate:` of
-/// `generation`. Only the macOS `terminate:` relay notes one.
+/// The system asked this process to quit, through the `terminate:` of `generation`.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn note(generation: u64) {
     if generation != 0 {
@@ -51,32 +42,23 @@ pub(crate) fn note(generation: u64) {
     }
 }
 
-/// The quit of `generation` was cancelled: if it was the system's, it no longer
-/// is, and no later quit inherits its mark. A cancel of any other generation
-/// leaves the mark alone.
+/// The quit of `generation` was cancelled.
 pub(crate) fn forget(generation: u64) {
     let _ = SYSTEM_QUIT.compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst);
 }
 
-/// The event loop ended with an error under this process, its window system
-/// gone or another: its quit is the system's, as a logout's is, for the rest
-/// of the run.
+/// The event loop ended with an error under this process, its window system gone or another.
 pub(crate) fn note_event_loop_failed() {
     EVENT_LOOP_FAILED.store(true, Ordering::SeqCst);
 }
 
-/// Whether the system asked this process to quit, by a quit nobody cancelled,
-/// or its event loop failed.
+/// Whether the system asked this process to quit, by a quit nobody cancelled, or its event loop
+/// failed.
 pub(crate) fn asked() -> bool {
     SYSTEM_QUIT.load(Ordering::SeqCst) != 0 || EVENT_LOOP_FAILED.load(Ordering::SeqCst)
 }
 
-/// How a run whose event loop ended with `error` ends: the status it exits
-/// with and the line that says why. Only the display connection's death
-/// ([`EventLoopError::DisplayLost`]) ends it as a logout does, with
-/// [`EXIT_WINDOW_SYSTEM_GONE`] and a line saying the display connection
-/// ended; any other error is said as itself, with
-/// [`EXIT_EVENT_LOOP_FAILED`].
+/// How a run whose event loop ended with `error` ends.
 pub(crate) fn failed_loop_end(error: &EventLoopError) -> (i32, String) {
     match error {
         EventLoopError::DisplayLost(why) => {
@@ -105,8 +87,7 @@ pub(crate) fn asked_for(generation: u64) -> bool {
     generation != 0 && SYSTEM_QUIT.load(Ordering::SeqCst) == generation
 }
 
-/// No mark at all, for a test that starts from a fresh arbiter
-/// (`menu::terminate_test_serial`).
+/// No mark at all, for a test that starts from a fresh arbiter (`menu::terminate_test_serial`).
 #[cfg(test)]
 pub(crate) fn clear_for_test() {
     SYSTEM_QUIT.store(0, Ordering::SeqCst);
@@ -117,8 +98,6 @@ pub(crate) fn clear_for_test() {
 mod tests {
     use super::*;
 
-    /// Only logout, restart and shutdown codes are the system's: an AppleScript
-    /// `quit` or a Dock Quit carries no reason, which reads as `0`.
     #[test]
     fn only_a_logout_a_restart_or_a_shutdown_is_the_systems() {
         for r in [b"logo", b"rlgo", b"rrst", b"rest", b"rsdn", b"shut"] {
@@ -134,8 +113,6 @@ mod tests {
         assert_eq!(KEY_QUIT_REASON, 0x7768_793f);
     }
 
-    /// A cancelled system quit marks no later quit, through either cancel path; a
-    /// duplicate the system sends while a quit is pending marks that pending quit.
     #[test]
     fn a_cancelled_system_quit_does_not_mark_a_later_person_quit() {
         use crate::menu::{NativeTerminateDecision, admit_native_terminate};
@@ -170,10 +147,6 @@ mod tests {
         assert!(!asked());
     }
 
-    /// A FAILED EVENT LOOP (a window system that went away, or another error)
-    /// MAKES THE QUIT THE SYSTEM'S, so the manifest keeps the agents as a
-    /// logout's does, and no cancel of any generation unmarks it: no window is
-    /// left to answer a Cancel in.
     #[test]
     fn a_failed_event_loop_marks_the_quit_and_no_cancel_unmarks_it() {
         use crate::menu::{NativeTerminateDecision, admit_native_terminate};
@@ -191,12 +164,6 @@ mod tests {
         assert!(!asked());
     }
 
-    /// ONLY A DEAD DISPLAY ENDS THE RUN AS A LOGOUT (GONE-2): the line that
-    /// says the display connection ended, and 69. Every other error the loop
-    /// can end with (the X11 error at a quit's last sync was one, until the
-    /// backend kept it out of the run's end) is said as itself, with 70: the
-    /// negative control, which COMPOSITOR-GONE's mapping of every error to
-    /// the logout failed.
     #[test]
     fn only_a_dead_display_ends_the_run_as_a_logout() {
         let (status, line) = failed_loop_end(&EventLoopError::DisplayLost(

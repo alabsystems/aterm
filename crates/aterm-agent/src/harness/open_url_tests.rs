@@ -794,6 +794,90 @@ fn mailbox_secret_files_require_complete_regular_contents() {
 }
 
 #[test]
+fn maildir_threads_keep_consumed_links_across_authorizations() {
+    use super::super::headless_oauth::{
+        MailboxConfig, MailboxCredential, poll_mailbox_config_for_credential,
+    };
+    use std::time::Duration;
+
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-maildir-thread-history-")
+        .tempdir()
+        .unwrap();
+    let thread = concat!(
+        "To: <owner@example.test>\r\n\r\n",
+        "Earlier link: https://claude.ai/magic-link#first\r\n",
+        "Latest link: https://claude.ai/magic-link#second\r\n",
+    );
+    let first = MailboxCredential::MagicLink("https://claude.ai/magic-link#first".to_owned());
+    let second = MailboxCredential::MagicLink("https://claude.ai/magic-link#second".to_owned());
+    let poll = |cfg: &MailboxConfig, timeout| {
+        // Each public call starts a new authorization's in-memory credential history.
+        poll_mailbox_config_for_credential(cfg, Some("owner@example.test"), timeout)
+    };
+
+    let mailbox = tmp.path().join("persistent");
+    std::fs::create_dir(&mailbox).unwrap();
+    std::fs::write(mailbox.join("thread.eml"), thread).unwrap();
+    let cfg = MailboxConfig::from_dir(&mailbox);
+    assert_eq!(poll(&cfg, Duration::from_secs(60)), Ok(first.clone()));
+    assert!(!mailbox.join("thread.eml.clicked").exists());
+    let seen = cfg.seen_file.as_deref().unwrap();
+    let first_history = std::fs::read(seen).unwrap();
+    assert!(!first_history.is_empty());
+    assert_eq!(poll(&cfg, Duration::from_secs(60)), Ok(second));
+    assert!(mailbox.join("thread.eml.clicked").is_file());
+    assert!(std::fs::read(seen).unwrap().starts_with(&first_history));
+    assert!(poll(&cfg, Duration::ZERO).is_err());
+
+    let mailbox = tmp.path().join("no-history");
+    std::fs::create_dir(&mailbox).unwrap();
+    std::fs::write(mailbox.join("thread.eml"), thread).unwrap();
+    let cfg = MailboxConfig {
+        dir: Some(mailbox.clone()),
+        ..MailboxConfig::default()
+    };
+    assert_eq!(poll(&cfg, Duration::from_secs(60)), Ok(first.clone()));
+    assert_eq!(poll(&cfg, Duration::from_secs(60)), Ok(first.clone()));
+    assert!(!mailbox.join("thread.eml.clicked").exists());
+    assert!(!mailbox.join(".mailbox.seen").exists());
+
+    let mailbox = tmp.path().join("no-history-single");
+    std::fs::create_dir(&mailbox).unwrap();
+    std::fs::write(
+        mailbox.join("single.eml"),
+        "To: <owner@example.test>\r\n\r\nhttps://claude.ai/magic-link#first\r\n",
+    )
+    .unwrap();
+    let cfg = MailboxConfig {
+        dir: Some(mailbox.clone()),
+        ..MailboxConfig::default()
+    };
+    assert_eq!(poll(&cfg, Duration::from_secs(60)), Ok(first));
+    assert!(mailbox.join("single.eml.clicked").is_file());
+    assert!(!mailbox.join(".mailbox.seen").exists());
+    assert!(poll(&cfg, Duration::ZERO).is_err());
+
+    let mailbox = tmp.path().join("recurring-otp");
+    std::fs::create_dir(&mailbox).unwrap();
+    let cfg = MailboxConfig::from_dir(&mailbox);
+    for name in ["first.eml", "new-message.eml"] {
+        std::fs::write(
+            mailbox.join(name),
+            format!(
+                "To: <owner@example.test>\r\n\r\nVerification code: 111111\r\nMessage: {name}\r\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            poll(&cfg, Duration::from_secs(60)),
+            Ok(MailboxCredential::Otp("111111".to_owned())),
+        );
+        assert!(mailbox.join(format!("{name}.clicked")).is_file());
+    }
+}
+
+#[test]
 fn imap_bridge_and_http_json_mailbox_fetch_credentials_and_track_seen_digests() {
     use super::super::headless_oauth::{
         MailboxConfig, MailboxCredential, poll_mailbox_config_for_credential,
@@ -1671,7 +1755,12 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
             assert!(std::fs::read(&probe_seen).is_err());
         }
         std::fs::set_permissions(&probe_seen, seen_permissions.1.clone()).unwrap();
-        assert_eq!(std::fs::read(&probe_seen).unwrap(), b"existing_digest\n");
+        // Maildir consumption may append a message digest; earlier history stays intact.
+        assert!(
+            std::fs::read(&probe_seen)
+                .unwrap()
+                .starts_with(b"existing_digest\n")
+        );
 
         std::fs::write(
             probe_dir.join("other.eml"),
@@ -1728,9 +1817,10 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
             other_clicked.exists(),
             "another flow's consumption is retained"
         );
-        assert_eq!(
-            std::fs::read_to_string(&probe_seen).unwrap(),
-            "existing_digest\nfresh_digest\n"
+        assert!(
+            std::fs::read_to_string(&probe_seen)
+                .unwrap()
+                .starts_with("existing_digest\nfresh_digest\n")
         );
     }
     assert!(super::page_needs_browser_before_email(
@@ -1985,5 +2075,453 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
             thread_dir.join("thread.eml.clicked").exists(),
             "thread file is marked clicked once its final unseen OTP is consumed"
         );
+
+        let link_thread_dir = tmp.path().join("multi_link_thread_mb");
+        std::fs::create_dir_all(&link_thread_dir).expect("mkdir multi_link_thread_mb");
+        let link_thread_cfg = MailboxConfig {
+            dir: Some(link_thread_dir.clone()),
+            ..MailboxConfig::default()
+        };
+        std::fs::write(
+            link_thread_dir.join("thread_links.eml"),
+            "To: <sol-m27@proton.me>\r\n\r\nEarlier link: https://claude.ai/magic-link#tok_old\r\nLatest link: https://claude.ai/magic-link#tok_new\r\n",
+        )
+        .expect("write two-link thread");
+        let mut link_thread_seen = std::collections::BTreeSet::new();
+        assert_eq!(
+            super::super::headless_oauth::poll_mailbox_or_webmail_for_credential(
+                &mut cdp,
+                &link_thread_cfg,
+                Some("sol-m27@proton.me"),
+                Duration::from_secs(5),
+                Duration::ZERO,
+                &mut link_thread_seen,
+            ),
+            Ok(MailboxCredential::MagicLink(
+                "https://claude.ai/magic-link#tok_old".to_owned()
+            ))
+        );
+        assert!(
+            !link_thread_dir.join("thread_links.eml.clicked").exists(),
+            "thread file with remaining unseen magic link must not be marked clicked yet"
+        );
+        assert_eq!(
+            super::super::headless_oauth::poll_mailbox_or_webmail_for_credential(
+                &mut cdp,
+                &link_thread_cfg,
+                Some("sol-m27@proton.me"),
+                Duration::from_secs(5),
+                Duration::ZERO,
+                &mut link_thread_seen,
+            ),
+            Ok(MailboxCredential::MagicLink(
+                "https://claude.ai/magic-link#tok_new".to_owned()
+            ))
+        );
+        assert!(
+            link_thread_dir.join("thread_links.eml.clicked").exists(),
+            "thread file is marked clicked once its final unseen magic link is consumed"
+        );
+
+        let scoped_cfg = super::super::headless_oauth::MailboxConfig::from_toml_str(
+            r#"
+webmail_url = "https://mail.proton.me/u/0/inbox"
+imap_url = "imaps://imap.fastmail.com:993/INBOX"
+
+[passwords]
+"sol-m27@proton.me" = "pw-m27"
+"#,
+            None,
+        )
+        .expect("parse scoped mailbox config");
+        assert!(
+            scoped_cfg
+                .effective_webmail_url(Some("sol-m27@proton.me"))
+                .is_some()
+        );
+        assert!(
+            scoped_cfg
+                .effective_imap_url(Some("sol-m27@proton.me"))
+                .is_some()
+        );
+        assert!(
+            scoped_cfg
+                .effective_webmail_url(Some("other@example.test"))
+                .is_none(),
+            "scoped webmail_url must not activate for unconfigured account"
+        );
+        assert!(
+            scoped_cfg
+                .effective_imap_url(Some("other@example.test"))
+                .is_none(),
+            "scoped imap_url without embedded password must not activate for unconfigured account"
+        );
+
+        let embedded_imap_cfg = super::super::headless_oauth::MailboxConfig::from_toml_str(
+            r#"
+imap_url = "imap://bridge:secret@127.0.0.1:1143/INBOX" # gitleaks:allow
+
+[passwords]
+"sol-m27@proton.me" = "pw-m27"
+"#,
+            None,
+        )
+        .expect("parse embedded-password imap config");
+        assert!(embedded_imap_cfg.is_configured_for(Some("other@example.test")));
+        assert!(
+            embedded_imap_cfg
+                .effective_imap_url(Some("other@example.test"))
+                .is_some()
+        );
+        assert!(step_js.contains("link has expired"));
+
+        let srcdoc_thread = concat!(
+            "To: <sol-m27@proton.me>\r\nContent-Type: text/html; charset=utf-8\r\n\r\n",
+            "<iframe sandbox=\"\" srcdoc=\"&lt;p&gt;Your&amp;nbsp;verification&amp;nbsp;code:&amp;nbsp;111111&lt;/p&gt;\"></iframe>",
+            "<iframe sandbox=\"\" srcdoc=\"&lt;p&gt;Your&amp;nbsp;verification&amp;nbsp;code:&amp;nbsp;&lt;strong&gt;908172&lt;/strong&gt;&lt;/p&gt;\"></iframe>",
+        );
+        assert_eq!(
+            super::super::headless_oauth::extract_otps_from_email(
+                srcdoc_thread,
+                Some("sol-m27@proton.me")
+            ),
+            vec!["908172".to_owned(), "111111".to_owned()],
+            "sandboxed srcdoc iframes are decoded with the newest (bottom-most) message prioritized first"
+        );
+        let srcdoc_link = concat!(
+            "To: <sol-m27@proton.me>\r\nContent-Type: text/html; charset=utf-8\r\n\r\n",
+            "<iframe sandbox=\"\" srcdoc=\"&lt;a href=&quot;https://claude.ai/magic-link?token=abc&amp;amp;state=s1&quot;&gt;Sign in&lt;/a&gt;\"></iframe>",
+        );
+        assert_eq!(
+            super::extract_magic_link_from_email(srcdoc_link, Some("sol-m27@proton.me")).as_deref(),
+            Some("https://claude.ai/magic-link?token=abc&state=s1")
+        );
+
+        let split_boxes_email = concat!(
+            "To: <sol-m27@proton.me>\r\nContent-Type: text/html; charset=utf-8\r\n\r\n",
+            "<p>Your verification code:</p>",
+            "<div>9</div><div>0</div><div>8</div><div>1</div><div>7</div><div>2</div>",
+            "<p>Earlier code: <span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span></p>",
+            "<p>Backup login code: 654 321.</p>",
+        );
+        assert_eq!(
+            super::super::headless_oauth::extract_otps_from_email(
+                split_boxes_email,
+                Some("sol-m27@proton.me")
+            ),
+            vec![
+                "908172".to_owned(),
+                "123456".to_owned(),
+                "654321".to_owned()
+            ],
+            "split-box div/span digits and spaced 3-digit OTP groups are extracted in order"
+        );
+
+        let us_home = tmp.path().join("underscore_secrets_home");
+        std::fs::create_dir_all(us_home.join(".secrets")).expect("create .secrets");
+        std::fs::write(us_home.join(".secrets/m27_2_pass"), "us-m27-2-pw\n")
+            .expect("write m27_2_pass");
+        std::fs::write(
+            us_home.join(".secrets/m27_2_otpauth"),
+            format!("{otpauth_uri}\n"),
+        )
+        .expect("write m27_2_otpauth");
+        let mut us_cfg = discover_mailbox_config_files(Some(&us_home), None, None)
+            .expect("discover underscore secret files");
+        assert_eq!(
+            us_cfg.password_for(Some("sun.m27.2@proton.me")).as_deref(),
+            Some("us-m27-2-pw")
+        );
+        assert_eq!(
+            us_cfg
+                .totp_secret_for(Some("sun.m27.2@proton.me"))
+                .as_deref(),
+            Some(otpauth_uri)
+        );
+        us_cfg.alias_label_to_email(Some("m27-2"), Some("alias-m27-2@example.test"));
+        assert_eq!(
+            us_cfg
+                .password_for(Some("alias-m27-2@example.test"))
+                .as_deref(),
+            Some("us-m27-2-pw")
+        );
+
+        let flat_toml = format!(
+            r#"
+m27_password = "flat-m27-pw"
+m27_totp = "{otpauth_uri}"
+m27_2_pass = "flat-m27-2-pw"
+"#
+        );
+        let flat_cfg = super::super::headless_oauth::MailboxConfig::from_toml_str(&flat_toml, None)
+            .expect("parse top-level suffixed keys in ai-mailbox.toml");
+        assert_eq!(
+            flat_cfg.password_for(Some("sol-m27@proton.me")).as_deref(),
+            Some("flat-m27-pw")
+        );
+        assert_eq!(
+            flat_cfg
+                .totp_secret_for(Some("sol-m27@proton.me"))
+                .as_deref(),
+            Some(otpauth_uri)
+        );
+        assert_eq!(
+            flat_cfg
+                .password_for(Some("sun.m27.2@proton.me"))
+                .as_deref(),
+            Some("flat-m27-2-pw")
+        );
+
+        let raw_multiline = format!(
+            "# raw credentials\nraw-m27-pw\nraw-m27-second-pw\n{otpauth_uri}\nhttps://mail.proton.me/u/0/inbox\n"
+        );
+        let raw_cfg =
+            super::super::headless_oauth::MailboxConfig::from_toml_str(&raw_multiline, None)
+                .expect("parse raw multi-line credentials");
+        assert_eq!(
+            raw_cfg.password_for(Some("sol-m27@proton.me")).as_deref(),
+            Some("raw-m27-pw")
+        );
+        assert_eq!(
+            raw_cfg
+                .mailbox_password_for(Some("sol-m27@proton.me"))
+                .as_deref(),
+            Some("raw-m27-second-pw")
+        );
+        assert_eq!(
+            raw_cfg
+                .totp_secret_for(Some("sol-m27@proton.me"))
+                .as_deref(),
+            Some(otpauth_uri)
+        );
+        assert_eq!(
+            raw_cfg
+                .effective_webmail_url(Some("sol-m27@proton.me"))
+                .as_deref(),
+            Some("https://mail.proton.me/u/0/inbox")
+        );
+
+        let bare_home = tmp.path().join("bare_label_secrets_home");
+        std::fs::create_dir_all(bare_home.join(".secrets")).expect("create .secrets");
+        std::fs::write(
+            bare_home.join(".secrets/m27"),
+            format!("bare-m27-pw\n{otpauth_uri}\n"),
+        )
+        .expect("write bare m27 secret file");
+        let bare_cfg = discover_mailbox_config_files(Some(&bare_home), None, None)
+            .expect("discover bare label secret file");
+        assert_eq!(
+            bare_cfg.password_for(Some("sol-m27@proton.me")).as_deref(),
+            Some("bare-m27-pw")
+        );
+        assert_eq!(
+            bare_cfg
+                .totp_secret_for(Some("sol-m27@proton.me"))
+                .as_deref(),
+            Some(otpauth_uri)
+        );
+
+        let mailhog_msg = r#"{
+            "ID": "998877",
+            "To": [{"Relays": null, "Mailbox": "sol-m27", "Domain": "proton.me", "Params": ""}],
+            "Content": {
+                "Headers": {
+                    "Content-Transfer-Encoding": ["quoted-printable"],
+                    "Subject": ["Sign in to Claude"]
+                },
+                "Body": "<a href=3D\"https://claude.ai/magic-link?token=3Dmhog_tok&amp;state=3Ds7\">Sign in</a>"
+            }
+        }"#;
+        assert_eq!(
+            super::extract_magic_link_from_email(mailhog_msg, Some("sol-m27@proton.me")).as_deref(),
+            Some("https://claude.ai/magic-link?token=mhog_tok&state=s7")
+        );
+        assert_eq!(
+            super::extract_magic_link_from_email(mailhog_msg, Some("other@proton.me")),
+            None
+        );
+
+        let graph_msg = r#"{
+            "id": "182930",
+            "subject": "Your Claude verification code",
+            "toRecipients": [{"emailAddress": {"name": "Sol", "address": "sol-m27@proton.me"}}],
+            "body": {
+                "contentType": "html",
+                "content": "<html><body><p>Your verification code is <strong>731904</strong></p></body></html>"
+            }
+        }"#;
+        assert_eq!(
+            super::super::headless_oauth::extract_otps_from_email(
+                graph_msg,
+                Some("sol-m27@proton.me")
+            ),
+            vec!["731904".to_owned()],
+            "Microsoft Graph nested body.content OTP is extracted without polluting with JSON id field"
+        );
+        assert!(
+            super::super::headless_oauth::extract_otps_from_email(
+                graph_msg,
+                Some("other@proton.me")
+            )
+            .is_empty()
+        );
+
+        let gmail_msg = r#"{
+            "id": "654321",
+            "payload": {
+                "headers": [
+                    {"name": "To", "value": "sol-m27@proton.me"},
+                    {"name": "Subject", "value": "Sign in to Claude"}
+                ],
+                "parts": [
+                    {
+                        "mimeType": "text/html",
+                        "body": {
+                            "data": "PGh0bWw-PGJvZHk-VmVyaWZpY2F0aW9uIGNvZGU6IDxzdHJvbmc-NjE5NDAyPC9zdHJvbmc-PC9ib2R5PjwvaHRtbD4="
+                        }
+                    }
+                ]
+            }
+        }"#;
+        assert_eq!(
+            super::super::headless_oauth::extract_otps_from_email(
+                gmail_msg,
+                Some("sol-m27@proton.me")
+            ),
+            vec!["619402".to_owned()]
+        );
+
+        let jmap_msg = r#"{
+            "id": "112233",
+            "to": [{"email": "sol-m27@proton.me"}],
+            "bodyValues": {
+                "part1": {
+                    "value": "Your verification code: 528193"
+                }
+            }
+        }"#;
+        assert_eq!(
+            super::super::headless_oauth::extract_otps_from_email(
+                jmap_msg,
+                Some("sol-m27@proton.me")
+            ),
+            vec!["528193".to_owned()]
+        );
+    }
+}
+
+#[test]
+fn recovered_callbacks_require_delivery_but_reached_callbacks_allow_duplicates() {
+    use crate::harness::headless_oauth::{
+        CdpClient, drive_cdp_oauth_with_webmail, split_nul_messages,
+    };
+    use std::io::{Read, Write};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Observation {
+        Event,
+        RecoveredPage,
+        ReachedPage,
+    }
+
+    const CALLBACK: &str = "http://127.0.0.1:9124/callback?code=cb_unreach_ok&state=st_unreach";
+    for observation in [
+        Observation::Event,
+        Observation::RecoveredPage,
+        Observation::ReachedPage,
+    ] {
+        for delivery in [Ok(200), Ok(500), Err("callback delivery failed")] {
+            let (to_r, to_w) = std::io::pipe().expect("pipe1");
+            let (from_r, mut from_w) = std::io::pipe().expect("pipe2");
+            let browser_thread = std::thread::spawn(move || {
+                let mut reader = to_r;
+                let mut pending = Vec::new();
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    pending.extend_from_slice(&buf[..n]);
+                    for req in split_nul_messages(&mut pending) {
+                        let id = req.get("id").and_then(Value::as_u64).unwrap();
+                        let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+                        if method == "Runtime.evaluate"
+                            && !matches!(observation, Observation::RecoveredPage)
+                        {
+                            let frame = match observation {
+                                Observation::Event => aterm_json::json!({
+                                    "url": "chrome-error://chromewebdata/",
+                                    "unreachableUrl": CALLBACK
+                                }),
+                                _ => aterm_json::json!({"url": CALLBACK}),
+                            };
+                            let mut evt = aterm_json::to_vec(&aterm_json::json!({
+                                "sessionId": "s_unreach",
+                                "method": "Page.frameNavigated",
+                                "params": {"frame": frame}
+                            }))
+                            .unwrap();
+                            evt.push(0);
+                            from_w.write_all(&evt).unwrap();
+                        }
+                        let result = match method {
+                            "Target.createTarget" => aterm_json::json!({"targetId": "t_unreach"}),
+                            "Target.attachToTarget" => {
+                                aterm_json::json!({"sessionId": "s_unreach"})
+                            }
+                            "Runtime.evaluate" => {
+                                let (state, url) = match observation {
+                                    Observation::Event => {
+                                        ("waiting", "chrome-error://chromewebdata/")
+                                    }
+                                    Observation::RecoveredPage => ("callback_recovered", CALLBACK),
+                                    Observation::ReachedPage => ("callback", CALLBACK),
+                                };
+                                aterm_json::json!({"result": {"type": "object", "value": {"state": state, "url": url}}})
+                            }
+                            _ => aterm_json::json!({}),
+                        };
+                        let mut out =
+                            aterm_json::to_vec(&aterm_json::json!({"id": id, "result": result}))
+                                .unwrap();
+                        out.push(0);
+                        from_w.write_all(&out).unwrap();
+                        from_w.flush().unwrap();
+                        if method == "Browser.close" {
+                            return;
+                        }
+                    }
+                }
+            });
+            let mut cdp = CdpClient::new(to_w, from_r);
+            let mut delivered = Vec::new();
+            let result = drive_cdp_oauth_with_webmail(
+                &mut cdp,
+                "https://claude.com/cai/oauth/authorize?client_id=c1&redirect_uri=http%3A%2F%2F127.0.0.1%3A9124%2Fcallback&state=st_unreach",
+                Some("sol-m27@proton.me"),
+                Duration::from_secs(60),
+                Duration::ZERO,
+                |_, _| Err("mailbox must not be polled when callback is observed"),
+                |url| {
+                    delivered.push(url.to_owned());
+                    delivery
+                },
+            );
+            let expected = if matches!(observation, Observation::ReachedPage) {
+                Ok(())
+            } else {
+                match delivery {
+                    Ok(200) => Ok(()),
+                    Ok(_) => {
+                        Err("the local OAuth callback listener rejected the authorization code")
+                    }
+                    Err(err) => Err(err),
+                }
+            };
+            assert_eq!(result, expected, "{observation:?}, {delivery:?}");
+            assert_eq!(delivered, [CALLBACK]);
+            drop(cdp);
+            browser_thread.join().expect("callback browser fixture");
+        }
     }
 }

@@ -1,33 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A pack's upload to the staging owner's `atpkg-<program>-<build>` release:
-//!
-//! * every file is under the release host's 2 GiB per-asset ceiling, and the asset still
-//!   hashes to the signed row (a rebuild racing between sign and upload would ship bytes
-//!   every client refuses);
-//! * a pack is immutable once public: when the public owner already serves the tag, the
-//!   upload is a no-op if its manifest is byte-identical and a refusal otherwise (the
-//!   manifest carries the tarball's sha256, so equal manifests are equal packs);
-//! * the staging release is created as a prerelease, or its assets replaced
-//!   (`Replace::Clobber`) to converge a partial publish;
-//! * the `upload` verb ([`run`]) replaces assets of a release that already stands, on the
-//!   staging or the public owner, as that owner's token: the Linux lane's signing ceremony
-//!   re-uploads a manifest and its signature with it.
-
+//! Uploading signed `atpkg-<program>-<build>` release assets to the staging and public hosts.
 use std::path::{Path, PathBuf};
 
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::host::{HostError, Replace};
 
-/// Before a `--upload` pack builds anything, check the staging owner's token file is there:
-/// uploads write as that token and never anonymously, so without it the pack would build
-/// and sign only to be refused at the first write.
-///
+/// Check that the staging owner's token file exists and is non-empty before building.
 /// # Errors
-///
-/// A refusal naming the token file.
+/// Returns a refusal naming the missing token file.
 pub fn token_preflight(ctx: &Ctx) -> Result<()> {
     if std::fs::metadata(&ctx.tokens.staging).is_ok_and(|m| m.len() > 0) {
         return Ok(());
@@ -40,14 +23,9 @@ pub fn token_preflight(ctx: &Ctx) -> Result<()> {
     )))
 }
 
-/// `upload <staging|public> <repo> <tag> <file>…`: replace (or add) each file's asset on the
-/// release `tag` of that owner's `repo`, as that owner's token. The release must stand; this
-/// creates none.
-///
+/// Replace or add release assets on `<staging|public> <repo> <tag>`.
 /// # Errors
-///
-/// A usage error for a missing operand or an unknown owner; a refusal for a file over the
-/// per-asset ceiling or the host's refusal; a could-not-run when the owner cannot be reached.
+/// Returns a usage, refusal, or unreachable-host error.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let [owner, repo, tag, files @ ..] = args else {
         return Err(Error::usage(
@@ -92,19 +70,15 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     }
 }
 
-/// The release tag of one program build.
+/// Release tag for one program build (`atpkg-<program>-<build>`).
 #[must_use]
 pub fn tag(program: &str, build: u64) -> String {
     format!("atpkg-{program}-{build}")
 }
 
-/// Refuse a file over the release host's per-asset ceiling
-/// (`aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND`, which every downloader applies), and
-/// an asset whose bytes no longer hash to the signed row's `sha256`.
-///
+/// Verify per-asset size bounds and that `asset` still hashes to `signed_sha256`.
 /// # Errors
-///
-/// The refusal, before any release is touched.
+/// Returns a refusal if any file exceeds the size bound or `asset` mismatches `signed_sha256`.
 pub fn preflight(asset: &Path, signed_sha256: &str, others: &[PathBuf]) -> Result<()> {
     for f in std::iter::once(asset).chain(others.iter().map(PathBuf::as_path)) {
         let len = std::fs::metadata(f)
@@ -129,7 +103,7 @@ pub fn preflight(asset: &Path, signed_sha256: &str, others: &[PathBuf]) -> Resul
     Ok(())
 }
 
-/// What an upload did.
+/// Outcome of [`publish`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Uploaded {
     /// The staging release was created, or its assets converged.
@@ -138,14 +112,9 @@ pub enum Uploaded {
     AlreadyPublic,
 }
 
-/// Upload `files` (the asset, the manifest `manifest` and its signature) to the staging
-/// owner's release of `repo`'s `tag`.
-///
+/// Upload `files` to the staging release of `repo`'s `tag` after checking public immutability.
 /// # Errors
-///
-/// A refusal when the public owner serves the tag with a different manifest (or one that
-/// cannot be fetched), or the host refuses; a could-not-run when an owner cannot be
-/// reached.
+/// Returns a refusal if the public release differs or upload fails, or cannot-run if unreachable.
 pub fn publish(
     ctx: &Ctx,
     repo: &str,
@@ -208,7 +177,6 @@ pub fn publish(
         Ok(_) => converge()?,
         Err(HostError::NotFound) => match host.create(&staging, tag, &title, notes, files) {
             Ok(()) => {}
-            // Another run of this program created it meanwhile: converge onto it.
             Err(HostError::Refused(_)) => converge()?,
             Err(e) => {
                 return Err(Error::refused(format!(

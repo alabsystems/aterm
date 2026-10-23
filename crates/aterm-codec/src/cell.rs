@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `cell` wire's attribute names, shared by its producer and style reader.
-//! A style is evidence only with the exact fields the producer emits: resolved
-//! RGB colours, known attributes, and at most its optional percent-encoded link.
+//! The `cell` wire's attribute vocabulary and strict style reader.
 
 /// The wire's spelling for no active attributes.
 pub const NONE: &str = "none";
@@ -105,8 +103,6 @@ fn dim_of(raw: &str) -> Option<bool> {
     Some(seen & (1_u16 << Attribute::Dim as u8) != 0)
 }
 
-// The producer's percent encoder emits ASCII graphic bytes and complete %XX
-// escapes. The blank glyph is an empty token. No decoding/allocation is needed.
 fn token(raw: &str) -> bool {
     let bytes = raw.as_bytes();
     let mut at = 0;
@@ -128,10 +124,8 @@ fn token(raw: &str) -> bool {
     true
 }
 
-/// A style only from a complete, well-formed `OK <glyph> <fg> <bg> <attrs>`
-/// reply, optionally followed by one `link=<percent-token>`. Empty glyphs are
-/// valid; missing colours, future/unknown attributes and extra fields are not.
-/// A trailing `frame=open` (the cell read in an unfinished DEC 2026 frame) is refused on purpose.
+/// Parses a complete `OK <glyph> <fg> <bg> <attrs>` reply (with optional `link=<percent-token>`).
+/// Refuses missing colours, unknown attributes, extra fields, and unfinished frames (`frame=open`).
 #[must_use]
 pub fn parse_style(line: &str) -> Option<Style<'_>> {
     let body = line
@@ -205,7 +199,6 @@ mod tests {
         }
     }
 
-    /// A cell read on an unfinished frame (` frame=open`) is no evidence, whatever its shape.
     #[test]
     fn a_cell_of_an_unfinished_frame_proves_nothing() {
         for whole in [

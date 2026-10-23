@@ -33,9 +33,7 @@ pub struct Worktree {
 }
 
 /// What `name` is inside `dir`, by one no-follow `stat`; `None` when nothing has that name.
-///
 /// # Errors
-///
 /// The [`Refusal`] `dir` earned before anything was opened, or the open's.
 pub fn marker_at(dir: &Path, name: &str, policy: &Policy) -> Result<Option<Marker>, Refusal> {
     let [one] = markers_at(dir, [name], policy)?;
@@ -43,9 +41,7 @@ pub fn marker_at(dir: &Path, name: &str, policy: &Policy) -> Result<Option<Marke
 }
 
 /// What each of `names` is inside `dir` through one open of `dir`.
-///
 /// # Errors
-///
 /// The [`Refusal`] `dir` earned before anything was opened, or the open's or a `stat`'s
 /// (other than `ENOENT`, which is `None` for that name).
 pub fn markers_at<const N: usize>(
@@ -82,9 +78,7 @@ pub fn markers_at<const N: usize>(
 }
 
 /// Where the link `name` inside `dir` points, resolved lexically against `dir`.
-///
 /// # Errors
-///
 /// The [`Refusal`] `dir` earned, or the open's.
 pub fn link_target(dir: &Path, name: &str, policy: &Policy) -> Result<Option<PathBuf>, Refusal> {
     let canon = tested(dir, policy)?;
@@ -97,8 +91,7 @@ pub fn link_target(dir: &Path, name: &str, policy: &Policy) -> Result<Option<Pat
             return Ok(None);
         };
         let mut buf = vec![0u8; 4_096];
-        // SAFETY: `fd` is an open directory, `cname` is NUL-terminated, and
-        // the buffer's length bounds the write.
+        // SAFETY: `fd` is an open directory, `cname` is NUL-terminated, and the buffer's length bounds the write.
         let n = unsafe {
             libc::readlinkat(
                 fd.as_raw_fd(),
@@ -156,8 +149,6 @@ pub fn worktree_above(start: &Path, policy: &Policy) -> Option<Worktree> {
     None
 }
 
-/// The names a build folder is known by (design §10.4 `writes`): cargo writes `CACHEDIR.TAG`
-/// and `.rustc_info.json` in its target folder and `.cargo-lock` in each profile folder.
 const BUILD_MARKERS: [&str; 3] = ["CACHEDIR.TAG", ".rustc_info.json", ".cargo-lock"];
 
 /// The nearest cargo target or profile folder at or above `start`.
@@ -187,7 +178,6 @@ pub fn build_dir_above(start: &Path, policy: &Policy) -> Option<PathBuf> {
     profile
 }
 
-/// `dir`'s canonical form once it passed the look test.
 fn tested(dir: &Path, policy: &Policy) -> Result<PathBuf, Refusal> {
     let canon = canonical(dir).ok_or(Refusal::Relative)?;
     match refuse_look(Some(dir), &canon, &policy.mounts, &policy.deny) {

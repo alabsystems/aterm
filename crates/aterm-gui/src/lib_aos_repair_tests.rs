@@ -21,19 +21,16 @@ use crate::input::{InputEvent, Source};
 use crate::scripted_redraw_fixture::{feed, scripted_app, surface};
 use crate::{App, WindowId};
 
-const WID: WindowId = WindowId(0);
+pub(super) const WID: WindowId = WindowId(0);
 /// A 120 Hz panel: the shipped effect lane.
 const PANEL: Duration = Duration::from_nanos(8_333_333);
 /// A brisk typist.
-const KEY_GAP: Duration = Duration::from_millis(60);
-/// The lane loop's hang detector, in pinned time: far past any cool-down (τ·ln 50 is
-/// about 4.7 s).
+pub(super) const KEY_GAP: Duration = Duration::from_millis(60);
+/// Pinned-time hang detector for the effect lane loop.
 const HORIZON: Duration = Duration::from_secs(60);
 
-/// The scripted fixture with only the momentum glow lit: serious mode off, the
-/// cursor-effect master on, no trail style (so the glow is alone in its stream), full
-/// motion, no blink clock, the window focused on a 120 Hz panel, and a prompt drawn.
-fn momentum_app(light: bool) -> App {
+/// Scripted fixture with only the momentum glow enabled on a focused 120 Hz window.
+pub(super) fn momentum_app(light: bool) -> App {
     let mut app = scripted_app();
     app.config.serious_mode = Some(false);
     app.config.cursor_trail = Some(true);
@@ -67,9 +64,8 @@ fn glyph(c: char) -> InputEvent {
     }
 }
 
-/// `n` keys `KEY_GAP` apart from `from` through normal key dispatch, each echoed and
-/// followed by a frame at its instant. Returns the last key's instant.
-fn type_keys(app: &mut App, from: Instant, n: u32) -> Instant {
+/// Dispatches `n` echoed keys `KEY_GAP` apart and returns the last key's instant.
+pub(super) fn type_keys(app: &mut App, from: Instant, n: u32) -> Instant {
     let mut at = from;
     for k in 0..n {
         at = from + KEY_GAP * k;
@@ -83,22 +79,21 @@ fn type_keys(app: &mut App, from: Instant, n: u32) -> Instant {
 }
 
 /// Where the effect lane parked.
-struct Parked {
+pub(super) struct Parked {
     /// The instant of the plan that parked it.
-    at: Instant,
+    pub(super) at: Instant,
     /// Deadlines it woke at.
-    wakes: usize,
+    pub(super) wakes: usize,
     /// Of those, the ones planned while the glow was settling (its settle wakes).
-    settle_wakes: usize,
+    pub(super) settle_wakes: usize,
     /// Whether the glow was settling at some plan.
-    saw_settling: bool,
+    pub(super) saw_settling: bool,
     /// Whether the last wake's redraw reached the surface.
-    last_presented: bool,
+    pub(super) last_presented: bool,
 }
 
-/// The effect lane as the event loop runs it, from `from`: plan, and while the plan
-/// names a deadline, service it and redraw at it; until the plan parks.
-fn run_lane(app: &mut App, from: Instant) -> Parked {
+/// Runs the terminal effect lane from `from` until no further wake is planned.
+pub(super) fn run_lane(app: &mut App, from: Instant) -> Parked {
     let mut now = from;
     let mut parked = Parked {
         at: from,
@@ -134,9 +129,8 @@ fn run_lane(app: &mut App, from: Instant) -> Parked {
     }
 }
 
-/// The glow's quads in the stream the page presents it on: additive light on a dark
-/// page, the under-ink halo on a light one.
-fn presented_glow(app: &App, light: bool) -> usize {
+/// Count of momentum glow quads in the active presentation stream.
+pub(super) fn presented_glow(app: &App, light: bool) -> usize {
     let input = &app.windows[&WID].input_scratch;
     if light {
         input.glow_under.len()
@@ -145,12 +139,12 @@ fn presented_glow(app: &App, light: bool) -> usize {
     }
 }
 
-fn status(app: &App) -> MomentumAosStatus {
+pub(super) fn status(app: &App) -> MomentumAosStatus {
     app.windows[&WID].fx.cursor().momentum.aos_status()
 }
 
 /// The exported log since the latest checkpoint, decoded back.
-fn exported_log(app: &App, epoch: Instant) -> Vec<MomentumEvent> {
+pub(super) fn exported_log(app: &App, epoch: Instant) -> Vec<MomentumEvent> {
     let trace = app.windows[&WID]
         .fx
         .cursor()
@@ -171,8 +165,7 @@ fn exported_log(app: &App, epoch: Instant) -> Vec<MomentumEvent> {
     log.inputs().to_vec()
 }
 
-/// A window attached under the demonstration fault at `t0`, typed into through normal
-/// dispatch, its lane run until it parks: the stranded glow, asserted as such.
+/// Attaches `DemoStrandedSettle`, types keys, and runs the lane until the glow is stranded.
 fn stranded(light: bool, t0: Instant) -> (App, Parked) {
     let mut app = momentum_app(light);
     app.redraw_window_at(WID, t0);
@@ -215,15 +208,7 @@ fn stranded(light: bool, t0: Instant) -> (App, Parked) {
     (app, parked)
 }
 
-/// The whole M2 story on the host path, dark and light pages: STRANDED under the
-/// demonstration fault (the lane parked, the halo presented, the glow hot, and a later
-/// turn still arms nothing); the repair to the shipped code through the App method
-/// pauses, commits a new revision on a witness whose live code failed `HotHasWake`,
-/// whose candidate passed and whose same-code replay reproduced the head, graded
-/// `Tested`; the lane then wakes from the accepted state and the last frame presented is
-/// the clearing frame; fresh keys through normal dispatch heat it, it settles, the
-/// scheduler wakes it, and the clearing frame is presented again, with replays,
-/// publications and rejections unchanged since the commit and no reset in the log.
+/// Repairs a stranded glow through the host path and verifies clearing and subsequent keys.
 #[test]
 fn a_stranded_glow_is_repaired_through_the_host_and_fresh_keys_clear_with_no_reset_or_replay() {
     for light in [false, true] {
@@ -367,9 +352,7 @@ fn a_stranded_glow_is_repaired_through_the_host_and_fresh_keys_clear_with_no_res
     }
 }
 
-/// A repair the call paused for, refused (the demonstration fault as its own candidate
-/// fails the contract on the stranded trace), resumes the old code: not paused, the
-/// same code and revision, one rejection. A glow the caller paused stays paused.
+/// A refused repair undo-resumes a call-initiated pause while preserving a caller's pause.
 #[test]
 fn a_refused_repair_resumes_the_glow_it_paused_and_keeps_a_callers_pause() {
     let t0 = Instant::now();
@@ -406,9 +389,7 @@ fn a_refused_repair_resumes_the_glow_it_paused_and_keeps_a_callers_pause() {
     assert!(!status(&app).paused);
 }
 
-/// Each ask names its exact refusal and changes nothing: an unattached window refuses
-/// pause, repair, resume, detach and trace; a running one refuses resume; a paused one
-/// refuses a second pause.
+/// Invalid lifecycle transitions return their exact refusal without mutating state.
 #[test]
 fn each_aos_ask_names_its_refusal_and_changes_nothing() {
     let t0 = Instant::now();
@@ -451,8 +432,7 @@ fn each_aos_ask_names_its_refusal_and_changes_nothing() {
     assert_eq!(app.aos_status_now().err(), Some(AosRefusal::NoWindow));
 }
 
-/// The `Wake::Aos` handler answers each ask as the verb's line, attach to detach, and
-/// each attach takes the next log epoch of its window.
+/// `control_aos` formats each lifecycle operation and advances `log_epoch` on re-attach.
 #[test]
 fn the_wake_handler_answers_each_ask_as_its_line() {
     use crate::aos_verb::Asked;
@@ -482,11 +462,57 @@ fn the_wake_handler_answers_each_ask_as_its_line() {
     );
 }
 
-/// A paused glow's held overlay is drawn only while the frame's own gates allow the glow:
-/// pause a hot glow (the overlay and the caret tint show), then turn Serious Mode on, or
-/// separately the momentum glow's own switch off, and redraw. The frame is the inert one:
-/// no momentum light in either stream and no body fill on the caret, while the pause is
-/// kept and nothing is recorded.
+/// `TraceHex` appends a valid, replayable hex trace bundle to the `Trace` summary line.
+#[test]
+fn the_trace_hex_ask_exports_the_trace_file_its_summary_counts() {
+    use aterm_effects::aos_momentum::MomentumTrace;
+
+    use crate::aos_verb::Asked;
+    let t0 = Instant::now();
+    let mut app = momentum_app(false);
+    app.redraw_window_at(WID, t0);
+    app.aos_attach_at(MomentumCode::Shipped, t0)
+        .expect("attaches");
+    let last = type_keys(&mut app, t0 + KEY_GAP, 6);
+    let summary = app.control_aos(Asked::Trace, last).expect("answers");
+    let line = app.control_aos(Asked::TraceHex, last).expect("answers");
+    let rest = line
+        .strip_prefix(summary.as_str())
+        .unwrap_or_else(|| panic!("the trace line comes first: {line}"));
+    let Some((len, hex)) = rest
+        .strip_prefix(" file_bytes=")
+        .and_then(|r| r.split_once(" hex="))
+    else {
+        panic!("file_bytes= then hex=: {rest}");
+    };
+    let file = aterm_codec::hex::decode_vec(hex.as_bytes()).expect("lowercase hex");
+    assert_eq!(len.parse::<usize>(), Ok(file.len()));
+    let trace = MomentumTrace::decode(&file).expect("a sealed momentum trace file");
+    let counts = trace.read(t0).expect("its log reads whole").counts;
+    assert_eq!(counts.keys, 6, "each key once");
+    assert!(
+        summary.ends_with(&format!(
+            " sealed=true keys={} resets={} ticks={} queries={}",
+            counts.keys, counts.resets, counts.ticks, counts.queries
+        )),
+        "the summary counts the exported log: {summary}"
+    );
+    let build = status(&app).build.expect("attached");
+    let replayed = trace
+        .replay(t0, &build)
+        .expect("the file replays to the live head");
+    assert_eq!(replayed.code, MomentumCode::Shipped);
+    assert_eq!(replayed.counts, counts);
+
+    app.aos_detach_now().expect("detaches");
+    assert_eq!(
+        app.control_aos(Asked::TraceHex, last),
+        app.control_aos(Asked::Trace, last)
+    );
+    assert!(app.control_aos(Asked::TraceHex, last).is_err());
+}
+
+/// Turning on serious mode or disabling the glow suppresses a paused glow's held overlay.
 #[test]
 fn a_paused_glow_is_not_drawn_once_serious_mode_or_its_switch_turns_it_off() {
     type Turn = fn(&mut App);

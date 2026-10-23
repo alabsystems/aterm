@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Approval-policy probe boundary ([`PolicyProbe`], [`ApprovalCtx::probe`], [`LiveProbe`],
-//! [`doors`]) for [`super::approval::decide`].
-//!
-//! Records derived answers ([`WorkerEnv::digest`] over [`WorkerEnv`], [`GitView::project`] for
-//! [`super::git_config`] and [`WorkerWrites::holds`] at [`PROJECTION`], and
-//! [`super::shell_startup::zshenv_hazard`]) rather than raw environment or file bytes.
+//! Approval-policy probe boundary ([`PolicyProbe`], [`LiveProbe`], [`doors`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -29,7 +24,6 @@ use crate::supervise::tape::header::Roots;
 /// How the approval policy looks at the machine ([module docs](self)).
 pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
     /// A name in a folder on the way to the absolute path `comps` that differs from the drawn one.
-    ///
     /// # Errors
     /// A folder on the way cannot be listed, or holds too many entries.
     fn hidden_twin(&self, comps: &[String]) -> Result<Option<String>, String> {
@@ -37,7 +31,6 @@ pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
     }
 
     /// [`Self::hidden_twin`] with `home` supplied to avoid TCC-protected macOS folders.
-    ///
     /// # Errors
     /// A folder on the way cannot be listed, or holds too many entries.
     fn hidden_twin_in(
@@ -46,24 +39,20 @@ pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
         home: Option<&Path>,
     ) -> Result<Option<String>, String>;
 
-    /// `comps` with every symbolic link resolved (the Read rule's resolver);
-    /// `None` for a dangling link or a refused look.
+    /// `comps` with every symbolic link resolved (the Read rule's resolver).
     fn real_components(&self, comps: &[String]) -> Option<Vec<String>>;
 
     /// Where the absolute path `comps` leads on the disk as the kernel walks it for `rm`.
-    ///
     /// # Errors
     /// A link climbs out of a missing directory, the links do not end.
     fn rm_physical(&self, comps: &[String]) -> Result<OnDisk, String>;
 
     /// The worker: the process leading the foreground group `group` of session `sid`.
-    ///
     /// # Errors
     /// The process cannot be read, or names another session or none.
     fn worker_proc(&self, group: u32, sid: &str) -> Result<WorkerEnv, String>;
 
     /// What a git command the worker runs in `dir` would load.
-    ///
     /// # Errors
     /// No git can be named, or its configuration cannot be read.
     fn git_view(
@@ -74,27 +63,21 @@ pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
     ) -> Result<GitView, String>;
 
     /// Check Claude Code settings for `launch` for hazardous `env` variables.
-    ///
     /// # Errors
     /// Such a variable, or a settings file that cannot be read whole.
     fn settings_env(&self, worker: &WorkerEnv, launch: &Path) -> Result<(), String>;
 
     /// What the worker's Bash tool's shell starts with ([`super::shell_startup::read`]).
-    ///
     /// # Errors
     /// What fails every line, or why the startup could not be read.
     fn shell_startup(&self, worker: &WorkerEnv, launch: &Path) -> Result<ShellStartup, String>;
 
     /// The ask rules and PreToolUse hooks of the agent's own Claude Code settings.
-    ///
     /// # Errors
     /// Why they could not be read.
     fn owner_asks(&self, worker: &WorkerEnv, launch: &Path) -> Result<Vec<OwnerAsk>, String>;
 
-    /// Where the worker's Bash tool may stand beyond `cwd`, from Claude
-    /// Code's transcripts under its directory
-    /// ([`crate::harness::footer::shell_cwds`]); empty where its directory
-    /// cannot be named.
+    /// Where the worker's Bash tool may stand beyond `cwd`.
     fn shell_cwds(&self, worker: &WorkerEnv, cwd: &Path) -> Vec<PathBuf>;
 }
 
@@ -107,7 +90,7 @@ pub struct OnDisk {
     pub foreign_link: bool,
 }
 
-/// Where the worker may write unapproved, so a `git` there would be the worker's to configure.
+/// Where the worker may write unapproved.
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerWrites<'a> {
     /// The session's working directory.
@@ -179,7 +162,6 @@ impl TapedProbe {
 
 impl ReplayProbe {
     /// A probe answering from the tape `fx` replays, the worker digested with `seed`.
-    ///
     /// # Panics
     /// `fx` does not replay: [`NoLook`] has no look to make.
     pub(crate) fn replaying(fx: Fx, seed: u64) -> Self {
@@ -241,9 +223,7 @@ impl PolicyProbe for NoLook {
     }
 }
 
-/// How a probe's REQUEST is written ([module docs](self)): each path as the
-/// run's roots write it (`path`), the worker by its digest under the tape's
-/// `seed`.
+/// How a probe's request is written ([module docs](self)).
 struct Requests<'a> {
     path: &'a dyn Fn(&Path) -> Vec<u8>,
     seed: u64,
@@ -291,8 +271,7 @@ impl Requests<'_> {
         ])
     }
 
-    /// A git view asked for: the worker, the directory, and where the worker
-    /// may write.
+    /// A git view asked for: the worker, the directory, and where the worker may write.
     fn git_view(&self, worker: &WorkerEnv, dir: &Path, writes: &WorkerWrites<'_>) -> Vec<u8> {
         let worker = self.worker(worker);
         let mut fields = vec![
@@ -438,9 +417,7 @@ pub(crate) struct KeyedProbe {
 }
 
 impl KeyedProbe {
-    /// A probe standing where the recorded loop had read the first `seen` of
-    /// the records `index` holds (the tape's effects, by ordinal), its
-    /// requests written under `roots` and `seed` as the recording wrote them.
+    /// A probe standing after the first `seen` records of `index` under `roots` and `seed`.
     pub(crate) const fn at(index: Arc<TapeIndex>, seen: usize, roots: Roots, seed: u64) -> Self {
         Self {
             index,
@@ -456,8 +433,7 @@ impl KeyedProbe {
         self.misses.lock_or_recover().clone()
     }
 
-    /// The answer to the request `write` writes at `door`, or `unrecorded`
-    /// with why.
+    /// The answer to the request `write` writes at `door`, or `unrecorded` with why.
     fn answer<A: TapeValue>(
         &self,
         door: &str,
@@ -563,8 +539,7 @@ pub(crate) enum Answer<T> {
     Err(String),
 }
 
-/// `value` as JSON bytes. The mirrors below hold strings, numbers, booleans and
-/// lists of them, which always serialize.
+/// `value` as JSON bytes.
 fn json<T: Serialize>(value: &T) -> Vec<u8> {
     aterm_json::to_vec(value).unwrap_or_default()
 }
@@ -636,8 +611,7 @@ impl TapeValue for Result<OnDisk, String> {
     }
 }
 
-/// The worker as a tape holds it: its digest (sixteen hex digits) and pid,
-/// never a variable.
+/// The worker as a tape holds it.
 impl TapeValue for Result<WorkerEnv, String> {
     fn to_tape(&self) -> Vec<u8> {
         answer(self, |w| (format!("{:016x}", w.digest(0)), w.pid()))
@@ -669,8 +643,7 @@ struct ViewWire {
 }
 
 impl ViewWire {
-    /// `view` projected — again, whatever handed it here: a tape never holds
-    /// more of a view than the projection keeps.
+    /// `view` projected — again, whatever handed it here.
     fn of(view: &GitView) -> Self {
         let v = view.project();
         Self {
@@ -718,7 +691,7 @@ impl TapeValue for Result<GitView, String> {
     }
 }
 
-/// A shell's startup as a tape holds it ([`ShellStartup::names`], [`ShellStartup::may_run_zsh`]).
+/// A shell's startup as a tape holds it.
 pub(crate) type ShellWire = (Vec<(String, String, bool)>, bool);
 
 impl TapeValue for Result<ShellStartup, String> {

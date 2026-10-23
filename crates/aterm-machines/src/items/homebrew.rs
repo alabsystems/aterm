@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Homebrew package, portable Ruby bootstrap, formulae, and casks for Apple silicon.
+//! Homebrew from its notarized `Homebrew.pkg`, then formulae and casks as the owning user.
 
 use super::apps::{
     Artifact, Notes, account, cached_verified, check_artifact, clear_stage, fresh_stage,
@@ -26,18 +26,13 @@ pub const PKG_USER_PLIST: &str = "/var/tmp/.homebrew_pkg_user.plist";
 /// Homebrew.pkg's receipt id.
 pub const PKG_ID: &str = "sh.brew.homebrew";
 
-/// Directory where Homebrew stores its portable Ruby.
+/// Where Homebrew keeps its portable Ruby.
 pub const VENDOR: &str = "/opt/homebrew/Library/Homebrew/vendor";
 
-/// The link, under [`VENDOR`], to the portable Ruby `brew` runs. Homebrew re-points it when
-/// it fetches another version, so it is read, then followed by what it names.
 const RUBY_LINK: &str = "portable-ruby/current";
 
-/// The bound on one `brew install`: a large formula with dependencies downloads hundreds
-/// of megabytes.
 const INSTALL_BUDGET: Duration = Duration::from_secs(3600);
 
-/// How long Homebrew's first Ruby-backed command may take: it downloads portable Ruby.
 const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(900);
 
 /// The `[homebrew]` table.
@@ -56,12 +51,11 @@ pub struct Table {
     pub casks: Vec<String>,
 }
 
-/// Expands `table` into `homebrew.pkg`, `homebrew.ruby`, and formula/cask items.
-///
+/// The items `table` asks for: `homebrew.pkg`, `homebrew.ruby` after it, then
+/// `homebrew.formula.<name>` and `homebrew.cask.<name>`, each waiting for both.
 /// # Errors
-/// One line naming what cannot be expanded: no owner, an owner this Mac does not have or
-/// root, a malformed pkg pin, a formula or cask name `brew` could read as an option or a
-/// path.
+/// One line naming what cannot be expanded: no owner, an owner this Mac does not have, a malformed
+/// pkg pin, a name `brew` would read as an option.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let owner_name = table
         .owner
@@ -108,7 +102,6 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     Ok(items)
 }
 
-/// Refuse a formula or cask name `brew` could read as an option or a path.
 fn check_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && !name.starts_with('-')
@@ -126,7 +119,6 @@ fn check_name(name: &str) -> Result<(), String> {
     }
 }
 
-/// `NotApplicable` off Apple silicon, `Unusable` when the architecture was not read.
 fn arch_gate(ctx: &Ctx) -> Option<Probe> {
     match ctx.facts.arch.as_str() {
         "arm64" => None,
@@ -139,7 +131,6 @@ fn arch_gate(ctx: &Ctx) -> Option<Probe> {
     }
 }
 
-/// `brew <args>` as `owner`, with Homebrew's quiet switches.
 fn brew(owner: &User, args: &[&str]) -> Cmd {
     Cmd::new(BREW)
         .args(args.iter().copied())
@@ -148,8 +139,6 @@ fn brew(owner: &User, args: &[&str]) -> Cmd {
         .env("HOMEBREW_NO_ENV_HINTS", "1")
 }
 
-/// The document that names `owner` to Homebrew.pkg's scripts (the form `defaults read`
-/// returned `admin` from in the VM).
 fn pkg_user_plist(owner: &str) -> String {
     let name = owner
         .replace('&', "&amp;")
@@ -167,8 +156,6 @@ fn pkg_user_plist(owner: &str) -> String {
     )
 }
 
-/// Write [`PKG_USER_PLIST`] naming `owner`, root:wheel 0600 with no ACL, and read back
-/// that it is exactly that.
 fn name_owner(sys: &dyn System, owner: &User) -> Result<(), String> {
     let path = Path::new(PKG_USER_PLIST);
     sys.write_file(path, pkg_user_plist(&owner.name).as_bytes(), 0o600)
@@ -191,7 +178,6 @@ fn name_owner(sys: &dyn System, owner: &User) -> Result<(), String> {
     }
 }
 
-/// `homebrew.pkg`: Homebrew in `/opt/homebrew`, owned by the owner.
 struct Pkg {
     art: Option<Artifact>,
     owner: User,
@@ -319,11 +305,8 @@ enum RubyState {
     Missing(String),
 }
 
-/// Whether Homebrew's portable Ruby is in place, by the test `brew` itself makes before a
-/// Ruby command (`Library/Homebrew/utils/ruby.sh`, `setup-ruby-path`, read on lab-03):
-/// `portable-ruby/current` the version `portable-ruby-version` names, and its `bin/ruby`
-/// executable. Otherwise that command first runs `brew vendor-install ruby`. Read as
-/// root, changing nothing.
+/// Whether Homebrew's portable Ruby is in place, by the test `brew` itself makes before a Ruby
+/// command (`Library/Homebrew/utils/ruby.sh`, `setup-ruby-path`, read on lab-03).
 /// # Errors
 /// One line when the answer could not be read.
 fn portable_ruby(sys: &dyn System) -> Result<RubyState, String> {
@@ -375,14 +358,6 @@ fn portable_ruby(sys: &dyn System) -> Result<RubyState, String> {
     }
 }
 
-/// `homebrew.ruby`: Homebrew's portable Ruby in place. Homebrew's first Ruby-backed command
-/// downloads it, printing the download on standard error (VM, 27.0: `brew list --formula
-/// --versions git` on a fresh prefix printed `==> Downloading …/portable-ruby/…` and exited
-/// 1, which the formula's read cannot tell from brew failing), and `brew --version`, which
-/// the pkg's probe runs, is shell alone and never fetches it. So this item reads the Ruby
-/// itself, and its apply is one such command, `brew config`, as the owner: after a pkg
-/// install, after a fetch that failed or outran its budget, after a person installed the
-/// pkg and never ran brew, and after a Homebrew update named a new Ruby.
 struct Ruby {
     owner: User,
 }
@@ -462,7 +437,6 @@ impl Item for Ruby {
     }
 }
 
-/// `homebrew.formula.<name>` or `homebrew.cask.<name>`.
 struct Package {
     name: String,
     cask: bool,
@@ -600,13 +574,10 @@ mod tests {
     use crate::model::{Mode, Outcome};
     use crate::port::{Fake, Ran, Stat};
 
-    /// The VM's pin (dl-verify, `gh api repos/Homebrew/brew/releases/latest`).
     const HOMEBREW_SHA: &str = "e021295947a4a9b7ca1a8eff310c9ea1db14d923c5acf7d79e325b60a81f1a15";
 
-    /// `installer -pkg Homebrew-7.0.9.pkg -target /`, VM.
     const INSTALLER_HOMEBREW: &str = "installer: Package name is Homebrew\ninstaller: Installing at base path /\ninstaller: The install was successful.\n";
 
-    /// `brew --version` as admin in the VM, after the pkg without Command Line Tools.
     const BREW_VERSION: &str = "Homebrew >=4.3.0 (shallow or no git repository)\n";
 
     const ENV: &str = "HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_ENV_HINTS=1";
@@ -630,7 +601,6 @@ mod tests {
         Stat { uid, ..dir() }
     }
 
-    /// `brew` installed, in a prefix the owner (uid 501) owns.
     fn brew_installed(sys: &Fake) {
         sys.stat_of(
             BREW,
@@ -642,7 +612,6 @@ mod tests {
         sys.stat_of(PREFIX, owned_by(501));
     }
 
-    /// Homebrew's portable Ruby as lab-03 (27.0) holds it after `brew config`.
     fn ruby_in_place(sys: &Fake) {
         sys.file(&format!("{VENDOR}/portable-ruby-version"), b"4.0.7\n");
         sys.link(&format!("{VENDOR}/portable-ruby/current"), "4.0.7");

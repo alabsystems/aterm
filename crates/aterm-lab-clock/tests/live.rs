@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The built library, loaded into a probe child (`lab-clock-probe`, started by the spawn seam with
-//! `DYLD_INSERT_LIBRARIES`), and its offset file stepped by a day as `lab sleep` steps it: every
-//! wall-clock read moves by the step, the clocks that count a sleep move by it under the continuous
-//! switch and not without it, and uptime never does.
+//! Live probe tests for `aterm-lab-clock` injected via `DYLD_INSERT_LIBRARIES`.
 
 #![cfg(target_os = "macos")]
 
@@ -19,16 +16,10 @@ use std::process::ChildStdin;
 
 use aterm_uds::spawnfd::{Child, Stdio};
 
-/// The step: a day, in nanoseconds; far beyond any time a test takes.
 const STEP_NS: i128 = 86_400 * 1_000_000_000;
-/// How far a moved clock may be from uptime's delta plus the step, or a
-/// clock that stayed from uptime's delta: the skew of reads in one line, the
-/// clocks' slew, and `time`'s whole seconds; far below the step.
 const SLACK_NS: i128 = 2_000_000_000;
-/// The hang detector of each wait.
 const HANG: Duration = Duration::from_secs(60);
 
-/// The clocks a step moves always.
 const WALL: [&str; 5] = [
     "realtime",
     "realtime_nsec_np",
@@ -36,7 +27,6 @@ const WALL: [&str; 5] = [
     "time",
     "systemtime",
 ];
-/// The clocks that count a sleep: a step moves them under the switch.
 const SLEEP_COUNTING: [&str; 5] = [
     "monotonic",
     "monotonic_raw",
@@ -44,10 +34,8 @@ const SLEEP_COUNTING: [&str; 5] = [
     "continuous",
     "continuous_approximate",
 ];
-/// The clocks a step never moves (`uptime_raw` is the reference).
 const UPTIME: [&str; 3] = ["uptime_raw_approx", "absolute", "instant"];
 
-/// The library, built once for every test here.
 fn library() -> &'static Path {
     static LIB: OnceLock<PathBuf> = OnceLock::new();
     LIB.get_or_init(|| {
@@ -79,7 +67,6 @@ fn library() -> &'static Path {
     })
 }
 
-/// A probe child with the library loaded, and the lab's files for it.
 struct Probe {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -88,7 +75,6 @@ struct Probe {
 }
 
 impl Probe {
-    /// Start one on `dir`'s offset file (`0` first) and record directory.
     fn start(dir: &Path, continuous: bool) -> Probe {
         std::fs::create_dir_all(dir.join("reg")).expect("record dir");
         set_offset(dir, "0");
@@ -122,7 +108,6 @@ impl Probe {
         }
     }
 
-    /// One line of readings.
     fn read(&mut self) -> HashMap<String, i128> {
         let stdin = self.stdin.as_mut().expect("its stdin");
         writeln!(stdin, "r")
@@ -140,8 +125,6 @@ impl Probe {
             .collect()
     }
 
-    /// Readings once the step has been taken: the wall clock `STEP_NS` past
-    /// `before`'s, beyond what uptime moved since.
     fn read_stepped(&mut self, before: &HashMap<String, i128>) -> HashMap<String, i128> {
         let end = Instant::now() + HANG;
         loop {
@@ -157,13 +140,11 @@ impl Probe {
         }
     }
 
-    /// Its record (`reg/<pid>.txt`).
     fn record(&self) -> String {
         std::fs::read_to_string(self.dir.join(format!("reg/{}.txt", self.child.id())))
             .unwrap_or_default()
     }
 
-    /// End it: its input closes, and it ends.
     fn end(mut self) {
         drop(self.stdin.take());
         let end = Instant::now() + HANG;
@@ -177,7 +158,6 @@ impl Probe {
     }
 }
 
-/// Write the offset file by rename, as the lab does.
 fn set_offset(dir: &Path, secs: &str) {
     std::fs::write(dir.join("offset.tmp"), format!("{secs}\n")).expect("offset");
     std::fs::rename(dir.join("offset.tmp"), dir.join("offset")).expect("offset in place");
@@ -187,7 +167,6 @@ fn delta(a: &HashMap<String, i128>, b: &HashMap<String, i128>, k: &str) -> i128 
     b.get(k).copied().expect(k) - a.get(k).copied().expect(k)
 }
 
-/// A scratch dir of its own for one test.
 fn scratch(name: &str) -> PathBuf {
     let d = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("aterm-lab-clock-{name}-{}", std::process::id()));
@@ -196,8 +175,6 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
-/// Step the offset of a probe started with or without the continuous
-/// switch: which clocks moved by the step, and the record it wrote.
 fn step(name: &str, continuous: bool) -> (HashMap<&'static str, i128>, i128, String) {
     let dir = scratch(name);
     let mut p = Probe::start(&dir, continuous);
@@ -232,10 +209,6 @@ fn assert_moved(moved: &HashMap<&str, i128>, clocks: &[&str], by: i128) {
     }
 }
 
-/// THE CONTINUOUS SWITCH ON, AS THE LAB SETS IT: a step of a day moves every
-/// wall clock and every clock that counts a sleep by a day, and uptime
-/// (`CLOCK_UPTIME_RAW`, `mach_absolute_time`, `Instant`) by nothing; the
-/// process's record says the new offset.
 #[test]
 fn a_step_moves_the_wall_and_the_sleep_clocks_by_the_step_and_never_uptime() {
     let (moved, up, record) = step("continuous", true);
@@ -253,8 +226,6 @@ fn a_step_moves_the_wall_and_the_sleep_clocks_by_the_step_and_never_uptime() {
     );
 }
 
-/// WITHOUT THE SWITCH the same step moves the wall clocks alone: the clocks
-/// that count a sleep stay with uptime.
 #[test]
 fn without_the_continuous_switch_a_step_moves_the_wall_alone() {
     let (moved, _, record) = step("wall", false);

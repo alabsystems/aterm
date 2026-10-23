@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BOOK OF DECLARED WAKES (`docs/DESIGN-harness-occupancy-2026-10-20.md` §4.1; the slice-2
-//! plan's D4, S2, S4, S8, S11, S13): the grammar of `wake label=… when=…` ([`WakeReq::parse`]),
-//! one session's book ([`WakeBook`]) with the operations its three tellers share (the loop's
-//! break and point doors, through a claim; the agent's own `await wake`, through an answer), and
-//! the session's one parked wait ([`ParkBook`]).
-//!
-//! Pure, serde and clockless: every instant is the caller's unix milliseconds, and every level
-//! (a file there, a pid gone, a machine term) is the caller's to read ([`Levels`]). The window's
-//! host keeps the book under one lock; the loop sees it as [`WakesSeen`].
-//!
-//! **Nothing a declaration says is typed.** The label, a path and a pattern are the agent's text:
-//! kept to answer its own `waits`, never in the view, and their `Debug` says their length alone.
-//! A need crosses as the grammar's canonical spelling, of machine terms alone (no job's id, no
-//! performance level's name).
+//! THE BOOK OF DECLARED WAKES.
 
 use std::fmt;
 
@@ -54,9 +41,7 @@ pub const WHEN_MAX: usize = 8;
 /// The most `unless=` atoms a wake carries.
 pub const UNLESS_MAX: usize = 4;
 
-/// An `await wake` answer unheard this long (no turn of the agent's seen run after it) may be
-/// retold once by a loop's door, in a hosted session: the gap a successor loop carries a hold
-/// across.
+/// Unheard `await wake` duration after which a hosted session loop's door may retell the answer.
 pub const UNHEARD_MS: i64 = 5 * MINUTE_MS;
 
 /// The usage line.
@@ -154,8 +139,7 @@ impl WakeUsage {
     }
 }
 
-/// A LABEL (`label=`): 1 to [`LABEL_MAX`] bytes of `A-Z a-z 0-9 . _ -`. The agent's own text,
-/// kept for its own `waits`; its `Debug` says its length alone.
+/// A LABEL (`label=`): 1 to [`LABEL_MAX`] bytes of `A-Z a-z 0-9 . _ -`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Token(String);
 
@@ -195,9 +179,7 @@ impl<'de> Deserialize<'de> for Token {
     }
 }
 
-/// A WAKE'S PATH, percent-decoded: under the home folder (`~/…` on the wire) or as given. Not yet
-/// admitted (`wake_atoms::admit` judges it against the session's roots). The agent's text: its
-/// `Debug` says its length alone.
+/// A WAKE'S PATH, percent-decoded: under the home folder (`~/…` on the wire) or as given.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AtomPath {
     home: bool,
@@ -262,9 +244,7 @@ impl<'de> Deserialize<'de> for AtomPath {
     }
 }
 
-/// A PATTERN (`file:PATH~/RE/`), percent-decoded: at most [`PATTERN_MAX`] characters, compiled by
-/// the bounded row matcher (`aterm_observe::row_matcher`). The agent's text: its `Debug` says its
-/// length alone, and nothing of a match is kept but the bit and its time.
+/// A PATTERN (`file:PATH~/RE/`), percent-decoded.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Pattern(String);
 
@@ -308,10 +288,7 @@ impl<'de> Deserialize<'de> for Pattern {
     }
 }
 
-/// MACHINE TERMS OF THE ONE GRAMMAR (`await sys`'s), parsed, with their canonical spelling: what a
-/// `need=` waits on, and a `when=`'s machine atom. Machine terms alone: a volume term, a job's
-/// term (its id is the agent's text) and a performance level by name are refused. Stored as the
-/// spelling, and read back by the same rules.
+/// MACHINE TERMS OF THE ONE GRAMMAR (`await sys`'s), parsed, with their canonical spelling.
 #[derive(Clone, PartialEq)]
 pub struct SysWait {
     wait: AwaitSys,
@@ -319,11 +296,8 @@ pub struct SysWait {
 }
 
 impl SysWait {
-    /// The machine wait of `terms` (each a term, `quiet`, or a `for=`/`scope=` word), as `await
-    /// sys` reads `sys <terms…>`.
-    ///
+    /// Parse `terms` into a machine wait as `await sys` reads `sys <terms…>`.
     /// # Errors
-    ///
     /// [`WakeUsage`]: a volume term, a job's term, a level by name, or a form `await sys` refuses.
     pub fn parse(terms: &[&str]) -> Result<Self, WakeUsage> {
         let text = format!("sys {}", terms.join(" "));
@@ -346,11 +320,8 @@ impl SysWait {
         Ok(Self { wait, canonical })
     }
 
-    /// The wait a stored spelling names (`sys …`, as [`Self::canonical`] gives it), read by the
-    /// same rules as [`Self::parse`].
-    ///
+    /// Parse a stored `sys …` spelling ([`Self::canonical`]) under [`Self::parse`] rules.
     /// # Errors
-    ///
     /// [`WakeUsage`]: a spelling that is not `sys` and terms [`Self::parse`] reads.
     pub fn of_spelling(text: &str) -> Result<Self, WakeUsage> {
         match text.split_whitespace().collect::<Vec<_>>().split_first() {
@@ -396,7 +367,6 @@ impl<'de> Deserialize<'de> for SysWait {
     }
 }
 
-/// A string read back through `check`: refused, the record is refused with the closed reason.
 fn checked_str<'de, D: serde::Deserializer<'de>, T>(
     d: D,
     check: impl FnOnce(String) -> Result<T, WakeUsage>,
@@ -404,8 +374,7 @@ fn checked_str<'de, D: serde::Deserializer<'de>, T>(
     check(String::deserialize(d)?).map_err(|why| serde::de::Error::custom(why.words()))
 }
 
-/// A SOURCE ATOM: a condition of the agent's own files or processes, judged by level at each look
-/// and latched by an edge between.
+/// Source atom: a condition of the agent's files or processes, judged by level and latched by edge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SourceAtom {
@@ -491,8 +460,7 @@ impl Atom {
 pub struct WakeReq {
     /// Its label.
     pub label: Token,
-    /// The condition's atoms, all of which must hold, in their order (the machine terms one atom,
-    /// where the first of them stood).
+    /// The condition's atoms, all of which must hold, in their order.
     pub when: Vec<Atom>,
     /// What must hold when it is told.
     pub need: Option<SysWait>,
@@ -511,7 +479,6 @@ enum Place {
     Need,
 }
 
-/// A term as read, before its place is judged.
 enum Read {
     Source(SourceAtom),
     Time(TimeAtom),
@@ -544,7 +511,6 @@ impl Pred {
         Ok(())
     }
 
-    /// The machine terms as one wait, where any; `for=`/`scope=` with none is refused.
     fn machine(&self) -> Result<Option<SysWait>, WakeUsage> {
         if self.sys.is_empty() {
             return if self.words.is_empty() {
@@ -566,14 +532,8 @@ impl Pred {
 }
 
 impl WakeReq {
-    /// THE DECLARATION `rest` SPELLS (the words after `wake`). Each term of `when=` and `need=`
-    /// after the first follows an `and`; `for=` and `scope=` follow a machine term; `unless=` is
-    /// one source atom, given again for another. A path and a pattern are percent-encoded: a raw
-    /// `~/` after a path's first character always opens its pattern, a leading `~/` is the home
-    /// folder, a raw space ends the word.
-    ///
+    /// THE DECLARATION `rest` SPELLS (the words after `wake`).
     /// # Errors
-    ///
     /// [`WakeUsage`]: the first reason the words are not a declaration.
     pub fn parse(rest: &str) -> Result<Self, WakeUsage> {
         let mut toks = rest.split_whitespace();
@@ -676,15 +636,13 @@ impl WakeReq {
         })
     }
 
-    /// Whether its condition is time alone: only an `await wake` answers it, and no line is typed
-    /// for it (an agent-scheduled alarm is spend the owner did not ask for).
+    /// Whether its condition is time alone.
     #[must_use]
     pub fn await_only(&self) -> bool {
         self.when.iter().all(|a| matches!(a, Atom::Time(_)))
     }
 }
 
-/// One term (`value`), reading `exited` after a `pid:` from `toks`.
 fn read<'a>(value: &str, toks: &mut impl Iterator<Item = &'a str>) -> Result<Read, WakeUsage> {
     if value.is_empty() {
         return Err(WakeUsage::Grammar);
@@ -747,7 +705,6 @@ fn read<'a>(value: &str, toks: &mut impl Iterator<Item = &'a str>) -> Result<Rea
     Ok(Read::Sys(value.to_string()))
 }
 
-/// A span (`<n>(s|m|h)`, `n` from 1, at most [`BY_MAX_MS`]), ms.
 fn span_ms(text: &str) -> Option<i64> {
     let digits = text.bytes().take_while(u8::is_ascii_digit).count();
     let (n, unit) = text.split_at(digits);
@@ -764,9 +721,6 @@ fn span_ms(text: &str) -> Option<i64> {
     (1..=BY_MAX_MS).contains(&ms).then_some(ms)
 }
 
-/// A path atom's raw text (after `file:` or `gone:`): a leading `~/` is the home folder, the
-/// first raw `~/` after it opens the pattern (`~/<re>/`, with no raw `/` inside), and each part is
-/// percent-decoded.
 fn path_and_pattern(raw: &str, pattern_ok: bool) -> Result<(AtomPath, Option<Pattern>), WakeUsage> {
     let (home, body) = match raw.strip_prefix("~/") {
         Some(rest) => (true, rest),
@@ -791,7 +745,6 @@ fn path_and_pattern(raw: &str, pattern_ok: bool) -> Result<(AtomPath, Option<Pat
     Ok((path, pattern))
 }
 
-/// `raw` percent-decoded strictly: each `%` is `%XX`, and the bytes are UTF-8.
 fn decode(raw: &str) -> Result<String, WakeUsage> {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -814,8 +767,7 @@ fn decode(raw: &str) -> Result<String, WakeUsage> {
     String::from_utf8(out).map_err(|_| WakeUsage::Escape)
 }
 
-/// ONE ATOM OF A DECLARED WAKE'S CONDITION, with its instant (a time atom's) and whether it holds
-/// (a source atom's latched, a time atom's past, the machine terms' at the last look).
+/// ONE ATOM OF A DECLARED WAKE'S CONDITION, with its instant (a time atom's) and whether it holds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WhenAtom {
     /// The atom.
@@ -866,12 +818,10 @@ impl DeclaredWake {
         wake_episode(self.declared_ms, self.ord)
     }
 
-    /// Whether it is still to be told and no teller holds it.
     const fn open(&self) -> bool {
         matches!(self.state, WakeState::Pending | WakeState::Ready)
     }
 
-    /// `Pending` to `Ready` once every atom of its condition holds.
     fn ready_at(&mut self, now_ms: i64) -> bool {
         if self.state == WakeState::Pending && self.when.iter().all(|a| a.held) {
             self.state = WakeState::Ready;
@@ -881,7 +831,6 @@ impl DeclaredWake {
         false
     }
 
-    /// Its view.
     fn seen(&self) -> WakeSeen {
         WakeSeen {
             ord: self.ord,
@@ -932,8 +881,7 @@ pub enum Change {
     Told(WakeDoor),
 }
 
-/// What a level read says, by the caller ([`WakeBook::on_look`]): `None` where it cannot be read
-/// now (a figure warming, a read refused), which changes nothing.
+/// What a level read says, by the caller ([`WakeBook::on_look`]).
 pub trait Levels {
     /// Whether `atom` holds.
     fn source(&self, atom: &SourceAtom) -> Option<bool>;
@@ -948,13 +896,11 @@ pub trait Levels {
 pub enum Reconciled {
     /// The last row says it was typed: told.
     Told,
-    /// An intent with no outcome, a skip, or no row: released, so it may be told (the one retell a
-    /// crash mid-write allows).
+    /// An intent with no outcome, a skip, or no row: released, so it may be told.
     Released,
 }
 
-/// THE RECONCILE OF A CLAIM ON `episode` from the ledger's fact rows (oldest first): its last row
-/// decides.
+/// THE RECONCILE OF A CLAIM ON `episode` from the ledger's fact rows (oldest first).
 #[must_use]
 pub fn reconcile_claim(episode: u64, rows: &[(u64, SeedOutcome)]) -> Reconciled {
     use super::fault::{Fault, armed};
@@ -998,14 +944,8 @@ impl WakeBook {
         self.wakes.iter_mut().find(|w| w.ord == ord)
     }
 
-    /// THE DECLARATION `req`, by `by` for `agent`, at `now_ms` in a zone `local_offset_s` from
-    /// UTC: its time atoms resolved (`at:` the next such local time, `in:` from now), each within
-    /// its `by=`. A book full of finished wakes forgets its oldest finished one; one holding
-    /// [`MAX_WAKES`] still to be told refuses. Its condition is not judged here: the caller's
-    /// next look does.
-    ///
+    /// THE DECLARATION `req`, by `by` for `agent`, at `now_ms` in a zone `local_offset_s` from UTC.
     /// # Errors
-    ///
     /// [`DeclareRefusal`].
     pub fn declare(
         &mut self,
@@ -1069,9 +1009,7 @@ impl WakeBook {
         Ok(ord)
     }
 
-    /// AN EDGE ON SOURCE ATOM `atom` (its index in the condition) of wake `ord` at `now_ms`: the
-    /// atom latches as holding, though its level reads false again by the next look (a file made
-    /// and gone between two looks), and the wake is `Ready` once every atom holds.
+    /// AN EDGE ON SOURCE ATOM `atom` (its index in the condition) of wake `ord` at `now_ms`.
     pub fn on_source(&mut self, ord: u16, atom: usize, now_ms: i64) -> Option<Change> {
         use super::fault::{Fault, armed};
         if armed(Fault::LevelOnly) {
@@ -1089,16 +1027,7 @@ impl WakeBook {
         wake.ready_at(now_ms).then_some(Change::Ready)
     }
 
-    /// THE LOOK AT `now_ms`, every level read again by `levels`: a wake past its `by=` expires
-    /// (`due`), one whose agent is gone expires (`agent`), one an `unless=` atom holds for
-    /// expires (`unless`); a pending wake's atoms are judged (a source atom latches once it
-    /// holds, a time atom holds once its instant passed, the machine terms hold as they read
-    /// now) and it is `Ready` once all hold. A ready wake stays ready whatever its levels read
-    /// now. An answered one whose `by=` passed or whose agent went ends told by its answer. A
-    /// wake a teller holds (answering, claimed) is left to that teller while its `by=` stands and
-    /// its agent lives, and then ends untold (`due`, `agent`) like any other: a teller that never
-    /// ends its write (its handler gone, a loop with no successor) strands no wake, and no hold is
-    /// reverted (a wake ended is told by no door; the teller's own end changes nothing).
+    /// THE LOOK AT `now_ms`, every level read again by `levels`.
     pub fn on_look(&mut self, levels: &dyn Levels, now_ms: i64) -> Vec<(u16, Change)> {
         let mut changed = Vec::new();
         for wake in &mut self.wakes {
@@ -1162,8 +1091,7 @@ impl WakeBook {
         changed
     }
 
-    /// THE `await wake` ANSWER BEGINS for ready wake `ord`: `Answering` while the reply is
-    /// written. False for a wake not ready.
+    /// THE `await wake` ANSWER BEGINS for ready wake `ord`: `Answering` while the reply is written.
     pub fn answer_begin(&mut self, ord: u16, now_ms: i64) -> bool {
         match self.get_mut(ord) {
             Some(wake) if wake.state == WakeState::Ready => {
@@ -1174,9 +1102,7 @@ impl WakeBook {
         }
     }
 
-    /// THE ANSWER'S WRITE ENDED, `ok` or not: written, the wake is `Answered` in a `hosted`
-    /// session (told once its loop sees a turn run after it) and `Told` in an unhosted one (no
-    /// door could tell it again); not written, it is `Ready` again, never lost.
+    /// THE ANSWER'S WRITE ENDED, `ok` or not.
     pub fn answer_done(&mut self, ord: u16, ok: bool, hosted: bool, now_ms: i64) {
         use super::fault::{Fault, armed};
         let Some(wake) = self.get_mut(ord) else {
@@ -1214,11 +1140,8 @@ impl WakeBook {
         }
     }
 
-    /// A LOOP'S DOOR CLAIMS wake `ord` of `episode` for its one write at `now_ms`: a ready wake is
-    /// `Claimed` for it (`Granted`); an answered one is `Answered` (told already, nothing to
-    /// type) until it has stood [`UNHEARD_MS`] unheard, and then claimed for the one retell; one
-    /// being answered or claimed is `Busy`; one whose condition has not held is `Unmet`; any other
-    /// (told, taken, expired, another episode's) is `Gone`. The await's door never claims.
+    /// A LOOP'S DOOR CLAIMS wake `ord` of `episode` for its one write at `now_ms`.
+    /// A time-only wake is `Gone` to a loop's door: only its await may answer it.
     pub fn claim(&mut self, ord: u16, episode: u64, door: WakeDoor, now_ms: i64) -> WakeClaim {
         use super::fault::{Fault, armed};
         let Some(wake) = self.get_mut(ord).filter(|w| w.episode() == episode) else {
@@ -1226,6 +1149,9 @@ impl WakeBook {
         };
         if door == WakeDoor::Await {
             return WakeClaim::Busy;
+        }
+        if wake.await_only {
+            return WakeClaim::Gone;
         }
         let claimed = WakeState::Claimed {
             door,
@@ -1253,8 +1179,7 @@ impl WakeBook {
         }
     }
 
-    /// THE LOOP RELEASES its claim on `ord` of `episode`, its line not typed: ready again (or
-    /// answered again, for a retell's claim). Honoured only for a claim a loop's door holds.
+    /// THE LOOP RELEASES its claim on `ord` of `episode`, its line not typed: ready again.
     pub fn release(&mut self, ord: u16, episode: u64) -> bool {
         match self.get_mut(ord).filter(|w| w.episode() == episode) {
             Some(wake) if matches!(wake.state, WakeState::Claimed { .. }) => {
@@ -1268,8 +1193,7 @@ impl WakeBook {
         }
     }
 
-    /// `ord` of `episode` WAS TOLD through `door` at `now_ms`: honoured for a claim that door
-    /// holds, and for the await's door, an answer heard ([`Self::heard`]).
+    /// `ord` of `episode` WAS TOLD through `door` at `now_ms`.
     pub fn told(&mut self, ord: u16, episode: u64, door: WakeDoor, now_ms: i64) -> bool {
         if self.get(ord).is_none_or(|w| w.episode() != episode) {
             return false;
@@ -1289,7 +1213,7 @@ impl WakeBook {
         }
     }
 
-    /// THE AGENT REMOVES `ord` (`wake rm #<n>`): gone from the book. False for none.
+    /// THE AGENT REMOVES `ord` (`wake rm #<n>`): gone from the book.
     pub fn rm(&mut self, ord: u16) -> bool {
         let before = self.wakes.len();
         self.wakes.retain(|w| w.ord != ord);
@@ -1297,7 +1221,6 @@ impl WakeBook {
     }
 
     /// THE AGENT TOOK `ord` (`wake taken #<n>`): a wake still to be told, or told, is `Taken`.
-    /// False for none, or one that expired.
     pub fn taken(&mut self, ord: u16) -> bool {
         match self.get_mut(ord) {
             Some(wake) if wake.state.live() || matches!(wake.state, WakeState::Told { .. }) => {
@@ -1308,8 +1231,7 @@ impl WakeBook {
         }
     }
 
-    /// EVERY WAKE STILL TO BE TOLD EXPIRES for `why` (the owner switched occupancy off). Answers
-    /// their ordinals.
+    /// EVERY WAKE STILL TO BE TOLD EXPIRES for `why` (the owner switched occupancy off).
     pub fn disarm(&mut self, why: ExpireWhy) -> Vec<u16> {
         let mut ended = Vec::new();
         for wake in &mut self.wakes {
@@ -1321,9 +1243,7 @@ impl WakeBook {
         ended
     }
 
-    /// A SUCCESSOR'S RECONCILE of the claims a loop's door held, from the ledger's fact rows
-    /// (oldest first, by episode): each claim whose last row says typed is told; any other is
-    /// released ([`reconcile_claim`]). Answers each claim's outcome.
+    /// A SUCCESSOR'S RECONCILE of the claims a loop's door held, from the ledger's fact rows.
     pub fn reconcile(
         &mut self,
         rows: &[(u64, SeedOutcome)],
@@ -1354,10 +1274,7 @@ impl WakeBook {
             .collect()
     }
 
-    /// THE BOOK AS A SUCCESSOR WINDOW READS IT BACK from a session record: a wake whose answer
-    /// was being written when the record was kept is `Ready` again (that write never ended in
-    /// this process: the one retell a crash mid-write allows); a claim stays for the successor's
-    /// [`Self::reconcile`], and every other state as kept.
+    /// THE BOOK AS A SUCCESSOR WINDOW READS IT BACK from a session record.
     #[must_use]
     pub fn restored(mut self) -> Self {
         for wake in &mut self.wakes {
@@ -1374,8 +1291,7 @@ impl WakeBook {
         self.seen().head_due().map(|w| w.ord)
     }
 
-    /// THE READY WAKES A PARKED `await wake` MAY BE ANSWERED BY, in the order it takes them: a
-    /// critical one first, then the lowest ordinal (time-only wakes among them).
+    /// THE READY WAKES A PARKED `await wake` MAY BE ANSWERED BY, in the order it takes them.
     #[must_use]
     pub fn for_await(&self) -> Vec<u16> {
         let mut ready: Vec<&DeclaredWake> = self
@@ -1484,8 +1400,7 @@ pub enum ParkAnswer {
 }
 
 impl ParkAnswer {
-    /// Its reply: `OK wake #<n> ready since=<ms>[ slots=<u>/<n>]` or `EXPIRED wake #<n>
-    /// why=<word>`.
+    /// Format the reply (`OK wake #<n> ready since=<ms>` or `EXPIRED wake #<n> why=<word>`).
     #[must_use]
     pub fn reply(self) -> String {
         match self {
@@ -1502,8 +1417,7 @@ impl ParkAnswer {
     }
 }
 
-/// THE SESSION'S ONE PARKED `await wake` (one of the 64 shared wait slots at most): a second is
-/// refused, and one with no wake open to answer it is refused at once.
+/// THE SESSION'S ONE PARKED `await wake` (one of the 64 shared wait slots at most).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParkBook {
     parks: Vec<Park>,
@@ -1511,9 +1425,7 @@ pub struct ParkBook {
 
 impl ParkBook {
     /// `conn` PARKS on `book` at `now_ms`.
-    ///
     /// # Errors
-    ///
     /// [`ParkRefusal::Busy`] while a park stands; [`ParkRefusal::NonePending`] for a book with no
     /// wake open.
     pub fn park(&mut self, conn: u64, book: &WakeBook, now_ms: i64) -> Result<(), ParkRefusal> {
@@ -1544,9 +1456,7 @@ impl ParkBook {
         self.parks.len() != before
     }
 
-    /// THE PARK'S END, once `book` holds no wake open to answer it: `ord`'s end, the last open
-    /// wake's, answers each park standing (`EXPIRED wake #<n> why=<word>`), and the parks end.
-    /// Nothing while a wake stays open, or with no park.
+    /// THE PARK'S END, once `book` holds no wake open to answer it.
     pub fn ended(&mut self, book: &WakeBook, ord: u16, why: Ended) -> Vec<(Park, ParkAnswer)> {
         if book.any_open() {
             return Vec::new();

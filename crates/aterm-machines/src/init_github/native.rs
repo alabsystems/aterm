@@ -61,10 +61,11 @@ impl Item for NativeRepositories {
         let check = (|| {
             let plan = self.plan(sys)?;
             let missing = repos::missing(sys, &self.user, &plan.repositories)?;
-            let ready = Git::keychain()
-                .configured(sys, &self.user, &plan.account)?
-                .ready()
-                && credential_ready(sys, &self.user, &plan.account, &plan.token)?;
+            let ready = lookups_answer(sys, &self.user, &plan.token)
+                || (Git::keychain()
+                    .configured(sys, &self.user, &plan.account)?
+                    .ready()
+                    && credential_ready(sys, &self.user, &plan.account, &plan.token)?);
             Ok::<_, String>((plan.repositories.len(), missing.len(), ready))
         })();
         match check {
@@ -190,13 +191,30 @@ fn credential_ready(
         .is_some_and(|stored| stored.bytes() == token.bytes()))
 }
 
-/// Store the synced token through `git credential approve`.
+/// Whether git's own github.com lookups, through the helpers `user`'s configuration names and
+/// asked as a clone asks, already hand back exactly `token` for every repository alike
+/// ([`Git::uniform`]): the secrets vault's helper reads the synced token itself, so a rotation
+/// reaches git with nothing here to redo, and the keychain is neither written nor made git's
+/// only helper. A lookup git cannot run, or settings that ask for some repositories otherwise,
+/// is no answer: the keychain path then runs as before and reports its own failure.
+fn lookups_answer(sys: &dyn System, user: &User, token: &Secret) -> bool {
+    let git = Git::keychain();
+    git.fill_as_configured(sys, Some(user), GITHUB)
+        .is_ok_and(|answer| answer.is_some_and(|got| got.bytes() == token.bytes()))
+        && git.uniform(sys, user).is_ok_and(|lookups| lookups.ready())
+}
+
+/// Store the synced token through `git credential approve`, unless git's own lookups already
+/// answer it ([`lookups_answer`]).
 fn install_credentials(
     sys: &dyn System,
     user: &User,
     account: &str,
     token: &Secret,
 ) -> Result<(), String> {
+    if lookups_answer(sys, user, token) {
+        return Ok(());
+    }
     let git = Git::keychain();
     if !credential_ready(sys, user, account, token)? {
         git.store(sys, Some(user), GITHUB, account, token)?;
@@ -217,7 +235,7 @@ mod tests {
     use super::*;
     use crate::git_credential::script;
     use crate::items::defaults::tests::user;
-    use crate::port::{Fake, GithubResponse, Stat};
+    use crate::port::{Fake, GithubResponse, Ran, Stat};
 
     const TOKEN: &str = "fixture_development_token_only";
 
@@ -524,6 +542,75 @@ mod tests {
                 "{mode:?}: {rows:?}"
             );
         }
+    }
+
+    /// git's own lookups already answering the synced token alike for every repository (the
+    /// secrets vault's helper, which reads it itself) are ready as they are: nothing goes into
+    /// the keychain and git's settings are not rewritten, so the next rotation of the synced
+    /// token reaches git. Ones that answer another token, or that some repositories' settings
+    /// could answer otherwise, still get the keychain.
+    #[test]
+    fn lookups_that_already_answer_the_synced_token_are_kept_as_they_are() {
+        let context = |item: &NativeRepositories| {
+            crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user))
+        };
+        let (sys, item) = fixture();
+        answer(
+            &sys,
+            &item.user,
+            &format!("{ACCESSIBLE}&page=1"),
+            aterm_json::json!([]),
+        );
+        script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
+        script::alike(&sys, &item.user);
+        assert!(
+            matches!(item.probe(&sys, &context(&item)), Probe::Ok { .. }),
+            "{:?}",
+            sys.calls()
+        );
+        item.apply(&sys, &context(&item)).unwrap();
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|call| !call.contains("credential approve") && !call.contains("--global")),
+            "{:?}",
+            sys.calls()
+        );
+
+        let (sys, item) = fixture();
+        answer(
+            &sys,
+            &item.user,
+            &format!("{ACCESSIBLE}&page=1"),
+            aterm_json::json!([]),
+        );
+        script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
+        let owners = format!("{}/.gitconfig", item.user.home);
+        sys.on(
+            &script::helpers(&item.user),
+            Ran::ok(&script::printed(&[(
+                &owners,
+                "credential.https://github.com/alice.helper",
+                "store",
+            )])),
+        );
+        credential_commands(&sys, &item.user, TOKEN);
+        item.apply(&sys, &context(&item)).unwrap();
+        let approve = script::credential(Some(&item.user), "approve");
+        assert!(sys.calls().contains(&approve), "{:?}", sys.calls());
+
+        let (sys, item) = fixture();
+        answer(
+            &sys,
+            &item.user,
+            &format!("{ACCESSIBLE}&page=1"),
+            aterm_json::json!([]),
+        );
+        script::lookups_hold(&sys, &item.user, GITHUB, "alice", "a_rotated_out_value");
+        credential_commands(&sys, &item.user, TOKEN);
+        item.apply(&sys, &context(&item)).unwrap();
+        let approve = script::credential(Some(&item.user), "approve");
+        assert!(sys.calls().contains(&approve), "{:?}", sys.calls());
     }
 
     #[test]

@@ -31,85 +31,89 @@ usage: aterm fabric [status] [--json]
                              [--expires <N>d|<N>h]
        aterm fabric halt  --cap-file <person-cap> <reason>|off
        aterm fabric inbox --cap-file <person-cap> [--peek]
-       aterm fabric post  --cap-file <person-cap> to=@<sid>@<node> kind=<k> [re=<off>]
+       aterm fabric post  --cap-file <person-cap> to=@<sid>@<node> [kind=<k>] [re=<off>]
                           [--] <text>
        aterm fabric help
 
-Inspect and manage the local aterm fabric. `status` reads the fleet, broker, cap
-file and state dir from `[fabric] command` in aterm.toml, falling back to the
-rendezvous file (`fabric.toml`) written by `aterm fabric on`.
+Inspect and manage this machine's fabric. Every verb that reads the bus finds the fleet,
+broker, cap file and state dir in `[fabric] command` (aterm.toml), else in the rendezvous
+file `fabric.toml` that `on` writes, else in a running instance's bridge command.
 
-  status           default view with seven sections:
-                   - CONFIG: command source, fleet, node id, cap grants, state dir
-                   - BROKER: live connect/attach/head probe, capability guard check,
-                     PID/service job, `subjects` spent of 4096, `acks` durability,
-                     `health` (poison status and flush counts), and `holds`
-                     (`<log>.health` snapshot)
-                   - NODES: bus presence rows (`this`, `local`, or `remote` for an
-                     unhosted/ghost node on this machine; retire via `aterm fabric
-                     doctor --retire-ghosts`)
-                   - BRIDGES: local aterm instances and their bridge processes
-                   - SESSIONS: per-session bus state (`live`, `away`, `gone`), hold,
-                     inbox counts, topics, role, detail, phase, context and title
-                     (`rows=4096+ truncated` when cut at 4096 rows)
-                   - TRAFFIC: last 10 bus records (metadata only)
-                   - WARNINGS: issues that block mail or make `connected` misleading
-  --json           status and brief: emit one JSON object (`brief --json` emits one
-                   object per session with node, sid, this, ep, need, detail, open,
-                   mail_in, mail_out, last_seq, age_s, partial)
-  tail             stream bus records live until Ctrl-C
-  --from <offset>  tail only: replay from bus offset `<offset>` first
-  --bodies         tail only: print each record's text after its trust label
-  --filter <f>     tail only: subscribe to one subject pattern (`/f/<F>/…`, `*` for
-                   one segment, `>` for the rest) instead of the whole fleet
-  on               idempotently provision the fabric root (`~/.local/share/aterm-fabric`,
-                   0700), node id, mint secret and 8 node grants; install and start
+  status           the default; seven sections:
+                   - CONFIG: the command's source and program, fleet, node id, cap
+                     files and their grants, state dir, presence and receipts
+                   - BROKER: whether it answers, its pid (and launchd job), bus head,
+                     `subjects` this node spent of 4096, `acks` durability, `health`
+                     (poisoned or not, flush counts), `holds` (from `<log>.health`)
+                     and `guard` (whether it checks capabilities)
+                   - NODES: every node on the presence roster, marked `this`, `local`
+                     or `remote` (no instance here answers as that node)
+                   - BRIDGES: each aterm instance on this machine and its bridge
+                   - SESSIONS: each session's bus state (`live`, `away`, `gone`), hold,
+                     mail counts, topics, role, detail, phase, context and title
+                     (`rows=4096+ truncated` past 4096 rows)
+                   - TRAFFIC: the last 10 bus records, metadata only
+                   - WARNINGS: each problem found (`doctor` prints its fix)
+  --json           status: one JSON object of the same data; brief: one object whose
+                   `sessions` each carry node, sid, this, ep, need, detail, open,
+                   mail_in, mail_out, last_seq, age_s and partial
+  tail             stream bus records as they land, until Ctrl-C
+  --from <offset>  tail: replay from bus offset <offset> first
+  --bodies         tail: print each record's text after its trust label
+  --filter <f>     tail: one subject pattern under `/f/<F>/` (`*` one segment, `>` the
+                   rest) instead of the whole fleet
+  brief            fold each session's mirrored log into a few lines (need, open work,
+                   mail), newest session first, within --budget tokens (default 2000)
+                   over the last --window records (default 65536); `@<sid>[@<node>]`
+                   picks one session
+  on               provision (idempotently) the fabric root `~/.local/share/aterm-fabric`
+                   (0700), node id, mint secret and the node's 8 grants; install and start
                    the broker under launchd (macOS) or systemd --user (Linux); write
                    `[fabric] command` to aterm.toml (keeping `.bak`) and `fabric.toml`
-                   (0600); attach running aterm instances; verify end-to-end delivery
-                   with a self-test note; and print `status`
-  --dry-run        on/off only: print planned steps without modifying anything
-  --fleet <F>      on and mint-for: fleet name (`/f/<F>/`; default `local`)
-  --service <s>    on/off only: `launchd`, `systemd` or `none` (`none` uses an
-                   already-running externally managed broker)
+                   (0600); attach running instances; prove delivery with a note a session
+                   posts to itself; print `status`
+  --dry-run        on/off: print every step, change nothing
+  --fleet <F>      on, mint-for: the fleet (`/f/<F>/`; default the configured one, else
+                   `local`)
+  --service <s>    on/off: `launchd`, `systemd`, or `none` (a broker run some other way)
   --durability strict|ordered|relaxed
-                   on only: broker ack durability tier (default `ordered`).
-                   - `ordered`: acks after a disk ordering barrier and flushes in
-                     full within 100 ms (served `strict` where the disk cannot
-                     guarantee ordering).
-                   - `strict`: acks after a full drive-cache flush; loses nothing
-                     acked on power loss.
-                   - `relaxed`: acks after the page-cache write; survives broker
-                     restarts, not power loss or kernel panic.
-                   Halts, a person's words, mail to a person and read marks always
-                   flush in full before ack. Clean stops flush and close the log; an
-                   unclean reboot advances the log generation at the agreement offset
-                   so bridges and notifiers resume without skipping post-restart mail
+                   on: what the broker's ack promises (default the installed job's, else
+                   `ordered`):
+                   - `ordered`: acks after a disk ordering barrier and flushes in full
+                     within 100 ms (served `strict` where the disk cannot keep the order)
+                   - `strict`: acks after a full drive-cache flush; a power loss loses
+                     nothing acked
+                   - `relaxed`: acks after the page-cache write; survives a broker
+                     restart, not a power loss or kernel panic
+                   Halts, a human's words, mail to a person and a person's read marks
+                   always flush in full before their ack. A clean stop flushes and closes
+                   the log; after an unclean reboot the log's generation advances, and
+                   bridges and notifiers resume without skipping mail
   off              stop and remove the broker job, `[fabric]` in aterm.toml (keeping
-                   `.bak`), and `fabric.toml`, while preserving the node id, secret,
-                   cap and bus log
-  doctor           print `status` warnings with their remedies (`--retire-ghosts`
-                   lists unhosted live presence rows on this node and, after y/N or
-                   `--yes`, publishes `exited` for each; dry by default)
-  mint-for <id>    mint a capability ring for human `h-<name>` or agent `a-<name>`
-                   under this machine's mint secret (human rings include `halt`)
-  --out <cap>      mint-for only: write cap to `<cap>` (0600, refusing symlinks or
-                   different existing caps; default prints cap to stdout and guidance
-                   to stderr)
+                   `.bak`) and `fabric.toml`; the node id, secret, cap and bus log stay
+  doctor           print the broker's durability, health and holds, then each warning
+                   with its fix; `--retire-ghosts` lists the live presence rows of this
+                   machine's nodes that no instance hosts and, after y/N or `--yes`,
+                   publishes `exited` for each
+  mint-for <id>    mint a cap for human `h-<name>` or agent `a-<name>` under this
+                   machine's mint secret (a human's includes `halt`)
+  --out <cap>      mint-for: write the cap to <cap> (0600; refuses a symlink or a
+                   different cap there); without it the cap goes to stdout and the
+                   guidance to stderr
   --expires <N>d|<N>h
-                   mint-for only: stamp grants with `exp=` so the broker refuses the
-                   ring after `<N>d` or `<N>h`
-  halt <reason>    as human `--cap-file`: hold every session on the fleet (`hold=1
+                   mint-for: stamp each grant `exp=` so the broker refuses it after that
+  halt <reason>    as a human's cap: hold every session on the fleet (`hold=1
                    origin=fleet`); `halt off` withdraws this human's halt
-  inbox            as `--cap-file`: print unread mail to `<person>` and commit the
-                   consumer group cursor (`--peek` leaves mail unread)
-  post             as `--cap-file`: send `to=@<sid>@<node>` with `kind=ask|answer|
-                   task|report|note` (default `note`) and optional `re=<off>`
-  --cap-file <c>   halt/inbox/post/brief: capability file (`mint-for h-<name> --out`)
+  inbox            as a person's cap: print its unread mail and mark it read (`--peek`
+                   leaves it unread)
+  post             as a person's cap: send to `@<sid>@<node>` with `kind=ask|answer|task|
+                   report|note` (default `note`) and optional `re=<off>`
+  --cap-file <c>   halt/inbox/post: the person's cap (`mint-for h-<name> --out <c>`);
+                   brief: read under it instead of the node's cap
 
-Message bodies are never printed without `tail --bodies`. `status`, `tail` and
-`doctor` write nothing to disk. Exit status: 0 healthy, 1 warning (or failed proof),
-2 fabric off, unreadable config, or usage error.
+`status` and `tail` print no message text (`tail --bodies` does); `status`, `tail`,
+`brief` and a plain `doctor` write nothing. Exit status: 0 healthy, 1 a warning or a
+failed step or proof, 2 fabric off, unreadable config, a refusal, or a usage error.
 ";
 
 const FABRIC_COMMAND_ENV: &str = "ATERM_FABRIC_COMMAND";

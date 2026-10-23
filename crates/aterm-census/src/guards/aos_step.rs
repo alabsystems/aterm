@@ -291,6 +291,50 @@ mod tests {
     }
 
     #[test]
+    fn a_clock_read_planted_in_the_m4_plan_lane_evaluator_or_publication_is_found() {
+        let planted = "use aterm_time::Instant;\n\
+                       fn a() -> Instant { Instant::now() }\n\
+                       fn b(t: Instant) -> u128 { t.elapsed().as_nanos() }\n\
+                       fn c() { std::thread::sleep(GAP); }\n\
+                       fn d() -> u32 { rand::random::<u32>() }\n\
+                       fn e(now: Instant, epoch: Instant) -> Duration { now.duration_since(epoch) }\n";
+        let parent = "#[cfg(any(test, debug_assertions, feature = \"aos-candidates\"))]\n\
+                      pub mod bundle;\n\
+                      pub mod lane;\n\
+                      #[cfg(test)]\n\
+                      mod lane_tests;\n\
+                      #[cfg(any(test, debug_assertions, feature = \"aos-candidates\"))]\n\
+                      pub mod m4;\n\
+                      #[cfg(test)]\n\
+                      mod m4_tests;\n\
+                      #[cfg(any(test, debug_assertions, feature = \"aos-candidates\"))]\n\
+                      pub mod plan;\n\
+                      #[cfg(any(test, debug_assertions, feature = \"aos-candidates\"))]\n\
+                      pub mod publish;\n\
+                      #[cfg(test)]\n\
+                      mod publish_tests;\n\
+                      #[cfg(test)]\n\
+                      mod rig;\n";
+        let dir = "crates/aterm-effects/src/aos_momentum";
+        let shipped = ["lane", "m4", "plan", "publish"];
+        let tests = ["lane_tests", "m4_tests", "publish_tests", "rig"];
+        let mut files: Vec<(String, &str)> = vec![(format!("{dir}.rs"), parent)];
+        files.extend(
+            shipped
+                .iter()
+                .chain(tests.iter())
+                .map(|m| (format!("{dir}/{m}.rs"), planted)),
+        );
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+        let found = findings(&files);
+        let expected: Vec<String> = shipped
+            .iter()
+            .flat_map(|m| (2..=5).map(move |l| format!("{dir}/{m}.rs:{l}")))
+            .collect();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
     fn a_clock_read_in_a_same_crate_helper_the_momentum_step_calls_is_found() {
         let planted = "fn ink(now: Instant) -> u32 { light(now) }\n\
                        fn light(_: Instant) -> u32 { let t = Instant::now(); 0 }\n";

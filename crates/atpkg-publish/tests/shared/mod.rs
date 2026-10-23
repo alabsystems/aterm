@@ -15,7 +15,6 @@ pub fn scratch(label: &str) -> aterm_tempfile::TempDir {
         .expect("scratch dir")
 }
 
-/// One entry of a [`Tree`].
 enum Node {
     Dir,
     File { bytes: Vec<u8>, mode: u32 },
@@ -29,9 +28,7 @@ pub struct Tree {
 
 impl Tree {
     /// Everything under `root`.
-    ///
     /// # Panics
-    ///
     /// When `root` cannot be read.
     #[must_use]
     pub fn read(root: &std::path::Path) -> Self {
@@ -66,9 +63,7 @@ impl Tree {
     }
 
     /// Writes the tree under `root`, rewriting mentions of the source root path to `root`.
-    ///
     /// # Panics
-    ///
     /// When it cannot be written.
     pub fn lay(&self, root: &std::path::Path) {
         use std::os::unix::ffi::OsStrExt as _;
@@ -90,7 +85,6 @@ impl Tree {
     }
 }
 
-/// `bytes` with every `from` replaced by `to`.
 fn moved<'a>(bytes: &'a [u8], from: &[u8], to: &[u8]) -> std::borrow::Cow<'a, [u8]> {
     if from.is_empty() || !bytes.windows(from.len()).any(|w| w == from) {
         return std::borrow::Cow::Borrowed(bytes);
@@ -111,9 +105,7 @@ pub type Made<K, T> =
     std::sync::Mutex<std::collections::BTreeMap<K, std::sync::Arc<std::sync::OnceLock<(Tree, T)>>>>;
 
 /// Runs `make` once per process for `key` and lays the resulting tree into `dir`.
-///
 /// # Panics
-///
 /// When `dir` holds anything, or the made tree cannot be read or laid down.
 pub fn made_once<K: Ord + Clone, T: Clone>(
     cache: &'static Made<K, T>,

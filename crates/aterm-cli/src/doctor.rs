@@ -17,8 +17,7 @@ pub const COPIES: &str = "base.pkg.copies";
 /// The Developer Tools row, whose fix-mode gather hands the owner to the pane.
 pub const DEVTOOLS: &str = "base.privacy.devtools";
 
-/// Whether a run narrowed to `only` reads the Developer Tools row, so a fix-mode gather may hand
-/// the owner to its pane ([`gather`]): `--only pkg` opens nothing.
+/// Whether a run narrowed to `only` reads the Developer Tools row.
 #[must_use]
 pub fn hands_over(only: &[String]) -> bool {
     only.is_empty()
@@ -27,9 +26,7 @@ pub fn hands_over(only: &[String]) -> bool {
             .any(|token| aterm_converge::selects(token, DEVTOOLS, "privacy", Some(Layer::Base)))
 }
 
-/// Whether the `--only` word `token` names one of doctor's own rows (its id, its family or the base
-/// layer), on any platform: what a run checks before it reads anything, so a word that names
-/// nothing is refused before the Developer Tools hand-over ([`gather`]).
+/// Whether the `--only` word `token` names one of doctor's own rows on any platform.
 #[must_use]
 pub fn names(token: &str) -> bool {
     ROWS.iter()
@@ -40,7 +37,6 @@ pub fn names(token: &str) -> bool {
 pub const GRAMMAR: &str =
     "[--read-only | --check | --apply | --restore] [--json] [--only <id,...>]";
 
-/// Each row's label, its item's id, family and title.
 const ROWS: [(&str, &str, &str, &str); 12] = [
     ("shell:", SHELL, "shell", "the shell aterm starts"),
     (
@@ -106,7 +102,6 @@ const ROWS: [(&str, &str, &str, &str); 12] = [
     ),
 ];
 
-/// The row labelled `label`: its id, family and title.
 fn named(label: &str) -> Option<(&'static str, &'static str, &'static str)> {
     ROWS.iter()
         .find(|(l, ..)| *l == label)
@@ -237,7 +232,6 @@ pub fn settings(action: Settings, json: bool) -> (String, u8) {
     }
 }
 
-/// A settings action that could not run: its one line, or the fleet document's `error`.
 fn settings_refused(json: bool, why: &str) -> (String, u8) {
     if json {
         let doc = aterm_json::json!({
@@ -253,7 +247,7 @@ fn settings_refused(json: bool, why: &str) -> (String, u8) {
 /// A row beside the items' own: the packages' summary, the repair's (`crates/aterm`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {
-    /// The left column, e.g. `packages:`.
+    /// The left column, such as `packages:`.
     pub label: &'static str,
     /// The verdict; never [`Mark::Fail`], which only the shell gives.
     pub mark: Mark,
@@ -356,15 +350,13 @@ pub fn gather(fix: bool) -> Gathered {
     }
 }
 
-/// The report closed by its `health:` line, and 1 when a row failed: the form the isolated
-/// fact tests read.
+/// The diagnostic facts' legacy shell-health assessment, used by isolated fact tests.
 #[must_use]
 pub fn render(gathered: &Gathered, rows: &[ItemReport], sections: &[Section]) -> (String, i32) {
     super::render_doctor_lines(&report_lines(gathered, rows, sections))
 }
 
-/// The composed doctor's explicit readiness assessment, retaining each fact including shell
-/// usability while distinguishing selected checks from complete OS setup.
+/// Composed doctor readiness assessment distinguishing selected checks from full OS setup.
 #[must_use]
 pub fn render_readiness(
     gathered: &Gathered,
@@ -401,9 +393,6 @@ pub fn render_readiness(
     text
 }
 
-/// One line per row of these
-/// items (`rows` may carry others, which `sections` summarize), then `sections`, the
-/// version and assessment are added by the caller.
 fn report_lines(gathered: &Gathered, rows: &[ItemReport], sections: &[Section]) -> Vec<DoctorRow> {
     let mut lines: Vec<DoctorRow> = Vec::new();
     for row in rows {
@@ -460,8 +449,6 @@ pub fn answer(text: &str, code: u8, stdout: bool) -> std::process::ExitCode {
     std::process::ExitCode::from(code)
 }
 
-/// A row's mark from what the engine made of it: done is `ok`, a fact or a wait is a
-/// `note`, an essential row left wrong is `FAIL`, anything else left wrong a `warn`.
 const fn mark_of(row: &ItemReport) -> Mark {
     match row.outcome {
         Outcome::Ok | Outcome::Changed => Mark::Ok,
@@ -471,7 +458,6 @@ const fn mark_of(row: &ItemReport) -> Mark {
     }
 }
 
-/// One fact row as an item: its probe is the reading; nothing applies it.
 struct Fact<'a> {
     line: &'a DoctorRow,
     id: &'static str,
@@ -541,7 +527,6 @@ impl Item for Fact<'_> {
     }
 }
 
-/// The stale copies of aterm: what the last look found, and what the prune did.
 struct Copies {
     prune: fn(bool) -> atpkg::copies::Pruned,
     looked: Mutex<Option<atpkg::copies::Pruned>>,
@@ -557,7 +542,6 @@ impl Copies {
         }
     }
 
-    /// What the row says: what the prune did, else what the look found.
     fn shown(&self) -> atpkg::copies::Pruned {
         let did = self
             .did
@@ -574,7 +558,6 @@ impl Copies {
     }
 }
 
-/// [`Copies`] as the `asked` item `base.pkg.copies`.
 struct CopiesItem<'a>(&'a Copies);
 
 impl Item for CopiesItem<'_> {
@@ -712,8 +695,6 @@ mod tests {
         }
     }
 
-    /// A settings action that cannot run still answers in its own form: the fleet
-    /// document with `error` and exit 1 under `--json`, one line otherwise.
     #[test]
     fn a_refused_settings_action_answers_in_the_fleet_document() {
         let (text, code) = settings_refused(true, "the fleet settings profile requires macOS");
@@ -732,8 +713,6 @@ mod tests {
         );
     }
 
-    /// The copies item looks without moving, moves only when applied, and its row says
-    /// what the prune did.
     #[test]
     fn the_stale_copies_are_looked_at_by_the_probe_and_moved_only_by_the_apply() {
         use atpkg::copies::Pruned;

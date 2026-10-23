@@ -96,9 +96,6 @@ pub const MATCH_RISE: f64 = aterm_types::scheme::MIN_SEARCH_MATCH_CONTRAST;
 /// Minimum `OkLab` distance between a search-match tint and the selection color.
 pub const MATCH_DISTINCT_OKLAB: f64 = aterm_types::scheme::MIN_SEARCH_MATCH_DISTANCE;
 
-/// The tint ramp: twentieths of the way from the background toward its seed,
-/// up to twelve of them (0.6). Past that the tint stops reading as a tint of
-/// the background and starts competing with the text on it.
 const MATCH_STEPS: (u8, f32) = (12, 20.0);
 
 /// The shared chrome colours of one theme ([`ChromeTokens::derive`]).

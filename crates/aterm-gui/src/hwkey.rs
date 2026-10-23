@@ -281,12 +281,13 @@ pub(crate) fn parse_hwkey(rest: &str) -> Result<HwKeySpec, String> {
 }
 
 fn usage() -> String {
-    "ERR usage: hwkey <char|name> [mods=<list>] [count=<n>] [interval=<ms>] \
-     [shape=press|built] — posts a REAL NSEvent into this app's own OS event queue so \
-     the key takes the winit hardware path (macOS only); shape=press builds it from a \
-     CoreGraphics key event, as a key press is, so the layout gives its characters and \
-     the input method may compose it. Names: enter tab esc space backspace delete \
-     up down left right home end pageup pagedown f1..f12\n"
+    "ERR usage: hwkey [unread=ok] [<mod>+]<char|name> [mods=<list>] [count=<n>] \
+     [interval=<ms>] [shape=press|built] — posts a real NSEvent into this app's own event \
+     queue, so the key takes the path a physical key press takes through aterm (macOS \
+     only); shape=press builds it from a CoreGraphics key event, so the layout gives its \
+     characters and the input method may compose it. <char> is one printable ASCII \
+     character; names: enter tab esc space backspace delete up down left right home end \
+     pageup pagedown f1..f12\n"
         .to_string()
 }
 

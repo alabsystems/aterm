@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! `lane-wl`: second Wayland client for the Linux runtime baseline (`lab linux baseline`).
+//!
+//! STOCK EXCEPTION: its work is Linux only, and Trust has no Linux std, so only stock Rust builds
+//! it (the Linux lane's guest pins its version: `aterm-lab/src/linux_guest.rs`).
 
 use std::process::ExitCode;
 

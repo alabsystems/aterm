@@ -8,7 +8,11 @@
 #[cfg(target_os = "macos")]
 mod abrew_admission;
 #[cfg(target_os = "macos")]
+mod aos_phase;
+#[cfg(target_os = "macos")]
 mod aos_repair;
+#[cfg(target_os = "macos")]
+mod aos_search;
 #[cfg(target_os = "macos")]
 mod band;
 #[cfg(target_os = "macos")]
@@ -382,8 +386,12 @@ Outside any lab (no jail, no stub):
   trail-contrast <png> [--find TEXT]... [--cells ROW:COL[-COL]]... [--row N]... [--newest N] [--min X]
                  [--newest-min X] [--caret-min X] [--dims FILE|--origin X,Y --cell WxH] [--no-clean] ...
                                  compute WCAG contrast JSON from trail-gallery frames and sidecars (`--help` for details)
-  aos-repair [--aterm PATH] [--control] [--keep] [--out DIR]
-                                 OPENS A WINDOW: verify Aos M2 live repair of a stranded momentum glow (~25 s; `--help` for details)
+  aos-repair [--aterm PATH] [--control | --publish PLAN_HEX] [--keep] [--out DIR]
+                                 OPENS A WINDOW: verify Aos M2 live repair of a stranded momentum glow, or publish an Aos M4 plan against a control (~25 s; `--help` for details)
+  aos-search [--grid] [--plans FILE] --out DIR [--toolchain LINE] | aos-search --verify FILE
+                                 run Aos M4's candidate search under the pinned policy, or verify a bundle FILE offline (`--help` for details)
+  aos-phase TRACE --build BUILD [--plan PLAN_HEX]
+                                 re-derive a windowed aos-repair run's measured phase from its kept trace (`--help` for details)
   resource-attribution [--aterm PATH]
                                  private two-tab delegated resource attribution check
   presence-flap --window|--headless [--aterm PATH] [--client PATH] [--phases \"A H B D T X\"] [--trials N] [--keep]
@@ -571,6 +579,8 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "__trail-redraw-fixture" => trail_gallery::cmd_redraw_fixture(args),
         "trail-contrast" => trail_contrast::cmd_trail_contrast(args),
         "aos-repair" => aos_repair::cmd_aos_repair(args),
+        "aos-search" => aos_search::cmd_aos_search(args),
+        "aos-phase" => aos_phase::cmd_aos_phase(args),
         "presence-flap" => presence::cmd_presence_flap(args),
         "meta-keys" => meta_keys::cmd_meta_keys(args),
         "predict-live" => predict_live::cmd_predict_live(args),

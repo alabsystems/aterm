@@ -22,7 +22,6 @@ use crate::stats_paint::{Bar, Hit, Instrument};
 use crate::stats_plan::DeckForm;
 use crate::{App, WindowId, term_lock};
 
-/// A private observer of the session's PTY input.
 fn observer() -> (UnixStream, Arc<SinkWriter>) {
     let (reader, writer) = UnixStream::pair().expect("private input observer");
     reader.set_nonblocking(true).unwrap();
@@ -43,7 +42,6 @@ fn drain(reader: &mut UnixStream) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// One window drawing `form`.
 struct Rig {
     app: App,
     wid: WindowId,
@@ -75,7 +73,6 @@ fn rig(form: &str) -> Rig {
 }
 
 impl Rig {
-    /// Everything the program was sent before a marker pasted to it now.
     fn sent(&mut self) -> String {
         const MARK: &str = "<marker>";
         self.app.input_to_session(
@@ -100,7 +97,6 @@ impl Rig {
         }
     }
 
-    /// Turn on the program's mouse reporting (`modes`).
     fn report_mouse(&mut self, modes: &[u8]) {
         let term = self
             .app
@@ -117,7 +113,6 @@ impl Rig {
         self.app.windows[&self.wid].stats_lens.open
     }
 
-    /// The window's Deck in `form`.
     fn deck(&mut self, form: DeckForm, width_pt: Option<f64>) {
         let (cw, cell) = self.app.win_cell_size(self.wid);
         let pad = self.app.win_pad(self.wid);
@@ -130,7 +125,6 @@ impl Rig {
         ws.metrics.head = crate::stats_deck::deck_px(StatsBars::Deck, form, ws.scale, cell);
     }
 
-    /// Rest on the form's first hit `pick` takes until the rest is served.
     fn rest_on_hit(&mut self, pick: impl Fn(&Hit) -> bool) -> Hit {
         let (at, hit) = self.hit(pick);
         self.move_to(at);
@@ -139,14 +133,12 @@ impl Rig {
         hit
     }
 
-    /// The frame point at the centre of the sill's first `want` instrument.
     fn instrument(&self, want: Instrument) -> ((f64, f64), Hit) {
         let f = self.app.deck_frame(self.wid).expect("the form shows");
         assert_eq!(f.form, StatsBars::Sill);
         self.hit(|h| h.instrument() == want)
     }
 
-    /// The frame point at the centre of the form's first hit `pick` takes.
     fn hit(&self, pick: impl Fn(&Hit) -> bool) -> ((f64, f64), Hit) {
         let _ = self.app.stats_deck_fp(self.wid);
         let f = self.app.deck_frame(self.wid).expect("the form shows");
@@ -165,14 +157,12 @@ impl Rig {
         (at, hit)
     }
 
-    /// The frame point at the centre of grid cell `(row, col)`.
     fn cell(&self, row: u16, col: u16) -> (f64, f64) {
         self.app
             .cell_centre_px(self.wid, row, col)
             .expect("cell on the grid")
     }
 
-    /// The frame point at the centre of the open lens's card.
     fn over_lens(&mut self) -> (f64, f64) {
         self.app.splice_stats_lens(self.wid);
         let (dx, dy, w, h) = self.app.windows[&self.wid]
@@ -197,7 +187,6 @@ impl Rig {
             .on_mouse_input(self.wid, ElementState::Released, button);
     }
 
-    /// Rest on `want` until the rest is served: the hover lens opens there.
     fn rest_on(&mut self, want: Instrument) -> Hit {
         let (at, hit) = self.instrument(want);
         self.move_to(at);
@@ -224,24 +213,20 @@ impl Rig {
         self.key(code, Key::Named(key), key.to_text());
     }
 
-    /// ⌘ and `c`, as the keyboard sends them.
     fn command(&mut self, code: KeyCode, c: &str) {
         self.chord(ModifiersState::SUPER, code, c);
     }
 
-    /// `mods` held over `c`.
     fn chord(&mut self, mods: ModifiersState, code: KeyCode, c: &str) {
         self.app.windows.get_mut(&self.wid).expect("window").mods = mods;
         self.key(code, Key::Character(SmolStr::new(c)), Some(c));
         self.app.windows.get_mut(&self.wid).expect("window").mods = ModifiersState::empty();
     }
 
-    /// What the test build's clipboard holds.
     fn clipboard(&self) -> Option<String> {
         crate::control::PBPASTE_STUB.with(|b| b.borrow().clone())
     }
 
-    /// The sentence ⌘C copies for `focus`, said for the window's front tab.
     fn sentence(&self, focus: Instrument) -> String {
         let snap = self.app.vitals.snapshot.clone().expect("a snapshot");
         let (tab_key, _) = self.app.deck_tab(self.wid);
@@ -253,8 +238,6 @@ impl Rig {
     }
 }
 
-/// A pointer resting on an instrument opens the hover lens there when the
-/// rest is served, not before; a pointer passing over opens none.
 #[test]
 fn a_rest_opens_the_hover_lens_and_passing_over_opens_none() {
     let mut r = rig("sill");
@@ -286,8 +269,6 @@ fn a_rest_opens_the_hover_lens_and_passing_over_opens_none() {
     );
 }
 
-/// A hover lens leaves with the pointer once its leave runs out, and stays
-/// while the pointer is over the lens itself.
 #[test]
 fn a_hover_lens_leaves_with_the_pointer_and_stays_while_over_the_lens() {
     let mut r = rig("sill");
@@ -321,9 +302,6 @@ fn a_hover_lens_leaves_with_the_pointer_and_stays_while_over_the_lens() {
     assert_eq!(r.lens(), None, "the lens leaves with the pointer");
 }
 
-/// A press on an instrument pins the lens there and reaches no program; a
-/// pinned lens outlasts the pointer; a press outside closes it and goes on
-/// to the program under the pointer.
 #[test]
 fn a_press_pins_the_lens_and_a_press_outside_closes_it_and_goes_on() {
     let mut r = rig("sill");
@@ -359,7 +337,6 @@ fn a_press_pins_the_lens_and_a_press_outside_closes_it_and_goes_on() {
     );
 }
 
-/// Any lens closes when its window loses focus.
 #[test]
 fn focus_loss_closes_the_lens() {
     let mut r = rig("sill");
@@ -369,9 +346,6 @@ fn focus_loss_closes_the_lens() {
     assert_eq!(r.lens(), None);
 }
 
-/// The keyboard lens (⌘I) takes ←/→/↑/↓, Return and Esc, and a bare
-/// modifier is inert; any other key closes it and reaches the terminal. Once
-/// Return has pinned it, it still takes the arrows.
 #[test]
 fn the_keyboard_lens_takes_its_keys_and_any_other_key_closes_it_and_goes_on() {
     let mut r = rig("sill");
@@ -445,9 +419,6 @@ fn the_keyboard_lens_takes_its_keys_and_any_other_key_closes_it_and_goes_on() {
     assert_eq!(r.sent(), "x", "and reaches the terminal");
 }
 
-/// A lens pinned by a click steps over `Instrument::ALL` with ←/→, and ⌘C
-/// (or Edit ▸ Copy, or the chord bound to Copy) copies the instrument's
-/// sentence, reaching no program; a hover lens takes no key.
 #[test]
 fn a_pinned_lens_steps_the_instruments_and_command_c_copies_their_sentence() {
     let mut r = rig("sill");
@@ -499,8 +470,6 @@ fn a_pinned_lens_steps_the_instruments_and_command_c_copies_their_sentence() {
     assert_eq!(r.sent(), "\x1b[C");
 }
 
-/// ⌘I opens the keyboard lens on CPU at first, then on the last instrument
-/// a lens showed, and closes an open one.
 #[test]
 fn command_i_reopens_the_last_instrument() {
     let mut r = rig("sill");
@@ -525,8 +494,6 @@ fn command_i_reopens_the_last_instrument() {
     );
 }
 
-/// Whenever Disk becomes the lens's instrument, the "where" survey is asked
-/// for: opened there, or stepped to.
 #[test]
 fn the_disk_lens_asks_for_the_where_survey() {
     let mut r = rig("sill");
@@ -552,8 +519,6 @@ fn the_disk_lens_asks_for_the_where_survey() {
     );
 }
 
-/// A hover lens moves to another instrument only after a rest there; a
-/// pinned lens stays where it was put.
 #[test]
 fn a_hover_lens_moves_after_a_rest_and_a_pinned_lens_stays() {
     let mut r = rig("sill");
@@ -590,10 +555,6 @@ fn a_hover_lens_moves_after_a_rest_and_a_pinned_lens_stays() {
     assert_eq!(r.lens().map(|l| l.focus), Some(Instrument::Cpu));
 }
 
-/// T-G10 on the Deck, through the App's own routing: a rest on a Full row
-/// opens its hover lens on the machine, a rest on a Folded scope cell opens
-/// it on that cell's scope and a click there pins it, and a click on an
-/// fslim block's state label pins the lens on that state's instrument.
 #[test]
 fn the_decks_rows_cells_and_state_labels_open_their_lens() {
     use crate::stats_paint::HitKind;
@@ -672,7 +633,6 @@ fn the_decks_rows_cells_and_state_labels_open_their_lens() {
     assert_eq!(r.sent(), "", "the program sees none of the rest");
 }
 
-/// On the Deck, a rest on the header opens How to read.
 #[test]
 fn a_rest_on_the_decks_header_opens_how_to_read() {
     let mut r = rig("deck");
@@ -694,10 +654,6 @@ fn a_rest_on_the_decks_header_opens_how_to_read() {
     );
 }
 
-/// Why now's "this tab" is every pane of the window's front tab, the focused
-/// first (`App::deck_tab_panes`, the panes the vitals request sends as one
-/// tab): the split keys a tab split into panes by its least session, so a
-/// focused pane past it still reads the tab's part, never "not read".
 #[test]
 fn why_now_reads_the_front_tab_by_every_pane() {
     use aterm_vitals::explain::fixtures;
@@ -794,7 +750,6 @@ fn the_tree_reads_the_deck_and_its_lens() {
             .all(|(name, words)| !name.is_empty() && !words.is_empty())
     );
     assert!(lens.wells.iter().all(|(name, _)| name != "Why now"));
-    // With a cause open in the engine's facts, Why now is read too.
     let mut snap = r
         .app
         .vitals
@@ -856,9 +811,6 @@ fn the_tree_reads_the_deck_and_its_lens() {
     );
 }
 
-/// No lens opens in a window too small to show one, and an open lens closes
-/// when the window shrinks under it, so no invisible lens swallows the
-/// arrows.
 #[test]
 fn no_lens_opens_or_stays_where_none_can_show() {
     let mut r = rig("sill");
@@ -876,9 +828,6 @@ fn no_lens_opens_or_stays_where_none_can_show() {
     assert_eq!(r.lens(), None);
 }
 
-/// The sill's instruments take the pointer before the grid does: a program
-/// reporting every motion sees none over an instrument, nor its wheel or a
-/// right press, and sees all of them over the grid next to it.
 #[test]
 fn the_sills_instruments_take_motion_presses_and_the_wheel_before_the_grid() {
     let mut r = rig("sill");
@@ -903,8 +852,6 @@ fn the_sills_instruments_take_motion_presses_and_the_wheel_before_the_grid() {
     assert_eq!(r.sent(), "", "over an instrument, the sill takes them");
 }
 
-/// View ▸ Stats Bars' checkmark is the applied form: each config apply
-/// republishes it, and so does the wait's menu publish.
 #[test]
 fn the_stats_bars_checkmark_follows_the_applied_form() {
     let mut app = App::headless_for_test();
@@ -936,11 +883,6 @@ fn the_stats_bars_checkmark_follows_the_applied_form() {
     assert_eq!(checked(), [Some(false), Some(false), Some(true)]);
 }
 
-/// View ▸ Deck Size round-trips: each radio row names its choice, its tag
-/// and its invoke name; the config's word is the applied choice, the native
-/// radio's checkmark and the palette's; choosing one with no config lane to
-/// write it says so and keeps the durable choice, and choosing the applied
-/// one writes and says nothing.
 #[test]
 fn the_deck_size_setting_round_trips_through_the_config_and_the_menu() {
     use crate::stats_plan::DeckSizePref;
@@ -1001,8 +943,6 @@ fn the_deck_size_setting_round_trips_through_the_config_and_the_menu() {
     assert_eq!(row.msg.title, "Couldn't set the stats deck's size to Full");
 }
 
-/// Choosing a form with no config lane to write it says so, and keeps the
-/// durable form; choosing the form already shown writes and says nothing.
 #[test]
 fn a_stats_bars_choice_that_cannot_be_saved_says_so() {
     let mut app = App::headless_for_test();
@@ -1025,8 +965,6 @@ fn a_stats_bars_choice_that_cannot_be_saved_says_so() {
     assert_eq!(row.msg.title, "Couldn't set the stats bars to Sill");
 }
 
-/// A change between the sill and off moves no row, column or head: the
-/// program sees no resize. The sill's lens closes with the form.
 #[test]
 fn switching_between_the_sill_and_off_regrids_nothing() {
     let mut r = rig("sill");

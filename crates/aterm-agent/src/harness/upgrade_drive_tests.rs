@@ -3116,6 +3116,21 @@ fn an_agent_on_a_pty_the_tab_does_not_own_is_never_driven_through_the_tab() {
             hit
         })
     };
+    // The agent as `visit` judges it: the stand-in itself (its argv; until it execs, the host's
+    // own program is a fork of this same binary, which `wait_exec` passes before the host's
+    // `setsid`), its group its own and the pty's foreground (`ids`: `pgid == tpgid == pid`).
+    let leads = |agent: u32| {
+        (0..3_000).any(|_| {
+            let led = atpkg::caller_shell::process_args(agent)
+                .is_some_and(|a| a.argv.get(1).is_some_and(|w| w == PARK[0]))
+                && ids(agent)
+                    .is_some_and(|(_, pgid, tpgid)| pgid == i64::from(agent) && tpgid == pgid);
+            if !led {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            led
+        })
+    };
     for in_shell in [true, false] {
         let dir = scratch(if in_shell { "pty" } else { "pty-own" });
         let opts = drive(&dir);
@@ -3136,7 +3151,10 @@ fn an_agent_on_a_pty_the_tab_does_not_own_is_never_driven_through_the_tab() {
         } else {
             child_of(host.id()).expect("the agent, the host's own program")
         };
-        wait_exec(agent);
+        assert!(
+            leads(agent),
+            "{in_shell}: the agent {agent} never led the host's pty"
+        );
         let owner = ps_name(host.id()).expect("the host, as ps names it");
         let sf = register(&opts.home, agent, SESSION);
         let got = visit(&opts, &sf, &table(), &newer(), &Live);

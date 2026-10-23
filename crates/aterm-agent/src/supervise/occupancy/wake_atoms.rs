@@ -1,32 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH PATHS A WAKE MAY WATCH (`docs/DESIGN-harness-occupancy-2026-10-20.md` §3.3, §5 "a file
-//! oracle"; the slice-2 plan's S5, S6): [`admit`], lexical first, and only then an injected
-//! [`PathProbe`] that reads a link without following one.
-//!
-//! A path is admitted only under the session's roots (its working directories and
-//! `~/scratch.noindex`, never one at or above the home folder), outside every privacy-guarded
-//! root (a `stat` there can put a consent dialog on the owner's screen), with no `.` or `..` and
-//! no dot-named component, with no credential's name below its root, and only for a session
-//! that runs under the user containment. Every refusal is decided before the probe is asked
-//! anything, so a refused path is never touched. Pure: the probe is the caller's (an `lstat`, in
-//! the window's host).
-//!
-//! The judgement reads one spelling of a folder, so it refuses the spellings the volume would
-//! read as another: names are compared without ASCII case, as the home volume compares them; a
-//! name outside ASCII (but the home's own) is refused, since the volume's Unicode folding reads
-//! `De\u{17f}ktop` (a long s) and `Des\u{212a}top` (a Kelvin sign) as `Desktop`; and the data
-//! volume's own mount ([`DATA_VOLUME`]), under which every firmlinked folder (`/Users` among them)
-//! has a second spelling, is guarded whole.
+//! WHICH PATHS A WAKE MAY WATCH.
 
 use std::path::{Path, PathBuf};
 
 /// The longest path a wake may name, in bytes.
 pub const PATH_MAX: usize = 1024;
 
-/// The data volume's own mount: `/System/Volumes/Data/Users/<me>` is the home again, so a root or
-/// a path under it is guarded.
+/// The data volume's own mount: `/System/Volumes/Data/Users/<me>` is the home again.
 pub const DATA_VOLUME: &str = "/System/Volumes/Data";
 
 /// The session's containment, as admission reads it: file atoms are the user containment's alone.
@@ -55,9 +37,7 @@ pub enum Probed {
     Other,
 }
 
-/// THE PROBE ADMISSION ASKS, injected: what is at a path, read as `lstat` reads it (a link is
-/// never followed). Asked only of paths admission has found lexically admissible, each from its
-/// shallowest folder down, so no ask resolves a link it has not already seen.
+/// THE PROBE ADMISSION ASKS, injected: what is at a path, read as `lstat` reads it.
 pub trait PathProbe {
     /// What is at `path`.
     fn probe(&self, path: &Path) -> Probed;
@@ -130,8 +110,7 @@ impl PathRefusal {
     }
 }
 
-/// THE SESSION'S ROOTS: the home folder they are judged against and the folders a wake may watch
-/// under.
+/// Session roots: the home folder and the folders a wake is permitted to watch under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Roots {
     /// The home folder (`~`).
@@ -140,10 +119,7 @@ pub struct Roots {
     pub dirs: Vec<PathBuf>,
 }
 
-/// THE ROOTS OF A SESSION whose home is `home`: `scratch` (`~/scratch.noindex`) and each of
-/// `cwds` (the tab's, its jobs'), less any that is not absolute, names a dot component, lies at
-/// or above `home` in any case (the whole home is never a root), spells a name outside ASCII
-/// that the home does not, or lies inside a `protected` root or the data volume's mount.
+/// THE ROOTS OF A SESSION whose home is `home`.
 #[must_use]
 pub fn roots(home: &Path, cwds: &[PathBuf], scratch: &Path, protected: &[PathBuf]) -> Roots {
     let home_segs = absolute_segments(home);
@@ -173,16 +149,8 @@ pub fn roots(home: &Path, cwds: &[PathBuf], scratch: &Path, protected: &[PathBuf
     }
 }
 
-/// THE ADMISSION OF A WAKE'S PATH (`path` as declared: absolute, or `~/…` when `home_relative`),
-/// in order: the session's containment, the length, a control character, a relative path, a dot
-/// component, a name outside ASCII, a guarded root (the data volume's mount among them), the
-/// roots (matched as spelled), a credential's name below the root; then, only for a
-/// path all of that admits, `probe` from the path's shallowest folder in the home (or the
-/// filesystem's root, for a root beside the home) down, refusing at the first link and stopping
-/// at the first missing component.
-///
+/// Admit a declared wake `path` (absolute, or `~/…` when `home_relative`) against `roots`.
 /// # Errors
-///
 /// [`PathRefusal`]: the first reason, before any probe for every lexical one.
 pub fn admit(
     path: &str,
@@ -257,7 +225,6 @@ pub fn admit(
     })
 }
 
-/// `text`'s components, split on `/`, empty ones dropped.
 fn split(text: &str) -> Vec<String> {
     text.split('/')
         .filter(|s| !s.is_empty())
@@ -265,24 +232,19 @@ fn split(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// An absolute path's components; `None` for a relative one or one not UTF-8.
 fn absolute_segments(path: &Path) -> Option<Vec<String>> {
     let text = path.to_str()?;
     text.starts_with('/').then(|| split(text))
 }
 
-/// The absolute path of `segs`.
 fn joined(segs: &[String]) -> PathBuf {
     PathBuf::from(format!("/{}", segs.join("/")))
 }
 
-/// `segs` without case, as the home volume compares names.
 fn fold(segs: &[String]) -> Vec<String> {
     segs.iter().map(|s| s.to_ascii_lowercase()).collect()
 }
 
-/// Whether every component of `segs` is ASCII, but those of a leading run spelled as the home's
-/// own: only there does [`fold`] compare as the volume does.
 fn plain(segs: &[String], home: Option<&[String]>) -> bool {
     let below = match home {
         Some(home) if segs.starts_with(home) => &segs[home.len()..],
@@ -291,13 +253,10 @@ fn plain(segs: &[String], home: Option<&[String]>) -> bool {
     below.iter().all(|s| s.is_ascii())
 }
 
-/// Whether a component is `.`, `..` or dot-named.
 fn dotted(seg: &str) -> bool {
     seg.starts_with('.')
 }
 
-/// Whether a component names a credential: `*credential*`, `*secret*`, `*token*`, `*.pem`,
-/// `*.key` or `id_*`, in any case.
 fn credential(seg: &str) -> bool {
     let seg = seg.to_ascii_lowercase();
     ["credential", "secret", "token"]
@@ -308,9 +267,6 @@ fn credential(seg: &str) -> bool {
         || seg.starts_with("id_")
 }
 
-/// Whether `segs` lies at or under a `protected` root or [`DATA_VOLUME`], compared without case
-/// (the home volume's names fold case). A root above the home (the folder of every user's home)
-/// guards everything under it but the home itself.
 fn guarded(segs: &[String], home: Option<&[String]>, protected: &[PathBuf]) -> bool {
     let path = fold(segs);
     if path.starts_with(&fold(&split(DATA_VOLUME))) {

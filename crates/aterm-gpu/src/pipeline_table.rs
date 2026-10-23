@@ -1164,10 +1164,24 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_ATLAS,
     },
+    PipelineSpec {
+        label: "aterm-gpu fx store pipeline",
+        library: ShaderLibrary::Cell,
+        vs: "vs_fx",
+        fs: "fs_fx_store",
+        target: TargetRole::OffscreenSrgb,
+        blend: None,
+        write_mask: WriteMask::Color,
+        vertex: VertexLayout::Fx,
+        #[cfg(any(wgpu_arm, gl_arm, test))]
+        topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", gl_arm))]
+        binds: BindSpec::FX,
+    },
 ];
 
 /// Total number of entries in [`PIPELINES`].
-pub(crate) const PIPELINE_COUNT: usize = 21;
+pub(crate) const PIPELINE_COUNT: usize = 22;
 
 /// Identifier and index into [`PIPELINES`] for each render pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1219,6 +1233,8 @@ pub(crate) enum Pipeline {
     FxLinear = 19,
     /// The knock-out: the deco-over blend onto RGB only, the page's alpha kept.
     KnockOver = 20,
+    /// Exact fx layers whose every drawn pixel is opaque, stored on the sRGB view.
+    FxStore = 21,
 }
 
 /// All [`Pipeline`] variants in row order.
@@ -1245,6 +1261,7 @@ pub(crate) const ALL_PIPELINES: [Pipeline; PIPELINE_COUNT] = [
     Pipeline::Fx,
     Pipeline::FxLinear,
     Pipeline::KnockOver,
+    Pipeline::FxStore,
 ];
 
 impl Pipeline {
@@ -1280,6 +1297,106 @@ impl Pipeline {
             Self::Fx => "fx",
             Self::FxLinear => "fx_linear",
             Self::KnockOver => "knock_over",
+            Self::FxStore => "fx_store",
+        }
+    }
+}
+
+/// The framebuffer-fetch twin of a Unorm-law row (Metal on an Apple GPU, design §5 lane B6): the row's vertex stage, layout and binds, drawn into the sRGB view with no fixed-function blend under the row's write mask, by a fragment (`*_fetch` in `cell.metal`, compiled under `ATERM_FETCH`) that applies the row's blend in exact integers to the byte it reads back.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(usize)]
+pub(crate) enum FetchTwin {
+    /// [`Pipeline::GlowAdd`]'s twin: `over_premul`.
+    GlowAdd = 0,
+    /// [`Pipeline::RainGlow`]'s twin: `add_sat`.
+    RainGlow = 1,
+    /// [`Pipeline::RainGlowOver`]'s twin: `over_rgb`.
+    RainGlowOver = 2,
+    /// [`Pipeline::FireAdd`]'s twin: `add_sat`.
+    FireAdd = 3,
+    /// [`Pipeline::FireOver`]'s twin: `over_rgb`.
+    FireOver = 4,
+    /// [`Pipeline::DecoAdd`]'s twin: `add_sat` of `premul_rgb`.
+    DecoAdd = 5,
+    /// [`Pipeline::Fx`]'s twin: `over_premul`.
+    Fx = 6,
+}
+
+/// How many [`FetchTwin`]s exist.
+#[cfg(target_os = "macos")]
+pub(crate) const FETCH_TWIN_COUNT: usize = 7;
+
+#[cfg(target_os = "macos")]
+impl FetchTwin {
+    /// Every twin, in discriminant order.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; FETCH_TWIN_COUNT] = [
+        Self::GlowAdd,
+        Self::RainGlow,
+        Self::RainGlowOver,
+        Self::FireAdd,
+        Self::FireOver,
+        Self::DecoAdd,
+        Self::Fx,
+    ];
+
+    /// The twin of `row`, or `None` for a row that draws on the sRGB view or outside the frame plan.
+    #[inline]
+    pub(crate) const fn of(row: Pipeline) -> Option<Self> {
+        Some(match row {
+            Pipeline::GlowAdd => Self::GlowAdd,
+            Pipeline::RainGlow => Self::RainGlow,
+            Pipeline::RainGlowOver => Self::RainGlowOver,
+            Pipeline::FireAdd => Self::FireAdd,
+            Pipeline::FireOver => Self::FireOver,
+            Pipeline::DecoAdd => Self::DecoAdd,
+            Pipeline::Fx => Self::Fx,
+            _ => return None,
+        })
+    }
+
+    /// The row this twin stands in for.
+    #[inline]
+    pub(crate) const fn row(self) -> Pipeline {
+        match self {
+            Self::GlowAdd => Pipeline::GlowAdd,
+            Self::RainGlow => Pipeline::RainGlow,
+            Self::RainGlowOver => Pipeline::RainGlowOver,
+            Self::FireAdd => Pipeline::FireAdd,
+            Self::FireOver => Pipeline::FireOver,
+            Self::DecoAdd => Pipeline::DecoAdd,
+            Self::Fx => Pipeline::Fx,
+        }
+    }
+
+    /// The twin's fragment entry point and label.
+    #[inline]
+    const fn fs_and_label(self) -> (&'static str, &'static str) {
+        match self {
+            Self::GlowAdd => ("fs_glow_fetch", "aterm-gpu glow fetch twin"),
+            Self::RainGlow => ("fs_rain_glow_fetch", "aterm-gpu rain halo fetch twin"),
+            Self::RainGlowOver => (
+                "fs_rain_glow_over_fetch",
+                "aterm-gpu rain halo over fetch twin",
+            ),
+            Self::FireAdd => ("fs_fire_add_fetch", "aterm-gpu fire add fetch twin"),
+            Self::FireOver => ("fs_fire_over_fetch", "aterm-gpu fire over fetch twin"),
+            Self::DecoAdd => ("fs_deco_add_fetch", "aterm-gpu deco-add fetch twin"),
+            Self::Fx => ("fs_fx_fetch", "aterm-gpu fx fetch twin"),
+        }
+    }
+
+    /// The twin's pipeline: its row's spec, with the twin's fragment, the sRGB view and no fixed-function blend.
+    #[inline]
+    pub(crate) const fn spec(self) -> PipelineSpec {
+        let (fs, label) = self.fs_and_label();
+        PipelineSpec {
+            label,
+            fs,
+            target: TargetRole::OffscreenSrgb,
+            blend: None,
+            ..*self.row().spec()
         }
     }
 }

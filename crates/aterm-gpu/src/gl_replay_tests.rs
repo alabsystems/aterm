@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GL arm against wgpu on the same driver: a frame rendered by the wgpu path records its plan (draw items, load, scissor, instance bytes, atlases, uniforms, band shift, apron), and [`GpuRenderer::gl_replay_recorded_plan_for_test`] replays it through the GL arm via the shared `run_frame_plan`.
+//! Differential tests replaying recorded wgpu frame plans on the GL arm.
 
 use super::*;
 use crate::device_layer::{
@@ -356,15 +356,10 @@ pub(crate) struct ReplayOpts<'a> {
     pub(crate) downlevel: bool,
 }
 
-/// A wgpu context on exactly `backends` (the oracle's driver choice), or why
-/// there is none: the instance and the lock [`GpuContext::new`] takes, so
-/// the oracles of tests running side by side meet as its contexts do.
 fn wgpu_ctx_on(backends: wgpu::Backends) -> Result<GpuContext, String> {
     GpuContext::one_at_a_time(crate::instance_descriptor(backends))
 }
 
-/// The oracle renderer on `backends`, and the GL device; a machine without
-/// either could not run the differential.
 fn arms_on(backends: wgpu::Backends) -> (GpuRenderer, GlDevice) {
     let ctx = wgpu_ctx_on(backends)
         .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no wgpu {backends:?}: {e}")));
@@ -381,7 +376,6 @@ fn arms_on(backends: wgpu::Backends) -> (GpuRenderer, GlDevice) {
 const ROWS: usize = 6;
 const COLS: usize = 24;
 
-/// The differential's fixtures, each with the streams it claims to drive.
 fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput, Vec<StreamId>)> {
     use StreamId as S;
     use aterm_core::render::{
@@ -661,20 +655,12 @@ fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput
     out
 }
 
-/// The colour-emoji face the renderer's Linux fallback chain finds first
-/// (`aterm_render`'s emoji candidates); the Linux lane provisions it.
 const COLOUR_FACE: &str = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
 
-/// Whether this host has [`COLOUR_FACE`], read from the file, never from a
-/// frame, so a renderer that lost its colour glyphs fails the claim rather
-/// than blaming the host.
 fn colour_face_installed() -> bool {
     std::path::Path::new(COLOUR_FACE).is_file()
 }
 
-/// End a differential that passed every fixture it could build COULD NOT
-/// RUN when the host has no colour face: its `colour_emoji` fixture, the
-/// colour row's only GL differential, was not built.
 fn end_unless_the_colour_row_ran() {
     if !colour_face_installed() {
         aterm_spec::host::could_not_run(format!(
@@ -683,10 +669,6 @@ fn end_unless_the_colour_row_ran() {
     }
 }
 
-/// The image plane, which the replay does not reach (it keeps to the glyph
-/// and sprite atlases): a placement over the text and one under it, for the
-/// armed differentials, whose renderers upload the plane through their own
-/// residency.
 fn image_fixture(gpu: &GpuRenderer) -> (&'static str, RenderInput, Vec<StreamId>) {
     use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef, ImageScaling};
     use aterm_core::terminal::Terminal;
@@ -734,12 +716,6 @@ fn image_fixture(gpu: &GpuRenderer) -> (&'static str, RenderInput, Vec<StreamId>
     )
 }
 
-/// The fx engine's five streams over text (docs/DESIGN-card-engine-2026-10-19.md
-/// §4.5): Exact layers at Under (an additive two-end rect and a ramps stack),
-/// Glow (an Index8 sprite, flipped, at an odd scale, over additive and
-/// source-over entries) and Over (a translucent rect and a Premul sprite with
-/// additive, clear, translucent and opaque texels), and Linear layers at Under
-/// and Over (a tinted Straight sprite, one flipped).
 fn fx_fixture(gpu: &GpuRenderer) -> (&'static str, RenderInput, Vec<StreamId>) {
     use aterm_core::render::{
         FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps, FxRect, FxSlot, FxSpace,
@@ -894,7 +870,6 @@ fn fx_fixture(gpu: &GpuRenderer) -> (&'static str, RenderInput, Vec<StreamId>) {
     )
 }
 
-/// Every pixel equal, else a panic naming the first differing texel.
 fn assert_frames_identical(name: &str, expected: &Frame, actual: &Frame) {
     assert_eq!(
         (expected.width, expected.height),
@@ -929,7 +904,6 @@ fn assert_frames_identical(name: &str, expected: &Frame, actual: &Frame) {
     );
 }
 
-/// Render every fixture on the oracle, replay it on the GL arm, compare.
 fn run_differential(backends: wgpu::Backends, glow_add: bool) -> Vec<String> {
     let (mut gpu, dev) = arms_on(backends);
     let mut win = WindowGpu::new();
@@ -987,15 +961,12 @@ fn run_differential(backends: wgpu::Backends, glow_add: bool) -> Vec<String> {
     lines
 }
 
-/// The plain text frame the cursor fixture draws.
 fn fixtures_base_for_cursor() -> RenderInput {
     let mut term = aterm_core::terminal::Terminal::new(ROWS as u16, COLS as u16);
     term.process(b"$ cursor blend >_\r\n");
     term.cell_frame(ROWS, COLS)
 }
 
-/// Against wgpu's GL backend on the same driver: the downlevel plan, every
-/// row wgpu's GL backend can build.
 #[test]
 fn gl_frames_match_wgpu_gles_byte_for_byte() {
     for line in run_differential(wgpu::Backends::GL, false) {
@@ -1004,8 +975,6 @@ fn gl_frames_match_wgpu_gles_byte_for_byte() {
     end_unless_the_colour_row_ran();
 }
 
-/// Against wgpu's Vulkan backend on the same driver (Linux's production
-/// renderer before the flip): the native plan, every row.
 #[test]
 fn gl_frames_match_wgpu_vulkan_byte_for_byte() {
     for line in run_differential(wgpu::Backends::VULKAN, true) {
@@ -1014,8 +983,6 @@ fn gl_frames_match_wgpu_vulkan_byte_for_byte() {
     end_unless_the_colour_row_ran();
 }
 
-/// The negative control: one flipped instance byte in the GL replay is a
-/// visible difference, so the differentials above cannot pass vacuously.
 #[test]
 fn a_flipped_instance_byte_breaks_the_gl_replay() {
     let (mut gpu, dev) = arms_on(wgpu::Backends::GL);
@@ -1047,8 +1014,6 @@ fn a_flipped_instance_byte_breaks_the_gl_replay() {
     );
 }
 
-/// The negative control for the view emulation: on the native plan, the
-/// additive rows draw through the raw (Unorm) view.
 #[test]
 fn the_raw_view_is_what_makes_the_native_plan_match() {
     let (mut gpu, dev) = arms_on(wgpu::Backends::VULKAN);
@@ -1088,12 +1053,6 @@ fn the_raw_view_is_what_makes_the_native_plan_match() {
     );
 }
 
-/// The production path, armed: a renderer with the GL arm armed draws every
-/// readback frame on GL (`encode_frame`'s GL tail, the glide and apron on the
-/// GL offscreen, the GL readback) and must equal an unarmed renderer's wgpu
-/// Vulkan frame byte for byte, on every fixture, three frames each (the
-/// second and third reuse the arm's residency: streams, atlases, programs,
-/// the offscreen).
 #[test]
 fn armed_gl_readbacks_match_the_wgpu_arm_byte_for_byte() {
     let (mut oracle, _dev) = arms_on(wgpu::Backends::VULKAN);
@@ -1132,11 +1091,6 @@ fn armed_gl_readbacks_match_the_wgpu_arm_byte_for_byte() {
     end_unless_the_colour_row_ran();
 }
 
-/// The readback's present-time layers on the armed GL arm: bloom (the glow
-/// extract into a half-resolution target and the screen composite), heat
-/// shimmer (stage copy and refract, phase pinned) and the tray card, each in
-/// the shared order, against an unarmed renderer's wgpu Vulkan frame byte for
-/// byte.
 #[test]
 fn armed_gl_effect_layers_match_the_wgpu_arm_byte_for_byte() {
     use aterm_core::render::{FireMode, FirePatch};
@@ -1227,8 +1181,6 @@ fn armed_gl_effect_layers_match_the_wgpu_arm_byte_for_byte() {
     );
 }
 
-/// One virtual present's exact destination bytes (straight sRGB RGBA8, the
-/// tap's decode of either arm's destination format).
 fn presented(
     gpu: &mut GpuRenderer,
     win: &mut WindowGpu,
@@ -1269,14 +1221,6 @@ fn presented(
     }
 }
 
-/// The production present path, armed: a renderer on the GL arm composes its
-/// presents (the dirty-row scissor over the resident offscreen, the present
-/// copy, bloom, shimmer, the sub-row glide with its apron, the card, the
-/// letterbox blit with the bell inversion and the drop overlay, the SDR
-/// crown) into its virtual target, and the destination must equal an unarmed
-/// renderer's wgpu Vulkan present byte for byte: every fixture presented three
-/// times (the second and third take the scissored path over the resident
-/// frame), then a changed row, then a cropped, letterboxed destination.
 #[test]
 fn armed_gl_presents_match_the_wgpu_arm_byte_for_byte() {
     let (mut oracle, _d1) = arms_on(wgpu::Backends::VULKAN);
@@ -1383,9 +1327,6 @@ fn armed_gl_presents_match_the_wgpu_arm_byte_for_byte() {
     end_unless_the_colour_row_ran();
 }
 
-/// The negative control for the present differential: the bell inversion and
-/// a changed row each change the armed GL present, so the agreement above is
-/// the composition's, not two blank destinations'.
 #[test]
 fn a_changed_present_changes_the_gl_destination() {
     let (mut armed, _d) = arms_on(wgpu::Backends::VULKAN);
@@ -1414,11 +1355,6 @@ fn a_changed_present_changes_the_gl_destination() {
     );
 }
 
-/// The GL arm's device-loss route: the injected-loss drill fires after the
-/// first armed present, the next frame's first `eglMakeCurrent` reports
-/// `EGL_CONTEXT_LOST`, that present drops, and the renderer reports the device
-/// lost with its cause, which is what sends the frontend to the CPU renderer
-/// (`recover_from_gpu_loss`).
 #[test]
 fn a_lost_gl_context_reaches_device_lost() {
     let input = fixtures_base_for_cursor();
@@ -1466,8 +1402,6 @@ fn a_lost_gl_context_reaches_device_lost() {
     assert!(reason.contains("EGL_CONTEXT_LOST"), "{reason}");
 }
 
-/// The heat-shimmer scene: an additive fire patch under a comet's glow, the
-/// fixture `armed_gl_effect_layers_match_the_wgpu_arm_byte_for_byte` draws.
 fn heat_input(gpu: &GpuRenderer) -> RenderInput {
     use aterm_core::render::{FireMode, FirePatch};
     use aterm_render::{GlowQuad, premul_rgb};
@@ -1507,10 +1441,6 @@ fn heat_input(gpu: &GpuRenderer) -> RenderInput {
     input
 }
 
-/// The video tap on the GL arm records exactly what the GL arm presents: a
-/// recording of three headless presents (a static frame, a glide frame, a
-/// changed row) equals, frame for frame, the wgpu arm's recording of the same
-/// presents, and its format names the GL destination.
 #[test]
 fn the_gl_video_tap_records_what_the_wgpu_tap_records() {
     let (mut oracle, _d1) = arms_on(wgpu::Backends::VULKAN);

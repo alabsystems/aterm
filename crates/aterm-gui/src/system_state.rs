@@ -789,8 +789,6 @@ impl NativeAppModel for SystemStateApp {
         use crate::native_ui::{AuditedCustomNode, RAINBOW_BANNER_AUDIT};
         let width = cx.viewport.width;
         let compact = width < 720.0;
-        // Every page keeps the narrow margin: a wider one would cost a short page rows of its
-        // checklist, and switching to it as a page grew took rows away.
         let padding = 12.0;
         let inner = (width - padding * 2.0).max(1.0);
         let reviewed_plan = self.reviewed_plan();
@@ -812,8 +810,6 @@ impl NativeAppModel for SystemStateApp {
             None,
         );
         let label_w = (inner - 94.0).max(30.0);
-        // A row is as tall as its setting's name, so its state words (a Check under way, a switch
-        // turned off) never resize the checklist.
         let names = Setting::ALL.map(|setting| wrap_lines(setting.label(), label_w, None));
         let row_h = |lines: usize| (lines as f32 * 20.0 + 8.0).max(38.0);
         let results: Vec<String> = self
@@ -823,15 +819,6 @@ impl NativeAppModel for SystemStateApp {
             .collect();
         let total = Setting::ALL.len() + results.len();
         let start = view.scroll.min(total.saturating_sub(1));
-        // A page with no room for the checklist's two tallest neighbouring rows and the scroll
-        // caption gives up, in turn, the banner, the restore hint (and a narrow page's second
-        // row of buttons, where their short faces fit in one), and the vault hint. One with no
-        // room for a one-line row and the caption then gives up the title and the guidance's
-        // third and second lines. Shorter than that, the buttons pass the bottom edge: the
-        // guidance's first line, where an offer's countdown and a result show, stays. A first
-        // window (80×24 under the vitals band) leaves System State 334 points. Each choice reads
-        // the page's size alone, never the guidance, a result or a row's state, so nothing a
-        // click or a result changes moves the fields or the buttons.
         struct Fit {
             shown: usize,
             title: bool,
@@ -859,8 +846,6 @@ impl NativeAppModel for SystemStateApp {
             help_lines,
             wants,
         });
-        // The checklist's room under a fit, after the margin, the parts it shows, the rows' gap,
-        // the vault fields with theirs, and the buttons.
         let room = |fit: &Fit, stacked: bool| {
             let optional = [vault_h + 6.0, restore_h + 6.0, 48.0 + 6.0];
             cx.viewport.height
@@ -895,10 +880,6 @@ impl NativeAppModel for SystemStateApp {
             one_row_share
         };
         let pending = self.pending() && !self.clock.interacted();
-        // Apply's face carries an offer's countdown where it has room for it and Apply is on the
-        // page (a second row of buttons sits 44 points under it); elsewhere the guidance leads
-        // with the countdown, its figure first so no cut drops it. Either way the guidance says
-        // how to stop it, ahead of any result.
         let on_face = label_fits(counting, share)
             && room(fit, stacked) + if stacked { 44.0 } else { 0.0 } >= 0.0;
         let warning = pending.then_some(if on_face {
@@ -912,9 +893,6 @@ impl NativeAppModel for SystemStateApp {
             (None, Some(summary)) => summary.clone(),
             (None, None) => "Choose your Mac settings, then Apply.".to_owned(),
         };
-        // The guidance is laid out for the countdown's widest figure, so its lines hold still as
-        // it counts down, and was counted at its fit's lines: the lines it leaves go to the
-        // checklist.
         let mut guidance = wrapped_lines(&words, inner, Some(fit.help_lines));
         if pending
             && !on_face
@@ -933,8 +911,6 @@ impl NativeAppModel for SystemStateApp {
             StyleRef::Secondary,
         );
         let room = (room(fit, stacked) + fit.help_lines as f32 * 20.0 - help_h).max(34.0);
-        // A row taller than the checklist's room beside its scroll caption ends on its last whole
-        // line with an ellipsis, so the checklist's edge never cuts a row.
         let rows_room = (room - 20.0).max(34.0);
         let lines_in = |height: f32| ((height / 20.0).floor() as usize).max(1);
         let mut rows = Vec::new();
@@ -1055,8 +1031,6 @@ impl NativeAppModel for SystemStateApp {
         } else {
             "Apply".to_owned()
         };
-        // A button whose widest label does not fit shows its short face, so a countdown never
-        // changes Apply's.
         let mut buttons = [
             ("apply", apply, counting, "Apply"),
             ("cancel", "Cancel".to_owned(), "Cancel", "Cancel"),
@@ -1075,7 +1049,6 @@ impl NativeAppModel for SystemStateApp {
             if short != spec.label && !label_fits(widest, share) {
                 spec = spec.visual_label(short);
             }
-            // A short page leaves out the restore hint, and VoiceOver still reads it here.
             if name == "restore" {
                 spec = spec.description(restore_words);
             }
@@ -1194,7 +1167,6 @@ impl NativeAppModel for SystemStateApp {
                 false,
                 None,
             ),
-            // A short page leaves out the vault hint, and VoiceOver still reads it here.
             self.field(
                 view,
                 "system-state/password",
@@ -1443,7 +1415,6 @@ fn text(
     .layout(Layout::default().height(Length::Fixed(height)))
 }
 
-/// Whether the painter draws `line` whole in `width`.
 fn line_fits(line: &str, width: f32) -> bool {
     use crate::native_ui::MAX_VISUAL_GRAPHEMES;
     (line.len() <= MAX_VISUAL_GRAPHEMES
@@ -1452,9 +1423,6 @@ fn line_fits(line: &str, width: f32) -> bool {
             <= width + crate::native_ui::TEXT_FIT_SLACK
 }
 
-/// The most of `1..=count` for which `fits` holds, found by halving. The count it returns was
-/// measured to fit (or is 0), even where a longer run measures narrower, as one ending in a
-/// zero-width grapheme can.
 fn most_fitting(count: usize, fits: impl Fn(usize) -> bool) -> usize {
     let (mut fitting, mut over) = (0, count + 1);
     while over - fitting > 1 {
@@ -1468,7 +1436,6 @@ fn most_fitting(count: usize, fits: impl Fn(usize) -> bool) -> usize {
     fitting
 }
 
-/// The byte offsets at which each grapheme of `text` ends.
 fn grapheme_ends(text: &str) -> Vec<usize> {
     text.grapheme_indices()
         .map(|(at, _)| at)
@@ -1477,20 +1444,14 @@ fn grapheme_ends(text: &str) -> Vec<usize> {
         .collect()
 }
 
-/// `words` in lines the painter draws whole in `width`, a word too long for one (a path, a URL)
-/// broken between graphemes. With `most`, it stops at one line past that many.
 fn wrap_lines(words: &str, width: f32, most: Option<usize>) -> Vec<String> {
     use crate::native_ui::MAX_VISUAL_GRAPHEMES;
     let most = most.unwrap_or(usize::MAX);
     let pieces = aterm_grapheme::pieces(words, aterm_grapheme::BreakKind::is_word_boundary);
     let mut lines: Vec<String> = Vec::new();
-    // The line being filled: empty, or the end of a word broken between graphemes.
     let mut line = String::new();
     let mut at = 0;
     while at < pieces.len() && lines.len() <= most {
-        // Each line takes the most pieces that fit, found by halving, so a line is measured a
-        // handful of times however many pieces it holds. It holds at most the painter's 256
-        // graphemes, so at most that many pieces.
         let window = &pieces[at..pieces.len().min(at + MAX_VISUAL_GRAPHEMES)];
         let joined = |count: usize| {
             let mut joined = line.clone();
@@ -1512,8 +1473,6 @@ fn wrap_lines(words: &str, width: f32, most: Option<usize>) -> Vec<String> {
         } else if !line.is_empty() {
             lines.push(std::mem::take(&mut line));
         } else {
-            // A piece too wide for a line of its own breaks between graphemes, its last part
-            // starting the next line.
             let text = window[0].text;
             let ends = grapheme_ends(text);
             let (mut from, mut taken) = (0, 0);
@@ -1544,8 +1503,6 @@ fn wrap_lines(words: &str, width: f32, most: Option<usize>) -> Vec<String> {
     lines
 }
 
-/// `line` cut to what fits in `width` with an ellipsis, where words after it were cut too: after
-/// its last whole word where it has one, and with no stop or separator before the ellipsis.
 fn elided(line: &str, width: f32) -> String {
     let ends = grapheme_ends(line);
     let kept = most_fitting(ends.len(), |count| {
@@ -1553,7 +1510,6 @@ fn elided(line: &str, width: f32) -> String {
     });
     let stem = &line[..kept.checked_sub(1).map_or(0, |at| ends[at])];
     let stem = match stem.rfind(char::is_whitespace) {
-        // A cut inside a word backs off to the word before it.
         Some(space)
             if stem.len() < line.len()
                 && !line[stem.len()..].starts_with(char::is_whitespace)
@@ -1576,7 +1532,6 @@ fn elided(line: &str, width: f32) -> String {
     )
 }
 
-/// `lines` cut to `limit`, the last it keeps ending in an ellipsis where any were cut.
 fn fit_lines(mut lines: Vec<String>, width: f32, limit: usize) -> Vec<String> {
     if lines.len() > limit {
         lines.truncate(limit.max(1));
@@ -1587,8 +1542,6 @@ fn fit_lines(mut lines: Vec<String>, width: f32, limit: usize) -> Vec<String> {
     lines
 }
 
-/// `lines` with `suffix` after the last where it fits, cut short with an ellipsis where only part
-/// of it does; the lines' own words are never cut.
 fn with_suffix(mut lines: Vec<String>, suffix: &str, width: f32) -> Vec<String> {
     let Some(last) = lines.last_mut() else {
         return lines;
@@ -1612,7 +1565,6 @@ fn with_suffix(mut lines: Vec<String>, suffix: &str, width: f32) -> Vec<String> 
     lines
 }
 
-/// `words` wrapped in `width`, cut to `max_lines` with an ellipsis.
 fn wrapped_lines(words: &str, width: f32, max_lines: Option<usize>) -> Vec<String> {
     let lines = wrap_lines(words, width, max_lines);
     match max_lines {
@@ -2269,10 +2221,6 @@ mod tests {
         assert!(!app.pending());
     }
 
-    /// The vault lines' preset turns the vault row on and the Mac settings rows off over
-    /// setup's own plan, keeps every other row and the vault field, queues nothing, waits
-    /// for the first read when none came yet, and moves nothing over an edit, under an offer
-    /// or while a run holds it.
     #[test]
     fn the_vault_sync_preset_moves_only_its_rows_and_never_over_an_edit_an_offer_or_a_run() {
         let mut read = Plan::default();
@@ -2433,13 +2381,6 @@ mod tests {
         }
     }
 
-    /// A first window is 80×24 under the vitals band: System State had 624×334 points in a
-    /// macOS 26.6 and 27.0 VM, where the page drew no checklist row and clipped Check and
-    /// Restore while its countdown ran. A short page, wide or narrow, leaves out its banner
-    /// and hints, then its title and the guidance's later lines, and puts its four buttons in
-    /// one row where their labels fit; a tall one keeps everything. What a page shows, and
-    /// where its fields and buttons sit, follows its size alone: never how far its list is
-    /// scrolled, an offer's countdown, a result, a Check under way or a switched-off row.
     #[test]
     fn a_short_page_keeps_the_checklist_apply_and_the_vault_fields_in_view() {
         use crate::native_ui::LogicalRect;
@@ -2531,15 +2472,11 @@ mod tests {
                         let compiled = compile(app, scroll, page);
                         let at = format!("a {state} {width}×{height} page scrolled to {scroll}");
                         let one_row = rect(&compiled, "system-state/actions/maintenance").is_none();
-                        // An offer's warning or a result's first line is always on the page.
                         assert!(
                             whole(&compiled, page, "system-state/help/0")
                                 || whole(&compiled, page, "system-state/summary/0"),
                             "the guidance in {at}"
                         );
-                        // Two rows of buttons fit whole under the fields from 216 points; one row
-                        // of the short labels, which fits from 347 points wide, from 172. Under
-                        // 182 points wide Restore's short face is cut.
                         if width >= 182.0 && (height >= 216 || width >= 360.0 && height >= 172) {
                             for key in ["system-state/url", "system-state/password"]
                                 .into_iter()
@@ -2548,7 +2485,6 @@ mod tests {
                                 assert!(whole(&compiled, page, key), "{key} in {at}");
                             }
                         }
-                        // Below that a button can pass the clip; its name keeps the countdown.
                         if let Some(apply) = compiled.semantic(&UiKey::new("system-state/apply")) {
                             assert_eq!(
                                 apply.label.contains('('),
@@ -2556,9 +2492,6 @@ mod tests {
                                 "Apply's countdown in its name in {at}"
                             );
                         }
-                        // The checklist's first row, however tall, and the caption under it fit
-                        // whole from 230 points with one row of buttons, 274 with two (the
-                        // grid's 238 and 286): a row taller than the room ends in an ellipsis.
                         if height >= 286 || height >= 238 && one_row {
                             let key = if scroll < Setting::ALL.len() {
                                 format!("system-state/setting/{scroll}")
@@ -2573,7 +2506,6 @@ mod tests {
                                 );
                             }
                         }
-                        // A result's lines come out of the checklist's room.
                         if width >= 624.0
                             && height >= 334
                             && scroll + 1 < Setting::ALL.len()
@@ -2621,8 +2553,6 @@ mod tests {
                 );
             }
             if width >= 624.0 {
-                // The page is laid out for a result's three lines, and the frame compared above
-                // held one line of guidance in one state and three of a result in another.
                 assert!(rect(&compile(&reported, 0, short), "system-state/summary/2").is_some());
                 assert!(rect(&compile(&plain, 0, short), "system-state/help/1").is_none());
                 let tall = LogicalRect::new(0.0, 0.0, width, 740.0);
@@ -2665,11 +2595,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Whether `key` paints whole on `page`: it paints, and every node it and its parts paint
-    /// lies on the page, is cut by no clip and draws its words unelided. A semantic rect is only
-    /// the part left visible. A switch's On and Off and a field's placeholder are the widgets'
-    /// own (a placeholder drops its "(optional)" where it must), so only the page's lines and
-    /// button faces are judged.
     fn whole(
         compiled: &crate::native_ui::CompiledUi,
         page: crate::native_ui::LogicalRect,
@@ -2693,16 +2618,11 @@ mod tests {
             })
     }
 
-    /// The words a text-fit audit line says were painted.
     fn painted(audit: &str) -> &str {
         let (_, rest) = audit.split_once("painted=\"").unwrap();
         rest.split('"').next().unwrap()
     }
 
-    /// Growing a page never takes a part, or a line of a result, away, nor a row of the
-    /// checklist but to make room for a part it brings back: every page keeps the one margin,
-    /// and a narrow page regroups its buttons only as it brings back its restore hint. The
-    /// title comes back only after every line of the result.
     #[test]
     fn a_taller_page_never_shows_less() {
         let mut reported = SystemStateApp::new(Plan::default());
@@ -2757,8 +2677,6 @@ mod tests {
                         "the result under the title at {width}×{height}"
                     );
                 }
-                // The checklist's label names the rows it shows, "rows 1–b of N", where it has
-                // room to show any.
                 let rows = compiled
                     .semantic(&UiKey::new("system-state/rows"))
                     .map_or(0, |node| {
@@ -2779,10 +2697,6 @@ mod tests {
         }
     }
 
-    /// An offer's countdown is always on the page, on Apply's whole face or leading the
-    /// guidance figure first, from 30 seconds to 1, at the default text size and the largest,
-    /// beside a result or not. The guidance says how to stop it wherever a line holds those
-    /// words, and nothing on the page moves or changes face as the countdown runs.
     #[test]
     fn an_offer_always_shows_its_countdown_and_how_to_stop() {
         use crate::native_appearance::{AppearancePreferences, install_preferences};
@@ -2891,9 +2805,6 @@ mod tests {
         let _ = install_preferences(AppearancePreferences::default());
     }
 
-    /// A row's state rides on its setting's last line where it fits; the name is never cut for
-    /// it. (A page too short for a row ends its name in an ellipsis, which the short-page sweep
-    /// holds whole.)
     #[test]
     fn a_settings_name_is_never_cut() {
         let plain = SystemStateApp::new(Plan::default());
@@ -2910,7 +2821,6 @@ mod tests {
         let off = SystemStateApp::new(Plan::from(aterm_types::macos_setup::Selection::none()));
         let squeeze = |words: &str| words.split_whitespace().collect::<String>();
         for width in 150..=800 {
-            // Tall enough for every row at every width.
             let page = crate::native_ui::LogicalRect::new(0.0, 0.0, width as f32, 4_000.0);
             for app in [&plain, &checking, &off] {
                 let compiled = compile_view(app, 0, page);
@@ -2958,7 +2868,6 @@ mod tests {
         let lines = wrap_lines(&long, 100_000.0, None);
         assert_eq!(lines.len(), 3, "the painter draws 256 graphemes of a line");
         assert_eq!(lines.join(" "), long.trim_end());
-        // A word thousands of graphemes long wraps into lines that fit and keep every grapheme.
         let word: String = (0..2_000)
             .map(|at| char::from(b'a' + (at % 26) as u8))
             .collect();
@@ -2968,8 +2877,6 @@ mod tests {
         assert_eq!(lines.concat(), word);
         assert_eq!(wrap_lines(&word, 156.0, Some(2)).len(), 3);
         assert_eq!(wrap_lines("", 80.0, None), vec![String::new()]);
-        // A run that measures narrower as it grows, as one ending in a zero-width grapheme can,
-        // never yields a count measured not to fit.
         let widths = [10.0, 20.0, 19.0, 30.0, 25.0, 40.0];
         for room in [0.0, 10.0, 19.5, 20.0, 26.0, 100.0] {
             let fitting = most_fitting(widths.len(), |count| widths[count - 1] <= room);
@@ -2978,8 +2885,6 @@ mod tests {
                 "{fitting} in {room}"
             );
         }
-        // An ellipsis follows a whole word, never part of one (a "1" of "15"), a stop or a
-        // separator.
         let line = "Setup: failed · Cancel was not saved. Try again after 15 seconds; 3 settings";
         for width in (60..=600).step_by(3) {
             let cut = elided(line, width as f32);
@@ -3002,8 +2907,6 @@ mod tests {
         );
     }
 
-    /// A short page leaves out the vault and restore hints, and VoiceOver still reads them on the
-    /// password field and Restore.
     #[test]
     fn a_short_page_keeps_its_hints_for_voiceover() {
         let app = SystemStateApp::new(Plan::default());
@@ -3095,10 +2998,6 @@ mod tests {
         ));
     }
 
-    /// An Apply says whether the person typed the vault. A field left as System State
-    /// showed it (here from a published status) asks for the vault setup shows when the
-    /// Apply is admitted; only an edited one is a vault the person chose. Negative control:
-    /// a flag that compares nothing reads every Apply as typed.
     #[test]
     fn an_apply_says_whether_the_vault_was_typed() {
         let mut app = SystemStateApp::new(Plan::default());

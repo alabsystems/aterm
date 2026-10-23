@@ -22,6 +22,7 @@ mod dirty_gate;
 #[cfg(wgpu_arm)]
 mod effect_pipeline_demand;
 mod feature_flip_parity;
+mod fetch_route;
 mod fire_halo_gpu;
 mod fire_patch_parity;
 mod free_parity;

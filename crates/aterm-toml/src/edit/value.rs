@@ -240,10 +240,6 @@ impl From<InlineTable> for Value {
 }
 
 /// A `[ … ]` array.
-///
-/// `trailing` is the run of whitespace and comments between the last element
-/// (or its comma) and the closing bracket — the only part of an array's
-/// formatting that has no element to hang off.
 #[derive(Debug, Clone, Default)]
 pub struct Array {
     pub(crate) values: Vec<Value>,
@@ -320,9 +316,6 @@ impl<V: Into<Value>> FromIterator<V> for Array {
 }
 
 /// A `{ … }` inline table.
-///
-/// `preamble` is the whitespace immediately after `{`; every other run belongs
-/// to a key or a value, so `{ }` and `{}` both survive a round-trip.
 #[derive(Debug, Clone, Default)]
 pub struct InlineTable {
     pub(crate) items: KeyMap,
@@ -387,9 +380,6 @@ impl TableLike for InlineTable {
     fn contains_key(&self, key: &str) -> bool {
         self.items.contains_key(key)
     }
-    /// A `[header]` table or array of tables is converted to its inline spelling on the way
-    /// in: an inline table holds only values, and the encoder prints only values inside
-    /// `{ … }`, so a stored `Item::Table` would vanish from the output.
     fn insert(&mut self, key: &str, item: Item) -> Option<Item> {
         self.items.insert(Key::new(key), inline_item(item))
     }
@@ -413,9 +403,6 @@ impl TableLike for InlineTable {
     }
 }
 
-/// `item` in a form an inline table can hold: a `[header]` table becomes an
-/// inline table and an array of tables an array of inline tables, recursively;
-/// every other item is returned unchanged.
 fn inline_item(item: Item) -> Item {
     match item {
         Item::Table(table) => Item::Value(Value::InlineTable(table_to_inline(table))),
@@ -430,9 +417,6 @@ fn inline_item(item: Item) -> Item {
     }
 }
 
-/// The inline spelling of a `[header]` table. Its header decor, span and `implicit` flag
-/// describe a header line, so they are dropped; `dotted` means the same in both spellings
-/// and is kept.
 fn table_to_inline(table: super::Table) -> InlineTable {
     let mut out = InlineTable::new();
     out.dotted = table.dotted;
@@ -445,15 +429,12 @@ fn table_to_inline(table: super::Table) -> InlineTable {
 impl core::str::FromStr for Value {
     type Err = crate::Error;
 
-    /// Parse exactly one value: no surrounding whitespace, comment or trailing newline
-    /// (see `parse::parse_value`).
     fn from_str(s: &str) -> crate::Result<Self> {
         super::parse::parse_value(s)
     }
 }
 
-/// Build a parsed scalar node. Kept here so the parser does not have to know
-/// the shape of [`Formatted`].
+/// Build a parsed scalar node.
 pub(crate) fn parsed<T: super::ValueRepr>(value: T, raw: &str, span: Range<usize>) -> Formatted<T> {
     Formatted::with_repr(value, Repr::new_unchecked(raw), span)
 }

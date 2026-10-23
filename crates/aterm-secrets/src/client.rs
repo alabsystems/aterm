@@ -1158,10 +1158,11 @@ fn files_intact(paths: &Paths, state: &State) -> bool {
     !state.failed
         && state.pending.is_empty()
         && state.manifest.files.iter().all(|(name, digest)| {
-            materialize::target_path(&paths.home, name)
-                .ok()
-                .and_then(|path| fsx::read_private(&path, text::MAX_VALUE).ok().flatten())
-                .is_some_and(|bytes| materialize::digest_hex(bytes.as_slice()) == *digest)
+            materialize::behind_a_link(&paths.home, name)
+                || materialize::target_path(&paths.home, name)
+                    .ok()
+                    .and_then(|path| fsx::read_private(&path, text::MAX_VALUE).ok().flatten())
+                    .is_some_and(|bytes| materialize::digest_hex(bytes.as_slice()) == *digest)
         })
 }
 
@@ -1575,6 +1576,23 @@ fn subscriber_pass(
     }
 }
 
+/// How often a machine still waiting asks again ([`ask_again_if_due`]).
+const REASK: u64 = 60 * 60;
+
+/// How long a join has, from saving the vault, to post its own request ([`in_flight`]).
+const JOIN_GRACE: u64 = 5 * 60;
+
+/// The `requested` a join records when it saves the vault, before it asks for the password
+/// and posts: dated so the re-ask comes due [`JOIN_GRACE`] later. A running subscriber leaves
+/// the join that long to post its own request (asking in between, without the join's proof,
+/// would make the join's own request a change the server refuses for a while), and a join cut
+/// off before it posts (Ctrl-C at the password prompt ends the process; aterm quits mid-join)
+/// is asked for by whichever subscriber pass comes next after that, not an hour on. The join's
+/// own request, once queued, records when it asked ([`request_join`]).
+fn in_flight() -> u64 {
+    now().saturating_sub(REASK - JOIN_GRACE)
+}
+
 fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
     let due = || -> crate::Result<Option<(Config, Option<String>)>> {
         let _lock = StateLock::take(paths)?;
@@ -1585,7 +1603,7 @@ fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
         };
         let state = load_state(paths)?;
         Ok(
-            (state.membership == Stored::Pending && now().saturating_sub(state.requested) >= 3600)
+            (state.membership == Stored::Pending && now().saturating_sub(state.requested) >= REASK)
                 .then_some((current, state.proof)),
         )
     };
@@ -2179,7 +2197,7 @@ fn join_with(
             state.digest = None;
             state.membership = Stored::None;
             state.proof = None;
-            state.requested = now();
+            state.requested = in_flight();
             prepare_materialization(paths, &mut state)?;
         } else if previous.as_ref() != Some(&config) {
             if previous
@@ -2187,7 +2205,7 @@ fn join_with(
                 .is_some_and(|previous| previous.host != host)
             {
                 state.proof = None;
-                state.requested = now();
+                state.requested = in_flight();
             }
             prepare_materialization(paths, &mut state)?;
         }
@@ -2563,6 +2581,9 @@ pub struct Published {
     pub password_renewed: bool,
     /// Whether a machine removed from an open vault was added to `code-only`.
     pub kept_out: bool,
+    /// Whether the vault is served at a URL, where an open vault's approver lets in any new
+    /// key that asks (a vault at a path lets in none without an admin).
+    pub queued: bool,
     /// Waiting join requests added to `code-only` when opening the vault.
     pub held: Vec<Request>,
     /// Why this machine's own sync after the publish failed, if it did. The publish stands.
@@ -2673,6 +2694,7 @@ fn publish_as(
         first_long_chain: pairs >= 2 && admin.opened_pairs < 2,
         password_renewed,
         kept_out,
+        queued: matches!(admin.config.source, Source::Url(_)),
         held,
         local,
     })
@@ -3792,6 +3814,36 @@ mod tests {
         let writer = StateLock::take(&reader).unwrap();
         drop(writer);
         assert!(materialization_ready(&reader).unwrap());
+    }
+
+    /// A file the vault wrote whose directory then became a symlink (a dotfiles setup's
+    /// `~/.config/gh`) is held without a look, so readiness does not judge it through the link,
+    /// while the same file missing from a real directory is incomplete.
+    #[test]
+    fn readiness_does_not_judge_a_held_file_behind_a_symlinked_directory() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("team.secrets");
+        let text = b"~/.config/gh/hosts.yml<<END if-absent\ngithub.com: {}\nEND\n";
+        fsx::write_atomic(&source, text, 0o600).unwrap();
+        let reader = Paths::for_home(&root.path().join("reader"));
+        join_pinned(&reader, source.to_str().unwrap(), "reader");
+        assert!(materialization_ready(&reader).unwrap(), "filled");
+        let gh = reader.home.join(".config/gh");
+        let dotfiles = root.path().join("dotfiles");
+        std::fs::create_dir(&dotfiles).unwrap();
+        std::fs::remove_dir_all(&gh).unwrap();
+        std::os::unix::fs::symlink(&dotfiles, &gh).unwrap();
+        sync(&reader, None).expect("synced");
+        assert!(
+            materialization_ready(&reader).unwrap(),
+            "held behind the link, not judged through it"
+        );
+        std::fs::remove_file(&gh).unwrap();
+        std::fs::create_dir(&gh).unwrap();
+        assert!(
+            !materialization_ready(&reader).unwrap(),
+            "missing from a real directory"
+        );
     }
 
     #[test]
@@ -5309,6 +5361,60 @@ mod tests {
             .collect();
         assert_eq!(queued, ["renamed"]);
         server.borrow_mut().take().expect("running").stop();
+    }
+
+    /// A join cut off between saving the vault and posting its request (the person stopped at
+    /// the password prompt, or aterm quit) leaves the machine waiting with nothing queued: the
+    /// pass of a subscriber already running asks [`JOIN_GRACE`] later, not an hour on, and not
+    /// sooner, while a join may still be about to post its own.
+    #[test]
+    fn a_join_cut_off_before_its_request_is_asked_for_after_the_grace() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let server = serve(&root.path().join("store"), &bound());
+        let url = format!("http://{}/v1/team", server.addr);
+        let admin = Paths::for_home(&root.path().join("ma"));
+        let created = create(&admin, &url, None, Some("ma")).expect("create");
+        let mac = Paths::for_home(&root.path().join("mb"));
+        let cut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            join(
+                &mac,
+                &JoinOptions {
+                    source: format!("{url}#{}", created.signer),
+                    host: Some("mb".to_string()),
+                    interactive: false,
+                    wait: Duration::ZERO,
+                    confirm: &|_| false,
+                    password: &|| panic!("the process ends at the password prompt"),
+                    requested: &|| {},
+                    say: &|_| {},
+                },
+            )
+        }));
+        assert!(cut.is_err(), "the join ends at its prompt");
+        let state = load_state(&mac).expect("state");
+        assert!(
+            state.membership == Stored::Pending && state.requested != 0,
+            "waiting, with a request recorded that was never posted"
+        );
+        let hosts = || -> Vec<String> {
+            requests(&admin, None)
+                .expect("requests")
+                .into_iter()
+                .map(|request| request.host)
+                .collect()
+        };
+        let config = pinned(&mac);
+        ask_again_if_due(&mac, &config, &|_| {});
+        assert!(
+            hosts().is_empty(),
+            "a pass leaves a join in flight to post its own request"
+        );
+        let mut state = load_state(&mac).expect("state");
+        state.requested = state.requested.saturating_sub(JOIN_GRACE);
+        save_state(&mac, &state).expect("state saved");
+        ask_again_if_due(&mac, &config, &|_| {});
+        assert_eq!(hosts(), ["mb"], "a pass after the grace asks");
+        server.stop();
     }
 
     #[test]

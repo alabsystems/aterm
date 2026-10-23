@@ -131,7 +131,8 @@ fn the_story_exports_the_checked_in_trace_and_the_checked_in_trace_replays_to_it
     assert!(
         golden == bytes,
         "the story exported {} bytes that are not the checked-in {} (first difference at byte {first_difference:?}); \
-         fix the change, or re-record with ATERM_BLESS_GOLDEN=1 and say why in the commit",
+         fix the change, or re-record with ATERM_BLESS_GOLDEN=1 and say why in the commit; \
+         re-recording aarch64-macos.trace moves the M4 corpus, which is a new acceptance policy version (ITEMS_V1's doc)",
         bytes.len(),
         golden.len()
     );

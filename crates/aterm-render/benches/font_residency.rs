@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Measures how many pages of each mapped Windows font file the font stack faults in.
+//!
+//! STOCK EXCEPTION: its work is Windows only, and Trust has no Windows std, so only stock Rust
+//! builds it (the Windows lane's guest pins its version: `aterm-lab/src/windows_guest.rs`).
 
 /// The fallback, symbol, and colour font files measured on Windows.
 #[cfg(windows)]

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::fixtures::{
     Coal, Proc, Scene, build_start_1032, delegated_1032, delegated_in_aterm_1032, reaped_1032,
-    spotlight_1032, tab, tab_ahead_1032, two_coalitions_1421,
+    shared_launcher_1032, spotlight_1032, tab, tab_ahead_1032, two_coalitions_1421,
 };
 use super::*;
 use crate::events::EventKind;
@@ -228,6 +228,86 @@ fn a_delegated_member_counts_once_in_its_tab_capped_at_its_launcher() {
     assert_eq!(
         (f.split.aterm_mc, f.split.delegated_mc, f.split.own_mc),
         (400, 500, 700)
+    );
+}
+
+#[test]
+fn two_tabs_delegated_jobs_under_one_launcher_count_each_member_once_in_its_own_tab() {
+    let scene = shared_launcher_1032();
+    let f = facts(&scene);
+    let launcher = row(&f, 4000);
+    assert_eq!(
+        (launcher.part, launcher.cpu_mc, launcher.delegated_mc),
+        (Part::Others, 900, 800),
+        "both members leave the launcher's part; its own 100 stays"
+    );
+    assert_eq!(launcher.tabs, None, "the app server is in no tab");
+    assert_eq!(f.split.delegated_mc, 800);
+    assert_eq!(
+        f.split.tabs,
+        [(1, 700), (2, 300)],
+        "each member in its own tab"
+    );
+    assert_eq!((f.split.own_mc, f.split.unattributed_mc), (200, 0));
+    assert_eq!(f.split.global_mc, 4200);
+    assert_eq!(f.split.parts(Some(1)), parts(700, 500, 830, 2170, 0));
+    assert_eq!(f.split.parts(Some(2)), parts(300, 900, 830, 2170, 0));
+    for tab in [1, 2] {
+        let p = f.split.parts(Some(tab));
+        assert_eq!(
+            p.tab + p.aterm_rest + p.others + p.services + p.unaccounted,
+            4200,
+            "tab {tab}'s view counts every member once"
+        );
+    }
+
+    let mut claimed_twice = scene.clone();
+    claimed_twice.busy_mc += 150;
+    for c in claimed_twice.coalitions.iter_mut().filter(|c| c.id == 4000) {
+        c.mc += 150;
+    }
+    let rustc = Proc::new(4030, 4001, 501, 4000, 1_792_517_500_030, "rustc", 150);
+    let key = crate::delegated::ProcessKey {
+        pid: rustc.pid,
+        start: u64::try_from(rustc.birth_ms).unwrap_or(0),
+    };
+    claimed_twice.procs.push(rustc);
+    for job in &mut claimed_twice.delegated {
+        job.members.push(key);
+    }
+    let f = facts(&claimed_twice);
+    assert_eq!(
+        (f.split.tabs.clone(), f.split.delegated_mc),
+        (vec![(1, 700), (2, 300)], 800),
+        "a member both jobs claim is neither tab's"
+    );
+    assert_eq!(f.split.parts(Some(1)), parts(700, 500, 980, 2170, 0));
+
+    let mut exited = scene;
+    exited.busy_mc += 200;
+    for c in exited.coalitions.iter_mut().filter(|c| c.id == 4000) {
+        c.mc += 200;
+    }
+    let rustc = Proc::new(4040, 4001, 501, 4000, 1_792_517_500_040, "rustc", 200).gone();
+    let key = crate::delegated::ProcessKey {
+        pid: rustc.pid,
+        start: u64::try_from(rustc.birth_ms).unwrap_or(0),
+    };
+    exited.procs.push(rustc);
+    for job in exited.delegated.iter_mut().filter(|j| j.tab == Some(2)) {
+        job.members.push(key);
+    }
+    let f = facts(&exited);
+    assert_eq!(
+        (f.split.tabs.clone(), f.split.delegated_mc),
+        (vec![(1, 700), (2, 300)], 800)
+    );
+    let launcher = row(&f, 4000);
+    assert_eq!((launcher.cpu_mc, launcher.delegated_mc), (1100, 800));
+    assert_eq!(
+        f.split.parts(Some(2)),
+        parts(300, 900, 1030, 2170, 0),
+        "a member that exited inside the window stays in its launcher's part"
     );
 }
 

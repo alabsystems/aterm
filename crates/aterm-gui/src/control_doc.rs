@@ -56,9 +56,6 @@ pub(crate) fn serve_doc(
     }
 }
 
-/// Ask the main thread `query` through the `inspect` hop, which carries the
-/// call to `App::answer_doc`; the answer comes back on the call's channel,
-/// sent before the hop's own reply.
 fn ask_main(proxy: &EventLoopProxy<Wake>, query: DocQuery) -> Result<DocAnswer, String> {
     let (answer, answered) = std::sync::mpsc::channel();
     let request = crate::app_control::InspectRequest::Doc(DocCall { query, answer });
@@ -71,10 +68,6 @@ fn ask_main(proxy: &EventLoopProxy<Wake>, query: DocQuery) -> Result<DocAnswer, 
     }
 }
 
-/// The spellings a document of `uri`'s file can be keyed by: `uri` as given,
-/// the codec's spelling of its path, and its realpath spelling, which the
-/// store keys documents by (`file:///tmp/x` is `file:///private/tmp/x` on
-/// macOS). The last reads the file system.
 fn spellings(uri: &str) -> Result<Vec<String>, String> {
     let path = amacs::protocol::uri::file_uri_to_path(uri)
         .map_err(|error| format!("bad uri={uri} ({error})"))?;
@@ -89,12 +82,6 @@ fn spellings(uri: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// `path`'s realpath spelling as a URI: its deepest existing ancestor
-/// resolved and the rest appended, as the store's admission resolves a path
-/// (amacs-files' `canonical_target_path`). A file deleted since its document
-/// was opened (`disk=missing`) is so still named by the spelling its document
-/// is keyed by: `/var/…/x` is `/private/var/…/x` whether `x` is there or not.
-/// `None` when no ancestor resolves or one cannot be read.
 fn real_spelling(path: &std::path::Path) -> Option<String> {
     let mut missing = Vec::new();
     let mut cursor = path;
@@ -112,7 +99,6 @@ fn real_spelling(path: &std::path::Path) -> Option<String> {
     amacs::protocol::uri::path_to_file_uri(&real).ok()
 }
 
-/// `doc ls`'s reply: `OK <n>`, then each document's row with its `disk=`.
 fn ls_reply(documents: Vec<DocFacts>) -> String {
     let rows: Vec<String> = documents
         .into_iter()
@@ -133,10 +119,6 @@ fn ls_reply(documents: Vec<DocFacts>) -> String {
     out
 }
 
-/// How `probe`'s file stands against the version its buffer was read or
-/// last saved as, by content ([`DiskState::by_content`], whose table is
-/// contracted in amacs): a write of the same bytes, or a `touch`, is not a
-/// change.
 fn disk_state(probe: Option<&DiskProbe>) -> DiskState {
     let Some(DiskProbe { path, baseline }) = probe else {
         return DiskState::Unknown;
@@ -155,8 +137,6 @@ fn disk_state(probe: Option<&DiskProbe>) -> DiskState {
     }
 }
 
-/// `doc read`'s reply: `OK <nbytes> doc=<d>`, then `lines` of `text` as
-/// anchored rows and their trailer.
 fn read_reply(text: &DocText, lines: LineRange) -> String {
     let body = format_lines(&text.text, text.seq, lines, DOC_READ_CAP);
     format!("OK {} doc={}\n{body}", body.len(), text.doc)
@@ -166,7 +146,6 @@ fn read_reply(text: &DocText, lines: LineRange) -> String {
 mod tests {
     use super::*;
 
-    /// The lane's own refusals answer before anything is asked.
     #[test]
     fn doc_lane_refuses_before_asking() {
         let asked = std::cell::RefCell::new(Vec::new());
@@ -207,7 +186,6 @@ mod tests {
         assert_eq!(*asked.borrow(), vec![DocQuery::Read(DocNames::Id(7))]);
     }
 
-    /// A URI is asked in each of its spellings, as given first.
     #[test]
     fn doc_uri_spellings_reach_the_store_key() {
         let dir = aterm_tempfile::Builder::new()

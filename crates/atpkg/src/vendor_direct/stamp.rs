@@ -15,16 +15,12 @@ use super::table::is_vendor;
 use super::version::Version;
 use crate::store::Layout;
 
-/// The stamp file's schema.
 const STAMP_SCHEMA: u32 = 1;
 
-/// Bound on a stamp read.
 const MAX_STAMP_BYTES: usize = 8 * 1024;
 
-/// The longest `ETag` kept; a longer one is dropped (the next check is a full GET).
 const MAX_ETAG_BYTES: usize = 256;
 
-/// The longest verdict kept, in characters.
 const MAX_VERDICT_CHARS: usize = 300;
 
 /// Duration (in seconds) that a successful head check vouches for the vendor's latest build.
@@ -80,8 +76,7 @@ struct StampFile {
     legacy_root_build: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_tree_root: Option<String>,
-    /// Every key this build does not know, carried verbatim through each rewrite so an
-    /// older build never erases what a newer one keeps.
+    /// Every key this build does not know.
     #[serde(flatten)]
     extra: BTreeMap<String, aterm_toml::Value>,
 }
@@ -107,7 +102,6 @@ impl ProgramStamp {
         read_file(layout, program).map(|file| Self::from_file(file).0)
     }
 
-    /// The stamp `file` holds, and the keys this build does not know.
     fn from_file(file: StampFile) -> (Self, BTreeMap<String, aterm_toml::Value>) {
         let refused = file.refused_version.zip(AuthenticatedDigest::recorded(
             file.refused_sha256.as_deref().unwrap_or_default(),
@@ -151,10 +145,9 @@ impl ProgramStamp {
     }
 
     /// Records that legacy index build `build` carries `version`.
-    ///
     /// # Errors
-    /// `build` is a vendor build id, `program` is not vendor-direct, or the stamp could not
-    /// be locked or written.
+    /// `build` is a vendor build id, `program` is not vendor-direct, or the stamp could not be
+    /// locked or written.
     pub(crate) fn record_legacy_version(
         layout: &Layout,
         program: &str,
@@ -180,10 +173,9 @@ impl ProgramStamp {
     }
 
     /// Records the signed `root` for legacy index build `build`.
-    ///
     /// # Errors
-    /// `build` is a vendor build id, `root` is not 64 hex digits, `program` is not
-    /// vendor-direct, or the stamp could not be locked or written.
+    /// `build` is a vendor build id, `root` is not 64 hex digits, `program` is not vendor-direct,
+    /// or the stamp could not be locked or written.
     pub(crate) fn record_legacy_root(
         layout: &Layout,
         program: &str,
@@ -201,7 +193,6 @@ impl ProgramStamp {
     }
 
     /// Records a head check timestamp, head version, and `ETag`.
-    ///
     /// # Errors
     /// `program` is not vendor-direct, or the stamp could not be locked or written.
     pub fn record_check(
@@ -219,7 +210,6 @@ impl ProgramStamp {
     }
 
     /// Records the lane's `verdict` and raises `high_water` to `active`.
-    ///
     /// # Errors
     /// Returns an error if `program` is not vendor-direct or the stamp cannot be written.
     pub(crate) fn record_outcome(
@@ -237,7 +227,6 @@ impl ProgramStamp {
     }
 
     /// Records a signed-yank move to `active`, setting `high_water` to `active`.
-    ///
     /// # Errors
     /// Returns an error if `program` is not vendor-direct or the stamp cannot be written.
     pub(crate) fn record_yank_move(
@@ -253,7 +242,6 @@ impl ProgramStamp {
     }
 
     /// Records a stage refusal of `version` with `digest`.
-    ///
     /// # Errors
     /// Returns an error if `program` is not vendor-direct or the stamp cannot be written.
     pub(crate) fn record_refusal(
@@ -270,7 +258,6 @@ impl ProgramStamp {
     }
 
     /// Clears any recorded stage refusal for `program`.
-    ///
     /// # Errors
     /// Returns an error if `program` is not vendor-direct or the stamp cannot be written.
     pub(crate) fn clear_refusal(layout: &Layout, program: &str) -> io::Result<()> {
@@ -289,16 +276,11 @@ impl ProgramStamp {
     }
 }
 
-/// `program`'s stamp file as written, at this build's schema; `None` when absent,
-/// unreadable, malformed or of another schema.
 fn read_file(layout: &Layout, program: &str) -> Option<StampFile> {
     let file: StampFile = durable::read_toml(&stamp_path(layout, program)?, MAX_STAMP_BYTES)?;
     (file.schema == STAMP_SCHEMA).then_some(file)
 }
 
-/// Read `program`'s stamp (absent or malformed reads as empty), apply `change`, and
-/// durably replace it — keys this build does not know included — all under the stamp's
-/// lock.
 fn update(
     layout: &Layout,
     program: &str,
@@ -348,16 +330,12 @@ fn update(
     durable::write_ordered(&path, &text)
 }
 
-/// A header value we will send back verbatim: 1–256 bytes of printable ASCII.
 fn etag_ok(etag: &str) -> bool {
     !etag.is_empty()
         && etag.len() <= MAX_ETAG_BYTES
         && etag.bytes().all(|b| (0x20..0x7f).contains(&b))
 }
 
-/// `text` as one line that is safe to print into a terminal: every control character
-/// (C0, DEL, C1 — so no escape sequence), line or paragraph separator and bidi control
-/// becomes a space, and the result is cut to [`MAX_VERDICT_CHARS`].
 fn one_line(text: &str) -> String {
     text.chars()
         .map(|c| if printable(c) { c } else { ' ' })
@@ -365,7 +343,6 @@ fn one_line(text: &str) -> String {
         .collect()
 }
 
-/// Not a control, separator or bidi-control character.
 fn printable(c: char) -> bool {
     !c.is_control()
         && !matches!(
@@ -401,7 +378,6 @@ mod tests {
         c.to_string().repeat(64)
     }
 
-    /// A payload digest of `c`s, `alg`'s length, the anchor vouched for.
     fn digest(alg: DigestAlg, c: char) -> AuthenticatedDigest {
         let len = if alg == DigestAlg::Sha256 { 64 } else { 128 };
         AuthenticatedDigest::authenticated(alg, &c.to_string().repeat(len)).unwrap()
@@ -468,8 +444,6 @@ mod tests {
         );
     }
 
-    /// The head watch holds an old copy while the lane raises the high-water; the watch's
-    /// next write must not lower it.
     #[test]
     fn a_check_never_lowers_the_high_water() {
         let l = layout("stale");
@@ -498,9 +472,6 @@ mod tests {
         assert_eq!(hw(), Some(v("0.156.2")));
     }
 
-    /// Writers in parallel (threads here; processes take the same `flock`) lose no update.
-    /// A writer the lock's bounded wait refuses writes again: on a loaded disk the queue of
-    /// 32 durable writes can approach the 5 s bound, and a refusal is never a lost write.
     #[test]
     fn concurrent_writers_lose_no_update() {
         let l = layout("race");
@@ -567,8 +538,6 @@ mod tests {
         assert_eq!(ProgramStamp::read(&l, "codex").unwrap().refused, None);
     }
 
-    /// A sha512 refusal is kept under `refused_sha512`, never in the sha256 key, and is its
-    /// own pair; a stamp naming both digests is no refusal.
     #[test]
     fn a_sha512_refusal_is_kept_under_its_own_key() {
         let l = layout("refusal-512");
@@ -628,8 +597,6 @@ mod tests {
         assert_eq!(got.verdict.chars().count(), MAX_VERDICT_CHARS);
     }
 
-    /// No terminal escape, bell, C1 control, line separator or bidi override survives into
-    /// a line `status` and Settings print.
     #[test]
     fn the_verdict_carries_no_control_or_bidi_character() {
         assert_eq!(
@@ -654,9 +621,6 @@ mod tests {
         assert_eq!(ProgramStamp::read(&l, "claude").unwrap().verdict, "x [2Jy");
     }
 
-    /// A legacy build's version, once read, is kept by build number beside every other
-    /// field; a vendor build id is never recorded as legacy, and a newer legacy build's
-    /// version replaces an older one's.
     #[test]
     fn a_read_legacy_version_is_kept_by_its_build() {
         let l = layout("legacy");
@@ -682,9 +646,6 @@ mod tests {
         assert_eq!(got.legacy_version_of(2_026_092_201), None);
     }
 
-    /// A legacy build's signed root is kept by its build number apart from its version (the
-    /// two are learned at different moments), lowercased; a vendor build id or a root that
-    /// is not 64 hex digits is refused, and a hand-mangled root reads as none.
     #[test]
     fn a_kept_legacy_root_is_kept_by_its_build() {
         let l = layout("legacy-root");
@@ -707,8 +668,6 @@ mod tests {
         assert_eq!(ProgramStamp::read(&l, "claude").unwrap().legacy_root, None);
     }
 
-    /// A key this build does not know — one a newer build writes — survives every rewrite
-    /// this build makes.
     #[test]
     fn a_key_this_build_does_not_know_survives_its_rewrites() {
         let l = layout("unknown-key");
@@ -730,8 +689,6 @@ mod tests {
         assert_eq!(got.high_water, Some(v("2.1.281")));
     }
 
-    /// A check vouches for "latest" for a day; never checked, or stamped more than an hour
-    /// ahead of the clock, vouches for nothing.
     #[test]
     fn a_check_vouches_for_a_day() {
         let at = |checked: i64| ProgramStamp {

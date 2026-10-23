@@ -8,8 +8,9 @@
 pub enum ProcessPresence {
     /// The pid exists, including when access to it is refused.
     Present,
-    /// The pid is held by a process that has exited and is not yet reaped (a zombie): it runs
-    /// nothing and holds nothing but its number.
+    /// The pid is held by a process that has exited and is not yet reaped (a zombie, or on XNU
+    /// one whose exit has begun and not finished): it runs nothing again, and once reapable it
+    /// holds nothing but its number.
     Exited,
     /// The kernel positively reported that no process has this pid.
     Absent,
@@ -29,6 +30,9 @@ pub fn process_presence(pid: i32) -> ProcessPresence {
         unsafe extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
         }
+        // Read before signal zero: an exit only moves forward, so one read here that signal
+        // zero then no longer finds was reaped in between, and reads absent, not present.
+        let exited = exited_unreaped(pid);
         // SAFETY: a positive pid addresses one process; signal zero only queries existence.
         let answers = unsafe { kill(pid, 0) } == 0;
         if !answers {
@@ -38,7 +42,7 @@ pub fn process_presence(pid: i32) -> ProcessPresence {
                 _ => return ProcessPresence::Unknown,
             }
         }
-        if exited_unreaped(pid) {
+        if exited {
             ProcessPresence::Exited
         } else {
             ProcessPresence::Present
@@ -50,13 +54,19 @@ pub fn process_presence(pid: i32) -> ProcessPresence {
     }
 }
 
-/// Whether `pid` reads as a zombie: XNU's `SZOMB`; on Linux a `Z` or `X` row with no other
-/// thread ([`procfs::exited_row`]). A read that fails says no.
+/// Whether `pid` reads as a process that has exited and is not yet reaped. On XNU: `SZOMB`, or
+/// a record only the zombie lookup finds. XNU takes an exiting process off its live list before
+/// it ends its threads and address space, so from then every live read ([`read_birth`],
+/// [`read_lineage`], and [`end_proven`]'s identity) refuses it while its status reads running
+/// until the exit finishes. On Linux a `Z` or `X` row with no other thread
+/// ([`procfs::exited_row`]). A read that fails says no.
 #[cfg(unix)]
 fn exited_unreaped(pid: i32) -> bool {
     #[cfg(target_vendor = "apple")]
     {
-        short_info(pid, true).is_some_and(|info| info.pbsi_status == BsdShortInfo::SZOMB)
+        short_info(pid, true).is_some_and(|info| {
+            info.pbsi_status == BsdShortInfo::SZOMB || short_info(pid, false).is_none()
+        })
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {

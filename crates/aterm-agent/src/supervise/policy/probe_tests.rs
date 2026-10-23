@@ -112,8 +112,7 @@ fn each_answer_reads_back_as_it_was_written() {
     assert_eq!(reread(&refused), refused);
 }
 
-/// A view projected by a rule this build does not have is refused, never
-/// judged as though the keys that rule kept were never set.
+/// Refuses a `GitView` whose projection version differs from this build's.
 #[test]
 fn a_view_projected_by_another_rule_is_refused() {
     let written =
@@ -141,11 +140,7 @@ pub(crate) fn exchanges<'a>(read: &'a Recovered, door: &str) -> Vec<(&'a [u8], &
         .collect()
 }
 
-/// A RECORDED PROBE IS THE LIVE ONE: over a scratch tree with a symbolic
-/// link, the hidden-twin walk, the Read rule's resolver and the rm rule's
-/// walk answer through the recording probe exactly as through the live one,
-/// and each look is one round trip at its own door, its request the path and
-/// its reply the answer — which reads back as what the policy was handed.
+/// The recording probe matches `LiveProbe` and records one exchange per filesystem lookup.
 #[test]
 fn a_recorded_probe_answers_as_the_live_one_and_tapes_each_look() {
     let dir = crate::supervise::ScratchDir::new("probe", "disk");
@@ -265,13 +260,7 @@ pub(crate) fn planted() -> [&'static str; 5] {
     ]
 }
 
-/// WHAT A PROBE READS NEVER REACHES THE TAPE: a worker whose environment
-/// plants an API key, judging a git read in a repository whose configuration
-/// plants a token, a URL's user and password and a credential helper —
-/// through the git view, the settings' `env` check and the Bash tool's
-/// directories — leaves none of them on the tape, and the view the policy was
-/// handed holds none of them either. Negative control: the same detector
-/// finds the key when it IS logged through the door.
+/// Secrets in the worker environment or git config never reach the tape or `GitView`.
 #[test]
 fn what_a_probe_reads_never_reaches_the_tape() {
     let dir = crate::supervise::ScratchDir::new("probe", "privacy");
@@ -320,18 +309,14 @@ fn what_a_probe_reads_never_reaches_the_tape() {
     );
 }
 
-/// The secrets the startup privacy test plants: a key in a `.zshenv` alias, a
-/// value on a snapshot's line of a shape the check does not read, a settings
-/// `env` value, a hook's command, and another session's id in the worker's
-/// `ATERM_PARENT_SESSION_ID`.
+/// Planted secrets for the shell startup and settings privacy test.
 const PLANTED_RC: &str = "planted-0005-zshenv-alias-key";
 const PLANTED_SNAPSHOT: &str = "planted-0005-snapshot-line";
 const PLANTED_SETTINGS: &str = "planted-0005-settings-env-value";
 const PLANTED_HOOK: &str = "planted-0005-hook-command-token";
 const PLANTED_SESSION: &str = "planted-0005-other-session";
 
-/// A zsh shell snapshot as Claude Code writes one, its person's part
-/// holding `extra` among the shell's options.
+/// Formats a Claude Code zsh snapshot fixture containing `extra`.
 fn zsh_snapshot(extra: &str) -> String {
     format!(
         "# Snapshot file\n# Unset all aliases to avoid conflicts with functions\n\
@@ -341,16 +326,7 @@ fn zsh_snapshot(extra: &str) -> String {
     )
 }
 
-/// WHAT THE SHELL'S STARTUP AND THE SETTINGS HOLD NEVER REACHES THE TAPE
-/// (the replay plan's §7: rc files, Claude Code's settings — derived answers
-/// only). A `.zshenv` whose alias carries a key, a snapshot line of a shape
-/// the check does not read, a settings `env` value that fails a git read and
-/// a PreToolUse hook's command each reach the probe that judges them — and
-/// the answers it tapes (refusals included, which a tape holds as written)
-/// name the file, the line's number, the word or the variable, never what
-/// the file held. A worker bound to another session is refused without that
-/// session's id. Negative control: the same detector finds the `.zshenv`'s
-/// key when its text IS taped.
+/// Shell startup files, snapshots, settings, and session bindings never leak secrets to the tape.
 #[test]
 fn what_the_shells_startup_and_the_settings_hold_never_reaches_the_tape() {
     let dir = crate::supervise::ScratchDir::new("probe", "startup");
@@ -443,15 +419,7 @@ fn what_the_shells_startup_and_the_settings_hold_never_reaches_the_tape() {
     );
 }
 
-/// A KEYED PROBE ANSWERS FROM WHAT THE RECORDED LOOP HAD READ, bounded by
-/// astream-effects' keyed view's own bound — a COUNT of records read, never
-/// an index: a look recorded as the tape's second record is no answer to a
-/// probe standing where the loop had read none or one record (it had not
-/// learned it yet; the negative control of the bound), and is the answer
-/// once it has read two; of two answers to one request the latest read is
-/// taken, past the tape's end too; and a request the tape never holds — the
-/// same look asked of another path — is answered as a refused look and
-/// named among the misses, door and request as the tape writes them.
+/// `KeyedProbe` answers with the latest matching exchange within the `seen` record count.
 #[test]
 fn a_keyed_probe_answers_from_what_the_loop_had_read() {
     let roots = crate::supervise::tape::header::Roots::of(vec![("w", PathBuf::from("/w"))]);

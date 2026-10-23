@@ -7,8 +7,7 @@
 // project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! The shape plan: the features a run is shaped with, compiled against one face for one direction
-//! and script.
+//! Compiled OpenType feature shaping plan for one face, direction, and script.
 
 use super::ShapeFace;
 use super::arabic;

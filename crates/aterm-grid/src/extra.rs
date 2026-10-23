@@ -26,7 +26,6 @@ impl CellCoord {
     }
 }
 
-/// `CellExtra::flags` bits: colour presence in bits 0-2, extended flags above.
 mod extra_flags {
     /// Underline color is present (bytes 0-2 of colors array).
     pub(crate) const HAS_UNDERLINE_COLOR: u16 = 1 << 0;
@@ -45,8 +44,7 @@ mod extra_flags {
 pub(crate) struct HyperlinkData {
     /// Hyperlink URL (OSC 8).
     pub url: Arc<str>,
-    /// Hyperlink ID (OSC 8 `id=` parameter), grouping cells into one span for
-    /// hover/click; without one, cells with identical URLs group.
+    /// Hyperlink ID (OSC 8 `id=` parameter).
     pub id: Option<Arc<str>>,
 }
 
@@ -82,25 +80,17 @@ pub const MAX_IMAGE_LAYERS: usize = 16;
 pub struct CellExtra {
     /// Bitflags: bits 0-2 track color presence, bits 3-15 for extended flags.
     flags: u16,
-    /// Packed RGB: underline in bytes 0-2, fg in 3-5, bg in 6-8, each valid only
-    /// while its HAS_* bit is set.
+    /// Packed RGB.
     colors: [u8; 9],
-    /// Indexed underline color, resolved from the live palette at render time
-    /// so OSC 4 changes apply. `HAS_UNDERLINE_COLOR` is clear while it is set.
+    /// Indexed underline color.
     underline_color_idx: Option<u8>,
-    /// Hyperlink URL and optional ID (OSC 8) in one allocation, shared by every
-    /// cell of a run (see [`HyperlinkData`]); `None` costs nothing (niche).
+    /// Hyperlink URL and optional ID (OSC 8) in one allocation.
     hyperlink: Option<Arc<HyperlinkData>>,
-    /// Complex character string (non-BMP, grapheme clusters), used when the
-    /// cell is COMPLEX. Boxed so the common path pays an 8-byte niche pointer,
-    /// not a 16-byte fat pointer.
+    /// Complex character string (non-BMP, grapheme clusters).
     complex_char: Option<Box<Arc<str>>>,
     /// Zero-width combining characters (inline up to two).
     combining: SmallVec<char, 2>,
-    /// The inline images covering this cell, bottom layer first (never empty
-    /// when present): one for an iTerm2 or sixel image, which owns its cells;
-    /// Kitty placements stack in [`ImageRef::draw_key`] order. Boxed: 8 bytes
-    /// when absent.
+    /// The inline images covering this cell.
     image: Option<Box<SmallVec<ImageRef, 1>>>,
 }
 
@@ -158,8 +148,7 @@ impl CellExtra {
         }
     }
 
-    /// Attach an already-built, possibly shared, hyperlink payload, replacing URL
-    /// and ID together without a per-cell allocation.
+    /// Attach an already-built.
     #[inline]
     pub(crate) fn set_hyperlink_data(&mut self, data: Option<Arc<HyperlinkData>>) {
         self.hyperlink = data;
@@ -338,11 +327,7 @@ impl CellExtra {
         self.complex_char = None;
     }
 
-    /// Whether this entry holds anything besides truecolor fg/bg bytes: a
-    /// combining mark, a cluster string, a link, an underline colour, extended
-    /// flags or an image. Those a cell owns only through its HAS_EXTRAS bit; the
-    /// fg/bg bytes a BCE blank also owns through the RGB marker in its packed
-    /// colours, without the bit (`Cell::bce_blank`).
+    /// Whether this entry holds anything besides truecolor fg/bg bytes.
     #[must_use]
     #[inline]
     pub(crate) const fn has_claimable_data(&self) -> bool {
@@ -354,8 +339,7 @@ impl CellExtra {
             || self.flags & !(extra_flags::HAS_FG_RGB | extra_flags::HAS_BG_RGB) != 0
     }
 
-    /// Drop everything [`Self::has_claimable_data`] counts, keeping the
-    /// truecolor fg/bg bytes. Returns whether the entry still holds data.
+    /// Drop everything [`Self::has_claimable_data`] counts.
     #[inline]
     pub(crate) fn retain_overflow_colors(&mut self) -> bool {
         self.hyperlink = None;
@@ -402,7 +386,7 @@ impl CellExtra {
         });
     }
 
-    /// Add `image` as a layer in [`ImageRef::draw_key`] order, keeping at most [`MAX_IMAGE_LAYERS`].
+    /// Add `image` as a layer in [`ImageRef::draw_key`] order.
     pub fn stack_image(&mut self, image: ImageRef) {
         let layers = self.image.get_or_insert_with(Box::default);
         let key = image.draw_key();

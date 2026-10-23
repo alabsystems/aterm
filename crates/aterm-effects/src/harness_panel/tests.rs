@@ -8,22 +8,16 @@ use crate::color_math::oklab;
 
 const PALETTES: [CardPalette; 3] = [CardPalette::Cruise, CardPalette::Land, CardPalette::Off];
 
-/// Claude's panel grey on a dark theme (2.1.304: `ESC[38;2;153;153;153m`)
-/// and its light theme's `inactive` (rgb(102,102,102)).
 const GREY_DARK: u32 = 0x0099_9999;
 const GREY_LIGHT: u32 = 0x0066_6666;
 
-/// The fold's stuck saturation (`aterm_agent::harness::agents::SAT_STUCK`).
 const SAT_STUCK_TEST: f32 = 0.10;
-/// The fold's freshness 90 s into quiet (`sat` falls from 1 at 20 s to 0.15
-/// at 150 s: `1 − 0.85·70/130`).
 const SAT_90S: f32 = 1.0 - 0.85 * 70.0 / 130.0;
 
 fn hex(c: aterm_types::Rgb) -> u32 {
     (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b)
 }
 
-/// `(name, ground, default ink, dark)` of the grounds the laws hold on.
 fn grounds() -> Vec<(&'static str, u32, u32, bool)> {
     ["Aterm Night", "Aterm Day", "Linen"]
         .into_iter()
@@ -35,7 +29,6 @@ fn grounds() -> Vec<(&'static str, u32, u32, bool)> {
         .collect()
 }
 
-/// The papers a light ring holds on: Aterm Day, Linen and white.
 fn papers() -> Vec<(&'static str, u32)> {
     let mut papers: Vec<(&'static str, u32)> = grounds()
         .into_iter()
@@ -46,7 +39,6 @@ fn papers() -> Vec<(&'static str, u32)> {
     papers
 }
 
-/// The pane's ground the one-ground laws draw on: Aterm Night or Aterm Day.
 fn ground(dark: bool) -> u32 {
     let name = if dark { "Aterm Night" } else { "Aterm Day" };
     hex(aterm_types::scheme::builtin(name).unwrap().background)
@@ -76,11 +68,6 @@ fn look(mood: DotMood, level: f32, sat: f32, k: usize, dark: bool) -> DotLook {
     look_on(CardPalette::Cruise, mood, level, sat, k, dark)
 }
 
-/// THE ROWS TAKE THE DOT HUES TOP DOWN: Cruise's task rows run orange,
-/// yellow, blue, violet (its red and green, Claude's failed and done, left
-/// out) and wrap; the main row keeps the first stripe; each dot is nearest
-/// its own row's hue; adjacent task rows never share one, on any palette or
-/// ground.
 #[test]
 fn the_rows_take_the_dot_hues_top_down() {
     let hue = |k: usize, dark: bool| {
@@ -142,11 +129,6 @@ fn the_rows_take_the_dot_hues_top_down() {
     }
 }
 
-/// NO LIVE DOT WEARS CLAUDE'S DONE OR FAILED: on every palette and ground,
-/// for every task row, every ink and every light a running, quiet or stuck
-/// dot wears — at every work level, freshness and step of its breath — lies
-/// [`STATUS_HUE_GUARD_DEG`] or more from the hue of Claude's success green
-/// and of its error red, or has no hue at all.
 #[test]
 fn no_live_dot_wears_claudes_status_hues() {
     let mut worst = f32::MAX;
@@ -207,12 +189,6 @@ fn no_live_dot_wears_claudes_status_hues() {
     }
 }
 
-/// QUIET IS PALER THAN RUNNING: a quiet dot's light holds at most
-/// `QUIET_KEEP` of a running one's chroma at its first quiet second (0.02
-/// over it for the bytes' rounding) and under a third of it 90 s in, its ring (lifted or solved to the same work's
-/// luminance, which moves chroma a little) at most 0.7 and 0.4 of it — on
-/// Cruise and Land, either ground, every task row and work level — so a
-/// quiet row never reads as Claude's done or failed by its colour.
 #[test]
 fn quiet_is_paler_than_running() {
     for palette in [CardPalette::Cruise, CardPalette::Land] {
@@ -336,9 +312,6 @@ fn freshness_is_saturation() {
     assert!(chroma(look(DotMood::Running, 0.2, 1.0, 1, true).ink.unwrap()) > 0.1);
 }
 
-/// THE FADE AND THE LIFT KEEP THE HUE: [`fade_chroma`] and
-/// [`at_luminance_hue`] turn a dot hue by no more than
-/// [`STATUS_HUE_DRIFT_DEG`], the lift landing on its luminance.
 #[test]
 fn the_fade_and_the_lift_keep_the_hue() {
     for palette in PALETTES {
@@ -464,12 +437,6 @@ fn a_stuck_dot_is_grey_and_breathes_under_the_flash_bound() {
     assert_eq!(r(BREATH_FLOOR), r(1.0));
 }
 
-/// AN AWAITING DOT IS A STILL AMBER RING, NEVER A RUNNING ONE NOR ONE
-/// WAITING ON A TOOL: unlit and unbreathing on every palette and ground,
-/// while every running dot — every palette, ground, task row and work level
-/// — is lit (on paper its hollow filled too), and so is every tool dot, its
-/// light inside its ring (on paper its hollow lit), so they differ by form
-/// whatever their hues.
 #[test]
 fn an_awaiting_dot_is_a_still_amber_ring() {
     for palette in PALETTES {
@@ -689,12 +656,6 @@ fn the_names_and_the_bar_walk_the_palette() {
     assert!(reach(8) > reach(3));
 }
 
-/// A DOT'S LIGHT STAYS ON ITS BULLET, ROUND ON EITHER GROUND: one radial
-/// light per row band it reaches, centred on the bullet, never wider than
-/// the cap nor past the pane's clip — on dark an additive halo, on paper a
-/// round source-over tint as wide as the dark halo and the hollow's round
-/// fill inside the ring, each its ceiling in its colour's high byte, and no
-/// square slab.
 #[test]
 fn a_dots_light_stays_on_its_bullet() {
     let place = DotPlace {
@@ -763,11 +724,6 @@ fn a_dots_light_stays_on_its_bullet() {
     }
 }
 
-/// THE LIGHT IS THE AGENT'S HUE, ON EITHER GROUND: a running dot's halo (dark)
-/// or tint and fill (light) is its fresh hue, at least as vivid as its ink
-/// (on paper the ring is the hue as a print ink, at most
-/// [`PRINT_RING_LUMA`]), so a running dot's light reads in its agent's
-/// colour; an awaiting dot is unlit.
 #[test]
 fn the_light_is_the_agents_hue_and_a_stuck_dots_is_grey() {
     for dark in [true, false] {
@@ -802,12 +758,6 @@ fn the_light_is_the_agents_hue_and_a_stuck_dots_is_grey() {
     }
 }
 
-/// EVERY DOT STAYS LEGIBLE: on Aterm Night every dot the look inks holds 3:1
-/// (a graphic's floor) against the ground; on Aterm Day, Linen and white
-/// every ring — running and quiet at every work level and freshness, a stuck
-/// one at every step of its breath, an awaiting one — holds it against the
-/// paper with both under the dot's own tint at its ceiling (the ring lies in
-/// the tint's plateau), the running ones [`PRINT_RING_CONTRAST`].
 #[test]
 fn every_dot_holds_three_to_one_on_its_ground() {
     let mut cases: Vec<(&str, u32, bool)> = grounds()
@@ -890,13 +840,6 @@ fn every_dot_holds_three_to_one_on_its_ground() {
     assert!(c < 3.0, "the solve is what holds it: {c:.2}:1");
 }
 
-/// A DOT WAITING ON ITS OWN TOOL CALL IS FRESH, STILL AND DIM: on every
-/// palette, ground and task row its ring keeps a running dot's chroma at the
-/// same level (never the stuck dot's grey: three times its chroma, 0.1 more
-/// at a waiting dot's levels; Off's moonbow has no chroma to keep), its light is
-/// [`TOOL_GLOW`] of a running dot's (on paper its hollow's fill too), held
-/// inside its ring ([`TOOL_RADIUS`], where every running dot's light spreads
-/// past it), and never breathes.
 #[test]
 fn a_tool_dot_is_fresh_still_and_dim() {
     let fresh_and_dim = |look: DotLook, running: DotLook, dark: bool| {

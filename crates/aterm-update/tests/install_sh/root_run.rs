@@ -5,7 +5,7 @@
 
 use std::os::unix::fs::MetadataExt as _;
 
-use crate::support::{Lib, Scratch, install_sh, s, system_path};
+use crate::support::{Lib, Scratch, install_sh, q, s, system_path};
 
 #[test]
 fn a_root_run_acts_on_a_home_only_as_its_account() {
@@ -476,7 +476,11 @@ fn folders_an_earlier_root_run_left_are_named_at_their_top() {
         recs[named].out.lines().collect::<Vec<_>>(),
         [&local, &state]
     );
-    let quoted = state.replace(' ', "\\ ");
+    let quoted = if state.contains(' ') {
+        format!("'{state}'")
+    } else {
+        state.clone()
+    };
     assert_eq!(
         recs[note].out.trim_end(),
         format!(
@@ -497,7 +501,7 @@ fn folders_an_earlier_root_run_left_are_named_at_their_top() {
     assert!(
         recs[spaced]
             .out
-            .contains(&format!("sudo chown -R john\\ smith {local} ")),
+            .contains(&format!("sudo chown -R 'john smith' {local} ")),
         "{}",
         recs[spaced].out
     );
@@ -579,4 +583,225 @@ fn a_folder_the_account_can_write_is_its_own() {
     let call = lib.call("mine \"$HOME\" && mine /tmp && ! mine /", &[]);
     let recs = lib.run(&scratch);
     assert_eq!(recs[call].rc, 0, "{}", recs[call].err);
+}
+
+#[test]
+fn the_note_names_the_desktop_entry_and_icons_on_linux_alone() {
+    let scratch = Scratch::new();
+    let tmp = scratch.join("tmp");
+    let mut lib = Lib::new();
+    let on = |os: &str| {
+        format!(
+            "( HOME=\"$TMPDIR/{os}\"; BIN_DIR=\"$HOME/.local/bin\" STORE_DIR=\"$HOME/.local/lib/aterm/bin\"; \
+             d=\"$HOME/.local/share\"; mkdir -p \"$d/icons/hicolor/256x256/apps\" \"$d/applications\"; \
+             : >\"$d/icons/hicolor/256x256/apps/aterm.png\"; \
+             uname() {{ if [ \"$1\" = -s ]; then echo {os}; else command uname \"$@\"; fi; }}; \
+             mine() {{ case \"$1\" in */apps/aterm.png | */applications) return 1 ;; esac; }}; \
+             foreign_home_folders && printf '%s\\n' ${{FOREIGN_FOLDERS[@]+\"${{FOREIGN_FOLDERS[@]}}\"}} )"
+        )
+    };
+    let linux = lib.call(on("Linux"), &[]);
+    let darwin = lib.call(on("Darwin"), &[]);
+    let recs = lib.run(&scratch);
+    let t = |rel: &str| s(&tmp.join(rel)).to_string();
+    assert_eq!(recs[linux].rc, 0, "{}", recs[linux].err);
+    assert_eq!(
+        recs[linux].out.lines().collect::<Vec<_>>(),
+        [
+            t("Linux/.local/share/applications"),
+            t("Linux/.local/share/icons/hicolor/256x256/apps/aterm.png")
+        ]
+    );
+    assert_eq!(recs[darwin].rc, 0, "{}", recs[darwin].err);
+    assert_eq!(recs[darwin].out, "", "macOS has neither");
+}
+
+#[test]
+fn the_notes_command_is_one_word_per_path_in_every_shell() {
+    let scratch = Scratch::new();
+    let words = [
+        "alice",
+        "/a/b.c",
+        "john smith",
+        "it's",
+        "a\\b",
+        "",
+        "$HOME",
+        "/Users//x/Donn\u{e9}es",
+        "a\tb",
+    ];
+    let mut lib = Lib::new();
+    lib.env("LC_ALL", "C");
+    let calls: Vec<usize> = words
+        .iter()
+        .map(|w| {
+            lib.call(
+                format!(
+                    "w=$(printf '%s' {}); q=$(shell_word \"$w\"); printf '%s\\n' \"$q\"; \
+                     eval \"[ \\\"\\$w\\\" = $q ]\"",
+                    q(w)
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    let spelled: Vec<&str> = calls
+        .iter()
+        .map(|&i| recs[i].out.trim_end_matches('\n'))
+        .collect();
+    assert_eq!(
+        spelled,
+        [
+            "alice",
+            "/a/b.c",
+            "'john smith'",
+            "it\\'s",
+            "a\\\\b",
+            "''",
+            "'$HOME'",
+            "'/Users//x/Donn\u{e9}es'",
+            "$'a\\tb'",
+        ]
+    );
+    for (w, &i) in words.iter().zip(&calls) {
+        assert_eq!(recs[i].rc, 0, "{w:?} does not read back: {}", recs[i].err);
+    }
+}
+
+#[test]
+fn root_runs_no_program_another_account_can_change() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(
+        "mkdir -p \"$HOME/.local/bin\" && \
+         printf '#!/bin/sh\\necho \"$0 $*\" >>\"$TMPDIR/ran\"\\necho aterm 0.1.0\\n' >\"$HOME/.local/bin/aterm\" && \
+         chmod 755 \"$HOME/.local/bin/aterm\" && ln -s /bin/ls \"$TMPDIR/ls\" && \
+         for f in /usr/bin/*; do if [ -L \"$f\" ] && [ -f \"$f\" ]; then SYSLINK=$f; break; fi; done",
+    );
+    let as_account = lib.call("may_run \"$HOME/.local/bin/aterm\"", &[]);
+    lib.step("id() { if [ \"$1\" = -u ]; then echo 0; else command id \"$@\"; fi; }");
+    let may = |p: &str| format!("if may_run {p}; then echo yes; else echo no; fi");
+    let system = lib.call(may("/bin/ls"), &[]);
+    let system_link = lib.call(may("\"$SYSLINK\""), &[]);
+    let theirs = lib.call(may("\"$HOME/.local/bin/aterm\""), &[]);
+    let their_link = lib.call(may("\"$TMPDIR/ls\""), &[]);
+    let missing = lib.call(may("/nonexistent/aterm"), &[]);
+    let folder = lib.call(may("/bin"), &[]);
+    let verdict = lib.call(
+        "bin_aterm_verdict \"$HOME/.local/bin/aterm\" \"$HOME/.local/lib/aterm/bin\"",
+        &[],
+    );
+    let asked = lib.call(
+        "first_line_bounded \"$HOME/.local/bin/aterm\" --version && \
+         setup_aterm shell-setup \"$HOME/.local/bin\" \"$HOME/.local/bin\" && [ ! -e \"$TMPDIR/ran\" ]",
+        &[],
+    );
+    let bundles = lib.call(
+        "mkdir -p \"$TMPDIR/x.app/Contents\" && bundle_is_roots /bin && ! bundle_is_roots \"$TMPDIR/x.app\"",
+        &[],
+    );
+    // Linux shows every link as lrwxrwxrwx (Ubuntu's /bin -> usr/bin): a root
+    // link is root's whatever its mode, a folder every account can write is not.
+    let modes = lib.call(
+        "( ls_entry() { echo 'lrwxrwxrwx 1 0 0 7 Apr 22 2024 /bin -> usr/bin'; }; root_entry /bin ) && \
+         ! ( ls_entry() { echo 'lrwxrwxrwx 1 501 0 7 Apr 22 2024 /bin -> usr/bin'; }; root_entry /bin ) && \
+         ! ( ls_entry() { echo 'drwxrwxrwx 2 0 0 64 Apr 22 2024 /x'; }; root_entry /x ) && \
+         ( ls_entry() { echo 'drwxrwxrwt 2 0 0 64 Apr 22 2024 /x'; }; root_entry /x )",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[as_account].rc, 0, "a run as the account runs anything");
+    for (i, want) in [
+        (system, "yes"),
+        (system_link, "yes"),
+        (theirs, "no"),
+        (their_link, "no"),
+        (missing, "no"),
+        (folder, "no"),
+    ] {
+        assert_eq!(recs[i].out.trim(), want, "call {i}: {}", recs[i].err);
+    }
+    assert_eq!(
+        recs[verdict].out.trim(),
+        "foreign another account can change it, so root does not run it to ask what it is"
+    );
+    assert_eq!(recs[asked].rc, 0, "root ran it: {}", recs[asked].err);
+    assert_eq!(recs[asked].out, "");
+    assert_eq!(recs[bundles].rc, 0, "{}", recs[bundles].err);
+    assert_eq!(recs[modes].rc, 0, "{}", recs[modes].err);
+}
+
+#[test]
+fn a_home_still_to_be_made_is_judged_by_the_folder_it_lands_in() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    let anchors = lib.call(
+        "( HOME=\"$HOME/not/yet\"; home_anchor; home_owner_uid; HOME=/no-such-folder/x; home_anchor; \
+         HOME=; home_anchor )",
+        &[],
+    );
+    let named = lib.call(
+        "( h=\"$HOME\"; account_homes() { echo \"$h\"; }; HOME=\"$HOME/not/yet\"; home_owner_named )",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    let home = scratch.join("home");
+    assert_eq!(recs[anchors].rc, 0, "{}", recs[anchors].err);
+    assert_eq!(
+        recs[anchors].out.lines().collect::<Vec<_>>(),
+        [
+            s(&home).to_string(),
+            std::fs::metadata(&home).expect("HOME").uid().to_string(),
+            "/".to_string(),
+            "/".to_string()
+        ]
+    );
+    assert_eq!(
+        recs[named].rc, 0,
+        "a HOME to be made in the account's own home is in it"
+    );
+}
+
+#[test]
+fn a_source_build_names_what_it_cannot_change_before_it_starts() {
+    let scratch = Scratch::new();
+    let tmp = scratch.join("tmp");
+    let home = scratch.join("home");
+    let mut lib = Lib::new();
+    lib.step("ROOT=\"$TMPDIR/co\"; mkdir -p \"$ROOT/target/release\" \"$HOME/.cargo/registry\"");
+    let user = lib.call("id -un", &[]);
+    let clean = lib.call("source_build_preflight", &[]);
+    let stale = lib.call(
+        "( id() { if [ \"$1\" = -u ]; then echo 424242424; else command id \"$@\"; fi; }; \
+         source_build_preflight ) 2>&1",
+        &[],
+    );
+    let elsewhere = lib.call(
+        "( id() { if [ \"$1\" = -u ]; then echo 424242424; else command id \"$@\"; fi; }; \
+         ROOT=/nonexistent; CARGO_HOME=/usr/bin; source_build_preflight )",
+        &[],
+    );
+    let as_root = lib.call(
+        "( id() { if [ \"$1\" = -u ]; then echo 0; else command id \"$@\"; fi; }; source_build_preflight )",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    for i in [clean, elsewhere, as_root] {
+        assert_eq!(recs[i].rc, 0, "call {i}: {}", recs[i].err);
+    }
+    let (target, cargo) = (
+        s(&tmp.join("co/target")).to_string(),
+        s(&home.join(".cargo")).to_string(),
+    );
+    assert_eq!(recs[stale].rc, 1);
+    assert_eq!(
+        recs[stale].out.trim_end(),
+        format!(
+            "install.sh: the source build would fail: not yours, so cargo cannot change what is in \
+             {target} {cargo} (an install under sudo makes such folders root's) — give them back \
+             with: sudo chown -R {} {target} {cargo}",
+            recs[user].out.trim()
+        )
+    );
 }

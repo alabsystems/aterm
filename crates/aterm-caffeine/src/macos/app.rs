@@ -23,7 +23,7 @@ use super::ui::{self, StatusUi};
 use super::watch::Watch;
 use crate::launchd::{self, Startup, StartupDoors};
 use crate::menu::{self, Click, MenuAction, Row};
-use crate::model::Mode;
+use crate::model::{Clocks, Mode};
 use crate::notify::ChangedObserver;
 use crate::paths::Paths;
 use crate::state;
@@ -84,7 +84,7 @@ enum Next {
 }
 
 /// The seconds to the next tick at `now` in `mode` ([`TICK_SECS`]).
-const fn next_tick_secs(mode: Mode, now: u64) -> u64 {
+const fn next_tick_secs(mode: Mode, now: Clocks) -> u64 {
     match mode.remaining(now) {
         Some(left) if left < TICK_SECS => left + 1,
         _ => TICK_SECS,
@@ -114,9 +114,9 @@ fn click_from(event: Option<EventKey>, stale: Option<EventKey>) -> Click {
     click_of(fresh.map(|event| (event.kind, event.flags)))
 }
 
-/// The wall clock in whole seconds.
-fn now() -> u64 {
-    aterm_time::unix_secs().unwrap_or(0)
+/// Both clocks, read now ([`state::clocks`]).
+fn now() -> Clocks {
+    state::clocks().unwrap_or_default()
 }
 
 /// Everything the mug knows and holds.
@@ -187,7 +187,7 @@ impl Mug {
     }
 
     /// Hold the activity while on and show its actual state.
-    fn apply(&mut self, now: u64) -> bool {
+    fn apply(&mut self, now: Clocks) -> bool {
         if !self.mode.is_on(now) {
             self.awake = None;
         } else if self.awake.is_none() {
@@ -209,7 +209,7 @@ impl Mug {
     }
 
     /// Apply `mode` and save the resulting state.
-    fn set(&mut self, mode: Mode, now: u64) -> Next {
+    fn set(&mut self, mode: Mode, now: Clocks) -> Next {
         let requested = mode.settled(now);
         self.mode = requested;
         if !self.apply(now) || (self.mode == requested && !self.save()) {
@@ -219,12 +219,12 @@ impl Mug {
     }
 
     /// A left click: on forever when off, off when on.
-    fn toggle(&mut self, now: u64) -> Next {
+    fn toggle(&mut self, now: Clocks) -> Next {
         self.set(self.mode.toggled(now), now)
     }
 
     /// A menu choice.
-    fn choose(&mut self, action: MenuAction, now: u64) -> Next {
+    fn choose(&mut self, action: MenuAction, now: Clocks) -> Next {
         match action {
             MenuAction::Activate(choice) => self.set(Mode::chosen(choice, now), now),
             MenuAction::ToggleStartup => {
@@ -244,7 +244,7 @@ impl Mug {
     }
 
     /// Turn Enable at Startup on or off.
-    fn set_startup(&mut self, on: bool, now: u64) -> Next {
+    fn set_startup(&mut self, on: bool, now: Clocks) -> Next {
         if let Err(err) = launchd::set_startup(&self.paths, &self.label, &self.origin, on) {
             let verb = if on { "turn on" } else { "turn off" };
             aterm_log::warn!("caffeine: could not {verb} Enable at Startup: {err}");
@@ -265,7 +265,7 @@ impl Mug {
     }
 
     /// The tick, and a wake from sleep.
-    fn tick(&mut self, now: u64, menu_open: bool) -> Next {
+    fn tick(&mut self, now: Clocks, menu_open: bool) -> Next {
         let settled = self.mode.settled(now);
         if settled == self.mode {
             if !self.apply(now) {
@@ -297,17 +297,25 @@ impl Mug {
         Next::Stop(Exit::Quit)
     }
 
+    /// Take the saved mode at `now`, saving it back when the file keeps it on the wall clock
+    /// alone ([`state::take`]), so that no later read of the file, by `status`, a bridge or the
+    /// next mug, reads it against a wall clock changed since. Whether that save, if due, was made.
+    fn take(&mut self, now: Clocks) -> bool {
+        let (mode, wall_only) = state::take(&self.paths.state_file(), now);
+        self.mode = mode;
+        !wall_only || self.save()
+    }
+
     /// Take the writer's mode.
-    fn reload(&mut self, now: u64) -> Next {
-        self.mode = state::load(&self.paths.state_file(), now);
-        if !self.apply(now) {
+    fn reload(&mut self, now: Clocks) -> Next {
+        if !self.take(now) || !self.apply(now) {
             return Next::Stop(Exit::Quit);
         }
         Next::Tick(next_tick_secs(self.mode, now))
     }
 
     /// The first [`Mug::apply`] of the mode read at the start.
-    fn begin(&mut self, now: u64) -> bool {
+    fn begin(&mut self, now: Clocks) -> bool {
         let applied = self.apply(now);
         bridge::release(&self.paths);
         applied
@@ -324,7 +332,7 @@ impl Mug {
     }
 
     /// The menu's rows at `now`.
-    fn rows(&self, now: u64) -> Vec<Row> {
+    fn rows(&self, now: Clocks) -> Vec<Row> {
         menu::compose(self.mode, now, self.startup(), &self.version)
     }
 }
@@ -495,7 +503,7 @@ impl CaffeineTarget {
     }
 
     /// Bring the menu up to date and pop it up below the button, outside the borrow.
-    fn show_menu(&self, now: u64) {
+    fn show_menu(&self, now: Clocks) {
         let popup = autoreleasepool(|_| {
             let mut mug = self.ivars().mug.try_borrow_mut().ok()?;
             if mug.exit.is_some() {
@@ -859,7 +867,9 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
         let Ok(mut mug) = target.ivars().mug.try_borrow_mut() else {
             return ExitCode::FAILURE;
         };
-        mug.mode = state::load(&mug.paths.state_file(), now);
+        if !mug.take(now) {
+            return refuse(&mug.paths, "the mug could not save the mode it read");
+        }
         let rows = mug.rows(now);
         mug.ui = ui::install(
             target.as_id(),
@@ -914,7 +924,10 @@ mod tests {
     use super::*;
     use crate::model::{Choice, HOUR};
 
-    const NOW: u64 = 1_790_000_000;
+    const NOW: Clocks = Clocks {
+        since_boot: 300_000,
+        wall: 1_790_000_000,
+    };
 
     #[test]
     fn a_refusal_lets_a_left_bridge_go() {
@@ -937,19 +950,18 @@ mod tests {
         assert_eq!(next_tick_secs(Mode::Forever, NOW), TICK_SECS);
         let hour = Mode::chosen(Choice::Hours1, NOW);
         assert_eq!(next_tick_secs(hour, NOW), TICK_SECS);
-        assert_eq!(next_tick_secs(hour, NOW + HOUR - 60), TICK_SECS);
-        assert_eq!(next_tick_secs(hour, NOW + HOUR - 59), 60);
-        assert_eq!(next_tick_secs(hour, NOW + HOUR - 30), 31);
-        assert_eq!(next_tick_secs(hour, NOW + HOUR - 1), 2);
+        assert_eq!(next_tick_secs(hour, NOW + (HOUR - 60)), TICK_SECS);
+        assert_eq!(next_tick_secs(hour, NOW + (HOUR - 59)), 60);
+        assert_eq!(next_tick_secs(hour, NOW + (HOUR - 30)), 31);
+        assert_eq!(next_tick_secs(hour, NOW + (HOUR - 1)), 2);
         assert_eq!(next_tick_secs(hour, NOW + HOUR), TICK_SECS);
-        let deadline = NOW + HOUR;
-        for start in NOW..deadline {
+        for start in 0..HOUR {
             let mut at = start;
-            while at < deadline {
-                at += next_tick_secs(hour, at);
+            while at < HOUR {
+                at += next_tick_secs(hour, NOW + at);
             }
-            assert!(at <= deadline + 1, "from {start}: {at}");
-            assert_eq!(hour.settled(at), Mode::Off);
+            assert!(at <= HOUR + 1, "from {start}: {at}");
+            assert_eq!(hour.settled(NOW + at), Mode::Off);
         }
     }
 
@@ -1028,7 +1040,7 @@ mod tests {
     }
 
     fn saved(mug: &Mug) -> Option<Mode> {
-        state::read(&mug.paths.state_file()).map(|s| s.mode)
+        state::read(&mug.paths.state_file(), NOW).map(|s| s.mode)
     }
 
     #[test]
@@ -1104,7 +1116,7 @@ mod tests {
         assert_eq!(mug.mode, hour);
         assert_eq!(saved(&mug), Some(hour));
         assert!(mug.awake.is_some());
-        assert_eq!(mug.tick(NOW + HOUR - 30, false), Next::Tick(31));
+        assert_eq!(mug.tick(NOW + (HOUR - 30), false), Next::Tick(31));
         assert_eq!(mug.mode, hour);
         assert_eq!(mug.tick(NOW + HOUR + 1, false), Next::Tick(TICK_SECS));
         assert_eq!(mug.mode, Mode::Off);
@@ -1115,6 +1127,29 @@ mod tests {
         assert_eq!(mug.choose(MenuAction::Quit, NOW), Next::Stop(Exit::Quit));
         assert_eq!(saved(&mug), Some(Mode::Off));
         assert!(mug.awake.is_none());
+    }
+
+    /// Ten minutes into Activate for 1 Hour, the wall clock set back a day: the mug still lets
+    /// go at the hour's end, and the hold, the file and the tooltip agree.
+    #[test]
+    fn a_clock_set_back_keeps_the_mac_awake_no_longer_than_the_span() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let mut mug = scratch_mug(dir.path());
+        let _ = mug.choose(MenuAction::Activate(Choice::Hours1), NOW);
+        let back = Clocks {
+            since_boot: NOW.since_boot + 600,
+            wall: NOW.wall - 24 * HOUR + 600,
+        };
+        assert_eq!(mug.tick(back, false), Next::Tick(TICK_SECS));
+        assert!(mug.awake.is_some());
+        assert_eq!(
+            state::load(&mug.paths.state_file(), back).remaining(back),
+            Some(HOUR - 600)
+        );
+        assert_eq!(mug.tick(back + (HOUR - 600), false), Next::Tick(TICK_SECS));
+        assert_eq!(mug.mode, Mode::Off, "the hour is up");
+        assert!(mug.awake.is_none());
+        assert_eq!(saved(&mug), Some(Mode::Off));
     }
 
     #[test]
@@ -1185,6 +1220,50 @@ mod tests {
         assert_eq!(mug.mode, state::load(&file, NOW));
         assert_eq!(mug.awake.is_some(), mug.mode.is_on(NOW));
         assert_eq!(std::fs::read(&file).expect("read"), before);
+    }
+
+    /// Activate for 8 Hours an hour from its end, in a file an earlier build wrote, taken at the
+    /// start (the update's restart into this build) or from a writer: the mug saves it back on
+    /// the boot clock, so a read of the file once the date is set back or forward a day
+    /// (`status`, a bridge, the next mug) has the 50 minutes the mug holds.
+    #[test]
+    fn an_earlier_builds_file_is_saved_back_on_the_boot_clock() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let mut mug = scratch_mug(dir.path());
+        let file = mug.paths.state_file();
+        std::fs::create_dir_all(&mug.paths.state_dir).expect("state dir");
+        let earlier = format!(
+            "mode=until\ndeadline={}\nspan={}\nboot={}\n",
+            NOW.wall + HOUR,
+            8 * HOUR,
+            state::boot_text(crate::instance::boot_id().expect("this boot"))
+        );
+        for from_writer in [false, true] {
+            let how = if from_writer {
+                "from a writer"
+            } else {
+                "at the start"
+            };
+            std::fs::write(&file, &earlier).expect("an earlier build's file");
+            let taken = if from_writer {
+                mug.reload(NOW) == Next::Tick(TICK_SECS)
+            } else {
+                mug.take(NOW)
+            };
+            assert!(taken, "{how}");
+            assert_eq!(mug.mode.remaining(NOW), Some(HOUR), "{how}");
+            for wall in [NOW.wall - 24 * HOUR + 600, NOW.wall + 24 * HOUR + 600] {
+                let later = Clocks {
+                    since_boot: NOW.since_boot + 600,
+                    wall,
+                };
+                assert_eq!(
+                    state::load(&file, later).remaining(later),
+                    Some(HOUR - 600),
+                    "{how}, the wall clock at {wall}"
+                );
+            }
+        }
     }
 
     #[test]

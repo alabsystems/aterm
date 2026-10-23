@@ -10,14 +10,11 @@ use std::time::Duration;
 
 use crate::lock::Flock;
 
-/// How long a read-modify-write waits for the file's lock. The holder keeps it for one
-/// small read and write; a wedged holder costs this one update, never a hung thread.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 
-/// Per-process sequence for temp names, so no two writes share a temp.
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Replace `path` with `bytes`: a fresh `0644` temp sibling, fsync, rename, directory fsync.
+/// Replace `path` with `bytes`.
 /// # Errors
 /// The temp could not be created, written, flushed or renamed; the temp is removed.
 pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -54,13 +51,10 @@ fn replace_via(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// How many times [`again_while_refused`] tries an operation again; the waits between
-/// the tries grow by a millisecond each, about 0.2 s in all.
+/// How many times [`again_while_refused`] tries an operation again.
 #[cfg(windows)]
 const REFUSED_TRIES: u64 = 20;
 
-/// `op`, tried again while Windows refuses it with `ERROR_ACCESS_DENIED`; elsewhere, `op`
-/// once.
 fn again_while_refused<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     #[cfg(windows)]
     {
@@ -92,8 +86,8 @@ pub(super) fn lock_for_update(path: &Path) -> io::Result<Flock> {
     Flock::lock_within(open_lock_file(&lock)?, LOCK_WAIT, &lock)
 }
 
-/// Open (creating `0600`, never truncating: a lock file is a rendezvous, not data) the
-/// lock file at `path`; std opens it close-on-exec.
+/// Open (creating `0600`, never truncating: a lock file is a rendezvous, not data) the lock file at
+/// `path`.
 fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).read(true).write(true).truncate(false);
@@ -116,16 +110,12 @@ pub(super) fn temp_path(path: &Path, seq: u64) -> io::Result<PathBuf> {
     Ok(path.with_file_name(tmp))
 }
 
-/// `path`'s final component as UTF-8.
 fn file_name(path: &Path) -> io::Result<&str> {
     path.file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))
 }
 
-/// Create, write and flush the temp. `0644` on the handle as well as at creation: the
-/// umask may clear bits, and under a system prefix a non-root reader must still read what
-/// root wrote.
 fn stage(tmp: &Path, bytes: &[u8]) -> io::Result<()> {
     stage_with(tmp, bytes, crate::platform::sync_file_contents)
 }
@@ -177,9 +167,7 @@ pub(super) fn read_toml<T: serde::de::DeserializeOwned>(path: &Path, limit: usiz
     aterm_toml::from_str(&text).ok()
 }
 
-/// Read a [`write_durable`] file whole, bounded to `limit` bytes of UTF-8: the old file or
-/// the new one, a refusal while a replace is in flight tried again
-/// ([`again_while_refused`]).
+/// Read a [`write_durable`] file whole ([`again_while_refused`]).
 fn read_durable(path: &Path, limit: usize) -> io::Result<String> {
     again_while_refused(|| crate::metadata_io::read_bounded_regular_utf8(path, limit))
 }
@@ -205,13 +193,6 @@ mod tests {
         crate::testdir::dir(&format!("atpkg-vendor-durable-{label}-"))
     }
 
-    /// Each replace names its flush (aterm-durable's counting seam): the durable one's
-    /// directory flush is durable (its temp takes a plain `fsync(2)`, which the seam does
-    /// not see); the ordered one orders the temp and the directory, and the vendor stamp
-    /// takes it. Windows opens no directory to flush (`store::sync_dir` is best-effort), and
-    /// its temp's own flush is `aterm_durable::durable_data`, which the seam does see: the
-    /// durable replace's one durable flush is the temp's there, and the ordered one orders
-    /// the temp alone.
     #[test]
     fn each_replace_names_its_flush() {
         use aterm_durable::{Flush, seam::Recording};
@@ -230,8 +211,6 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"a = 2\n");
     }
 
-    /// A leftover temp a dead process of this pid left under the next name is replaced;
-    /// another pid's is ignored.
     #[test]
     fn a_leftover_temp_is_replaced_or_ignored() {
         let d = dir("leftover");
@@ -257,7 +236,6 @@ mod tests {
         }
     }
 
-    /// A failed rename leaves the destination untouched and no temp behind.
     #[test]
     fn a_failed_replace_leaves_no_temp() {
         let d = dir("fail");
@@ -276,8 +254,6 @@ mod tests {
         assert!(dest.join("keep").exists());
     }
 
-    /// Concurrent writers of one file never expose a torn file: each stages through its
-    /// own temp.
     #[test]
     fn concurrent_writers_never_tear_the_file() {
         use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -319,8 +295,6 @@ mod tests {
         assert!(last == a || last == b);
     }
 
-    /// A dropped update lock is free at once while a copy of its descriptor lives — the
-    /// copy a child another thread is spawning holds until it execs.
     #[test]
     fn a_dropped_update_lock_is_free_while_a_copy_of_its_descriptor_lives() {
         let d = dir("lock-dup");
@@ -332,7 +306,6 @@ mod tests {
         drop((again, childs_copy));
     }
 
-    /// A lock still held is refused at the bound.
     #[test]
     fn a_held_update_lock_times_out() {
         let d = dir("lock-held");

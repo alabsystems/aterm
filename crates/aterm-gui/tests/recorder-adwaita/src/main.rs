@@ -18,8 +18,7 @@ mod shadow {
     include!(concat!(env!("OUT_DIR"), "/shadow.rs"));
 }
 
-/// parts.rs's part numbers (parts.rs itself makes subsurfaces through
-/// smithay-client-toolkit, which this recorder does not build).
+/// `parts.rs` part indices.
 mod parts {
     pub struct DecorationParts;
     impl DecorationParts {
@@ -31,8 +30,7 @@ mod parts {
     }
 }
 
-/// The two smithay-client-toolkit (wayland-csd-frame 0.3.0) types
-/// `buttons.rs` names, with that crate's bits for the flags it reads.
+/// Stub `wayland-csd-frame` flag types referenced by `buttons.rs`.
 mod smithay_client_toolkit {
     pub mod reexports {
         pub mod csd_frame {
@@ -74,7 +72,6 @@ pub enum Location {
     Button(buttons::ButtonKind),
 }
 
-/// lib.rs's alias.
 type SkiaResult = Option<()>;
 
 use std::path::PathBuf;
@@ -83,9 +80,6 @@ use std::path::PathBuf;
 /// of one side overlaps the other's.
 const HEADER_W: u32 = 800;
 
-/// The values the `layout` rows read: GNOME's default, the common ones, and
-/// what the parse makes of odd ones (spaces, a lone side, too many buttons,
-/// repeats, unknown names, empty sides, three sides).
 const VALUES: &[&str] = &[
     "appmenu:close",
     "appmenu:minimize,maximize,close",
@@ -119,8 +113,6 @@ fn kind_name(k: buttons::ButtonKind) -> &'static str {
     }
 }
 
-/// What `config::get_button_layout_config` reads with `value` set (`None`:
-/// no portal), through this crate's `dbus-send` first on PATH.
 fn read_config(value: Option<&str>, fake_dir: &std::path::Path) -> Option<(String, String)> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let mut dirs = vec![fake_dir.to_path_buf()];
@@ -143,21 +135,15 @@ fn join(v: &[&str]) -> String {
     }
 }
 
-/// The window sizes (logical px) the `plane` rows draw the parts of: the
-/// lane's Mutter window, the profile rows' window, a full output, an odd
-/// size, and one smaller than the shadow's corners.
 const PLANE_SIZES: &[(u32, u32)] = &[(744, 528), (400, 300), (1280, 800), (401, 299), (30, 20)];
 
-/// FNV-1a 64.
 fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
 
-/// The `plane` rows: each border part's buffer as aterm draws its parts
-/// around a `w`×`h` window (no separate header: the top and bottom parts
-/// span the window and both borders, the sides the window's height).
+/// Prints FNV-1a and alpha sums for each border part across [`PLANE_SIZES`].
 fn planes() {
     let depth = theme::BORDER_SIZE;
     for &(w, h) in PLANE_SIZES {
@@ -261,9 +247,7 @@ fn main() {
     );
 }
 
-/// The buttons on each side, left to right, as `find_button` answers across
-/// the header's button row: each run of one button's pixels is one button, a
-/// run left of the middle on the left side.
+/// Returns `(left, right)` button names across the header button row.
 fn sides(b: &buttons::Buttons) -> (Vec<&'static str>, Vec<&'static str>) {
     let (mut left, mut right) = (Vec::new(), Vec::new());
     let mut last = Location::None;
@@ -285,11 +269,7 @@ fn sides(b: &buttons::Buttons) -> (Vec<&'static str>, Vec<&'static str>) {
     (left, right)
 }
 
-/// The alpha `Shadow::draw` paints across part `idx` of a 400×300 window,
-/// from the window's edge outward, along the part's middle line (past the
-/// corners). A part is `theme::BORDER_SIZE` deep and as long as
-/// `parts.rs`'s `resize` makes it: the top and bottom the window's width
-/// and both borders, the sides the window's height and the header's.
+/// Samples shadow alpha outward along the middle line of part `idx`.
 fn profile(idx: usize, scale: u32, active: bool) -> Vec<u8> {
     let (w, h) = (400u32, 300u32);
     let depth = theme::BORDER_SIZE;

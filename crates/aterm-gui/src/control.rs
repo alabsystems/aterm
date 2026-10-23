@@ -667,11 +667,13 @@ fn help_short_catalog() -> String {
     use aterm_types::control_verbs::{catalog_lines, json_verbs};
     let json_verbs = json_verbs().collect::<Vec<_>>().join("/");
     let mut body = format!(
-        "# Framing: one \"OK …\"/\"ERR …\" status line, or \"OK <count>\" + <count> content lines; \
-         empty content = no data, never an error\n\
+        "# Framing: one \"OK …\"/\"ERR …\" status line, or \"OK <count>\" + <count> content lines \
+         (\"OK <nbytes>\" + raw bytes for cast, temporal, doc read, inbox get); empty content = no \
+         data, never an error\n\
          # --json on {json_verbs} = structured output · \"@<sid> <verb>\" = run it on that session \
-         (a bare @, what @$W is when $W is empty, is refused)\n\
-         # help <verb> = the full entry · help --full = the complete catalog\n"
+         (an @ that names nothing, as \"@$W\" with $W empty, is refused)\n\
+         # help <verb> = the full entry · help --full = the complete catalog · help --json = the \
+         catalog as JSON\n"
     );
     for line in catalog_lines() {
         body.push_str(&line);
@@ -707,25 +709,26 @@ fn help_full_catalog() -> String {
         .collect::<Vec<_>>()
         .join("/");
     let header = &format!(
-        r#"# Framing: every reply is a STATUS line ("OK …" / "ERR …") OR raw CONTENT lines. Content
-# verbs prefix "OK <count>" then <count> lines — except the Bytes-framed verbs (cast,
-# temporal, inbox get, outbox), which prefix "OK <nbytes>" then exactly that many raw bytes;
-# aterm-ctl prints the content and consumes the OK line, so an EMPTY content reply means NO
-# DATA — it is never an error (errors are always "ERR …"). Add "--json" to {json_verbs} for
-# structured output; a verb without a json form answers "ERR json: not supported for <verb>"
-# or, outside that allowlist, reads "--json" as an ordinary argument — do not probe with it.
-# Cross-session: prefix a verb with "@<selector>" (e.g. "@s-ab12 text"); an "@" that names
-# nothing (an empty $W in "@$W") is refused, never the active tab. Same-user only;
-# the per-launch token is auto-discovered by aterm-ctl. A sid hosted by ANOTHER same-user
-# aterm instance is relayed to it transparently (owner connections): every session of every
-# instance is addressable here. Discover peers with `sessions` (this instance) or the
-# client-side `aterm-ctl ls` (all instances).
+        r#"# Framing: every reply is one STATUS line ("OK …" / "ERR …"), or "OK <count>" then <count>
+# CONTENT lines, or, for the bytes verbs (cast, temporal, doc read, inbox get), "OK <nbytes>"
+# then exactly that many raw bytes. `aterm ctl` prints the content without its OK line, so
+# EMPTY output means NO DATA, never an error (errors are always "ERR …").
+# "--json" on {json_verbs} gives structured output; any other verb answers
+# "ERR json: not supported for <verb>" or reads "--json" as an ordinary argument, so do not
+# probe with it (`send --json` types it).
+# Cross-session: prefix a verb with "@<selector>" (@self, @<sid>, @<n>, or @. for the active
+# tab; e.g. "@s-ab12 text"). An "@" that names nothing (an empty $W in "@$W") is refused,
+# never read as the active tab. Same user only; `aterm ctl` reads the per-launch token
+# itself. On an owner connection, a sid that ANOTHER aterm instance hosts is relayed to it,
+# so every session of every instance is addressable here: `sessions` lists this instance's,
+# the client-side `aterm ctl ls` every instance's.
 # TARGETING RULE: the @<sid> selects WHERE the verb runs. SESSION verbs (text/screen/
 # image/turn/send/…) act on that session. APP-LEVEL verbs (window/chrome/controls/open/
-# settings/invoke/…) act on the resolved instance's FRONT window — the selector routes to
-# the instance (cross-instance via relay), e.g. `@peer window` screenshots the peer's
-# window, `@peer invoke NewTab` opens a tab in the peer. `tab` and `spawn` differ: an
-# explicit `@<sid>` aims them at the window HOSTING that session; flagless stays FRONT.
+# settings/invoke/…) act on the FRONT window of the instance hosting it: `@<sid> window`
+# screenshots that instance's front window, `@<sid> invoke NewTab` opens a tab there. `tab`,
+# `spawn` and `panes` act on the window HOSTING that session instead (the front window
+# without an @<sid>), and `theme session` on that session; `edit` needs the @<sid> and
+# opens beside that session's tab.
 #
 # SEEING a terminal (yours or a peer's) — five modes, pick by need:
 #   text / screen        what the PROGRAM wrote (plain rows / lossless styled grid)
@@ -7676,9 +7679,10 @@ const SUBSCRIBE_USAGE: &str = "ERR usage: subscribe [@<sel>[,<sel>]|@*] <streams
 
 fn subscribe_usage_bytes() -> Vec<u8> {
     format!(
-        "{SUBSCRIBE_USAGE}  <streams>: a subset of {} and must name at least one frame \
-         source; mail takes mail:kinds=<k,..>, mail:from=<class|principal> and/or \
-         mail:topic=<t>; log takes log:lvl=<session|run|turn|step> and/or log:class=turn\n",
+        "{SUBSCRIBE_USAGE}  <streams>: a comma list from {}, naming at least one besides \
+         timestamps (ts) and trim; no target means @. (the active tab); mail takes \
+         mail:kinds=<k,..>, mail:from=<class|principal> and/or mail:topic=<t>; log takes \
+         log:lvl=<session|run|turn|step> and/or log:class=turn\n",
         aterm_types::control_verbs::SUBSCRIBE_STREAMS.join(",")
     )
     .into_bytes()

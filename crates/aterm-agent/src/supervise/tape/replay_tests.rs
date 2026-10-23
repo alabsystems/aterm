@@ -6,13 +6,10 @@
 use super::*;
 use crate::supervise::tape::header::VERBATIM;
 
-/// A core over `records`, its roots empty.
 fn core_of(records: Vec<EffectRecord>) -> Arc<ReplayCore> {
     ReplayCore::start(records, VERBATIM, VERBATIM, "test", None)
 }
 
-/// `f` run against the core, the halt it unwinds with caught: `Err` when the
-/// replay halted.
 fn run<T>(f: impl FnOnce() -> T) -> Result<T, ()> {
     std::panic::catch_unwind(AssertUnwindSafe(f)).map_err(|payload| {
         assert!(
@@ -30,11 +27,6 @@ fn exchange(door: &str, request: &[u8], reply: &[u8]) -> EffectRecord {
     }
 }
 
-/// Each door serves its record: a monotonic read as an instant that far past
-/// the replay's origin, a wall read as its nanoseconds, a round trip as the
-/// recorded reply to the recorded request, a file as its bytes, an output
-/// compared; the control lane's requests and the printed lines are kept for
-/// the report.
 #[test]
 fn each_door_serves_its_record() {
     let core = core_of(vec![
@@ -74,24 +66,6 @@ fn each_door_serves_its_record() {
     assert_eq!(st.lines, ["APPROVED seq=1 ls"]);
 }
 
-/// AN ACT'S ROW REPLAYS IN THE BOOT SPELLING ITS TAPE RECORDED: a tape a
-/// build before the boot was read as bytes recorded (the kernel's text as it
-/// came — Linux's lower-case `boot_id`, macOS's upper-case
-/// `kern.bootsessionuuid` — in the count and in the act's ledger row) is fed
-/// back through the probe door the loop reads ([`Fx::asleep_for_ledger`])
-/// and its validated counted writer
-/// (`approvals::Ledger::write_counted_with_boot_text`),
-/// and the row it writes is the recorded one, byte for byte: the boot keeps
-/// the case it was read in (`policy::sleeps::Boot`), while the count compares
-/// by the 16 bytes alone. A count whose boot text names no boot (the all-zero
-/// id, a test's old name) replays as no named boot, and its row holds no count.
-/// Broader accepted text (mixed case, missing or displaced hyphens, and a
-/// NUL-framed UUID) also retains its exact recorded JSON spelling, without
-/// changing this host's live boot form. These are admitted-reader controls,
-/// not claims about text a normal historical kernel produced.
-/// NEGATIVE CONTROL: the Linux tape against a row written upper-case — what a
-/// build that spells every boot as macOS does would emit — diverges at the
-/// ledger door.
 #[test]
 fn an_acts_row_replays_in_the_boot_spelling_its_tape_recorded() {
     use crate::supervise::approvals::{Ledger, Outcome, Row};
@@ -213,10 +187,6 @@ fn an_acts_row_replays_in_the_boot_spelling_its_tape_recorded() {
     assert_eq!(d.door.as_deref(), Some(doors::LEDGER), "CONTROL: {d:?}");
 }
 
-/// A divergence unwinds from the door it is found at, latched as the first:
-/// its place, its door and its class; and nothing is served after it — a
-/// door asked again (as a loop that caught the unwind would) unwinds again,
-/// the first divergence kept.
 #[test]
 fn a_divergence_unwinds_and_nothing_is_served_after_it() {
     let core = core_of(vec![
@@ -241,9 +211,6 @@ fn a_divergence_unwinds_and_nothing_is_served_after_it() {
     ));
 }
 
-/// A flag read finds its record only where the recording's first true read
-/// was — after as many false reads as it counted — and is true from then on;
-/// flag reads that consume nothing past the guard's bound are no progress.
 #[test]
 fn a_flag_is_raised_where_it_was_and_the_guard_bounds_idle_reads() {
     let core = core_of(vec![
@@ -275,9 +242,6 @@ fn a_flag_is_raised_where_it_was_and_the_guard_bounds_idle_reads() {
     );
 }
 
-/// The classes: an act on either side is a decision (the host's acts among
-/// them), a decision's mark is a decision, an output, a write or a host's
-/// notification at the recorded door is an output, anything else drifts.
 #[test]
 fn a_divergence_is_sorted_by_what_differs() {
     let key = codec::ctl_request(&["key", "1"]);

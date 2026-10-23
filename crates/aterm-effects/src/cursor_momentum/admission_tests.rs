@@ -12,7 +12,6 @@ use super::*;
 use crate::cursor_momentum::test_fixtures::{Clock, TAU, config, padded, plain};
 use crate::cursor_momentum::{MOMENTUM_GLOW_RADIUS_CELLS, MomentumGlow, MomentumGlowFrame};
 
-/// Another effect's quad, already in a stream before the glow's tick.
 const OTHER: GlowQuad = GlowQuad {
     row: 9,
     x: 3,
@@ -84,8 +83,6 @@ fn hosted_tick(
     Ok((frame, budget, pushed))
 }
 
-/// A glow at full typing rate, ticked once at `intensity`, with other effects'
-/// quads already in both streams.
 fn tick_once(
     p: &MomentumProfile,
     cur: (u16, u16),
@@ -102,8 +99,6 @@ fn tick_once(
         .unwrap_or_else(|e| panic!("an admitted case: {e}"))
 }
 
-/// The design's closed form for the dark budget at `s = 1`:
-/// `16 · min(⌈2·ry/row_h⌉, ⌈(fx_bot − fx_top)/row_h⌉ + 1)`.
 fn dark_closed_form(geom: &Geom, radius: f32) -> usize {
     let ch = geom.ch as f32;
     let ry = ch * (0.45 + 0.6 * radius * 1.0);
@@ -143,7 +138,6 @@ impl Tightness {
     }
 }
 
-/// A deterministic xorshift for the sweep's random half.
 struct Rng(u64);
 
 impl Rng {
@@ -165,16 +159,6 @@ impl Rng {
     }
 }
 
-/// The property sweep. It covers a structured grid of cell sizes (row heights
-/// that do and do not divide the cell, strides 1 to 4) × radii × both pages ×
-/// the grid's corners and centre × three amplitudes, plus random geometries
-/// with padding, head bands, glyph spans and bar carets. Every admitted tick
-/// pushes within its budget and leaves the reserved streams' capacity
-/// unchanged. The dark budget never exceeds the design's closed form, and the
-/// light budget never exceeds 4095. The bound is tight. Some case on each page
-/// pushes exactly its budget, so one quad less would overflow there. Where the
-/// derived formula binds (dark budgets of 100 or more, light below the cap),
-/// some case pushes at least three quarters of it.
 #[test]
 fn every_admitted_tick_pushes_within_its_budget_and_never_reallocates() {
     let p = &MOMENTUM_PROFILE;
@@ -280,9 +264,6 @@ fn every_admitted_tick_pushes_within_its_budget_and_never_reallocates() {
     );
 }
 
-/// The budget covers every amplitude a tick can draw: each `u8` step from the
-/// hot floor to full (intensity sets it, the rate is full) stays within it,
-/// on both pages, at the production radius and at the profile's maximum.
 #[test]
 fn the_budget_is_the_worst_case_over_every_amplitude() {
     let p = &MOMENTUM_PROFILE;
@@ -325,11 +306,6 @@ fn the_budget_is_the_worst_case_over_every_amplitude() {
     assert!(drew > 0, "fixture: the amplitude sweep draws");
 }
 
-/// The largest grid the profile admits (65 535 px on each axis, with and
-/// without a head band, and a single cell 65 535 px tall), at the largest
-/// radius and τ, ticked at the horizon and queried with the longest frame
-/// interval. Every tick runs within its budget, and the deadline arithmetic
-/// does not overflow.
 #[test]
 fn the_maximum_admitted_profile_runs_within_its_budget() {
     let p = &MOMENTUM_PROFILE;
@@ -406,9 +382,6 @@ fn the_maximum_admitted_profile_runs_within_its_budget() {
     }
 }
 
-/// One ulp, one pixel or one nanosecond past each limit is refused, and the
-/// limit itself is admitted. A refused tick never reaches the engine: the
-/// state and both streams (contents and capacity) are as they were.
 #[test]
 fn one_step_past_the_profile_is_refused_before_the_tick() {
     let p = &MOMENTUM_PROFILE;
@@ -821,9 +794,6 @@ fn frame_interval_admission_refuses_past_the_profile() {
     }
 }
 
-/// A tick that cannot be hot (no cursor, a cursor just outside the grid,
-/// disabled, intensity ≤ 0) is budgeted nothing. Ticked on a hot engine with
-/// nothing reserved, it pushes nothing and allocates nothing.
 #[test]
 fn a_tick_that_cannot_be_hot_is_budgeted_nothing_and_pushes_nothing() {
     let p = &MOMENTUM_PROFILE;
@@ -889,8 +859,6 @@ fn a_tick_that_cannot_be_hot_is_budgeted_nothing_and_pushes_nothing() {
     }
 }
 
-/// A hand-built profile wider than the envelope, or one with NaN limits,
-/// admits nothing the envelope refuses.
 #[test]
 fn a_profile_wider_than_the_envelope_is_held_to_the_envelope() {
     let e = &MOMENTUM_ENVELOPE;
@@ -970,10 +938,6 @@ fn a_profile_wider_than_the_envelope_is_held_to_the_envelope() {
     );
 }
 
-/// The envelope's radius was chosen so that every `f32 → i32` the halo makes
-/// stays exact. At the envelope's limits (64 cells, a 65 535 px cell) the
-/// budget's own walk and the engine both run, and the pushes stay within the
-/// budget.
 #[test]
 fn the_envelopes_largest_halo_stays_within_its_budget() {
     let e = &MOMENTUM_ENVELOPE;
@@ -1013,8 +977,6 @@ fn the_envelopes_largest_halo_stays_within_its_budget() {
     }
 }
 
-/// `Geom::fx_*` and `cell_center` agree with the narrowed grid the budget
-/// walks, so the walk anchors where `emit_halo` does.
 #[test]
 fn the_budget_anchors_its_rows_where_the_halo_does() {
     let geom = padded();

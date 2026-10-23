@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// The burst, replayed through the real companion and the real renderer: a fast typist's line
-// (the trail gallery's `burst`: `echo the quick brown fox jumps over the lazy dog as the kitty
-// flies` at 50 ms a key on a prompt), then the five seconds after it, every 16 ms frame. The
-// resident pet bounds back along the line under its letters, drawn under the ink, and rests a
-// row lower, its whole body off the letters (the wrap it waits on never comes). Every
-// frame's letters are judged per glyph pixel: each pixel that reads 4.5:1 or more against the
-// page in the frame without the companion is read in the frame with it against the median of its
-// nearest ring (1, then 2 px out) of pixels the glyphs leave at the page, as `aterm-lab
-// trail-contrast`'s local measure judges them, on a dark page and on paper. Nothing reads under
-// 4.5:1. Negative control: with the knock-out off the body under the line takes letters under
-// the bar (the 2026-10-22 gallery's resting head: 1.3 to 4.4:1 on `he`).
+
+//! Tests glyph-pixel contrast of typing bursts rendered with the companion sprite.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,9 +24,6 @@ const FRAME_MS: u64 = 16;
 const KEY_MS: u64 = 50;
 const LINE: &str = "echo the quick brown fox jumps over the lazy dog as the kitty flies";
 const BAR: f64 = 4.5;
-/// A letter's solid ink, the pixels judged: at least this share of the ink's own ratio against the
-/// page in the frame without the companion (`aterm-lab trail-contrast`'s `SOLID_SHARE`), so the
-/// antialiased rim, which reads less on any page, is not.
 const SOLID_SHARE: f64 = 0.85;
 
 fn lin(c: u32) -> f64 {
@@ -58,7 +45,6 @@ fn contrast(a: u32, b: u32) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-/// Each channel's median (the upper one of an even count).
 fn median(px: &mut [u32]) -> u32 {
     let mid = px.len() / 2;
     let mut out = 0;
@@ -70,9 +56,6 @@ fn median(px: &mut [u32]) -> u32 {
     out
 }
 
-/// The worst ink pixel of `frame`: each pixel of `clean` in a letter's cell (`letter(x, y)`) that
-/// is solid ink ([`SOLID_SHARE`] of `ink`'s ratio against `page`), read against the median of its
-/// nearest ring of pixels `clean` leaves at the page.
 fn worst_ink(
     clean: &[u32],
     frame: &[u32],
@@ -136,7 +119,6 @@ struct Replay {
     clean: Option<(u64, Vec<u32>)>,
 }
 
-/// One judged frame.
 struct Judged {
     ms: u64,
     action: PetAction,
@@ -180,8 +162,6 @@ impl Replay {
         self.term.process_at(bytes, at);
     }
 
-    /// One presented frame, rendered with and without the companion, judged when the body lies
-    /// near any letter.
     fn present(&mut self) -> Option<Judged> {
         let (cw, ch) = self.cell;
         let mut input: RenderInput = self.term.cell_frame(usize::from(ROWS), usize::from(COLS));
@@ -238,7 +218,6 @@ impl Replay {
         let _ = self
             .owner
             .emit(&t, &input.cells, fallback, &mut self.decos, &mut free);
-        // Judged only where a body lies within a cell of a letter.
         let near_letters = free.iter().any(|s| {
             let (x0, x1) = (s.x - i32::from(cw), s.x + i32::from(s.w) + i32::from(cw));
             let (y0, y1) = (s.y - i32::from(ch), s.y + i32::from(s.h) + i32::from(ch));
@@ -285,7 +264,6 @@ impl Replay {
         })
     }
 
-    /// The burst and `tail` ms after its last key; each judged frame, and the ms of the last key.
     fn burst(&mut self, tail: u64) -> (Vec<Judged>, u64) {
         let mut events: Vec<(u64, Option<u8>, Vec<u8>)> =
             vec![(300, None, b"\x1b[2J\x1b[H\r\n\r\n\r\n\r\n$ ".to_vec())];
@@ -340,9 +318,6 @@ fn every_letter_the_burst_s_companion_lies_on_reads_at_the_bar() {
             .iter()
             .rfind(|j| j.ms > last + 3_000)
             .expect("judged frames after the burst");
-        // The rest is seated off the letters (the wrap it waits on never
-        // comes, so it stands a row lower): the knock-out is judged on the
-        // flight's frames under the line, not on a head cut off at rest.
         assert!(
             rest.action.settled() && !rest.under,
             "{name}: the pet rests with its body off the line ({:?}, under {})",
@@ -363,7 +338,6 @@ fn every_letter_the_burst_s_companion_lies_on_reads_at_the_bar() {
             );
         }
 
-        // Negative control: the same rest with the knock-out off.
         let mut off = Replay::new(ink, page);
         off.rend.set_knock_out(false);
         let (judged, _) = off.burst(4_600);

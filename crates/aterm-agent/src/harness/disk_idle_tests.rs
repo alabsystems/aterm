@@ -22,9 +22,7 @@ fn set_mtime(path: &Path, at: i64) {
         .expect("set mtime");
 }
 
-/// A checkout at `<tmp>/repo`: `.git/index`, `.git/logs/HEAD`, a manifest
-/// and a source file, and its build directory `target/` (one profile,
-/// `debug/`) with `doc/` and `criterion/` at its root.
+/// Create a checkout at `<tmp>/repo` with a `target/` directory.
 fn checkout(tmp: &Tmp) -> (PathBuf, PathBuf) {
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git/logs")).expect("git");
@@ -47,8 +45,7 @@ fn nobody(_: &[PathBuf], _: &[u32]) -> std::io::Result<PathScan> {
     Ok(PathScan::default())
 }
 
-/// Survey `target` (found under `repo`) for tier 3 at `now`, below the floor,
-/// with `links` as the link folders, through `processes`.
+/// Survey `target` under `repo` for tier-3 reclamation at `now`.
 fn survey(
     tmp: &Tmp,
     repo: &Path,
@@ -100,13 +97,7 @@ fn kept_why(rep: &super::super::Report, dir: &Path) -> Option<String> {
         .find_map(|n| n.strip_prefix(&prefix).map(str::to_owned))
 }
 
-/// EVERY CLAUSE CLEAR, the build directory is a tier-3 row (`tier=3`, its
-/// profiles' bytes); ONE CLAUSE UNMET at a time keeps it, the note saying
-/// which: a git index written an hour ago, a working-tree file written today,
-/// a session working in the checkout, a process with its working directory
-/// there, a profile written two days ago, only `.rustc_info.json` for a
-/// marker, a volume mounted inside it, and an installed link resolving into
-/// its `debug/`.
+/// A checkout with every clause clear yields a tier-3 row; any unmet clause keeps it.
 #[test]
 fn every_clause_clear_makes_a_whole_idle_row_and_each_unmet_one_keeps_it() {
     let now = now_after_write(8);
@@ -308,8 +299,7 @@ fn every_clause_clear_makes_a_whole_idle_row_and_each_unmet_one_keeps_it() {
     assert!(whole(&rep).is_empty() && kept_why(&rep, &target).is_none());
 }
 
-/// Off by `disk.idle_build_dirs` the row is listed, report-only, saying why;
-/// `idle_build_days` below one turns it off too.
+/// Tier-3 rows are report-only when `disk.idle_build_dirs` is off or `idle_build_days` is zero.
 #[test]
 fn the_row_is_report_only_while_tier_3_is_off() {
     let now = now_after_write(8);
@@ -365,8 +355,7 @@ fn the_row_is_report_only_while_tier_3_is_off() {
     assert!(Config::default().idle_whole_on());
 }
 
-/// The working-tree walk is bounded: one that runs out of time keeps the
-/// directory (a walk cut short proves nothing).
+/// A working-tree walk that exceeds its deadline keeps the build directory.
 #[test]
 fn a_working_tree_walk_cut_short_keeps_it() {
     let now = now_after_write(8);
@@ -386,9 +375,7 @@ fn a_working_tree_walk_cut_short_keeps_it() {
     assert!(cut.is_err_and(|w| w.contains("ran out of time")));
 }
 
-/// THE REMOVAL EMPTIES EACH PROFILE AND KEEPS IT: afterwards `debug/` and its
-/// three lock files are there and nothing else of it; `doc/`, `criterion/`,
-/// `CACHEDIR.TAG` and `.rustc_info.json` are untouched.
+/// Reclamation empties each profile under its locks while keeping non-profile directories.
 #[test]
 fn the_removal_empties_each_profile_under_its_locks_and_keeps_the_rest() {
     let now = now_after_write(8);
@@ -472,9 +459,7 @@ fn the_removal_empties_each_profile_under_its_locks_and_keeps_the_rest() {
     let _ = Class::CargoTargets;
 }
 
-/// A profile written since the survey, or a mount found under the locks,
-/// refuses the removal before anything is deleted; a path through a link is
-/// refused whole.
+/// Reclamation rechecks profile mtimes, mounts, and symlinks under the profile locks.
 #[test]
 fn the_removal_reads_the_clock_and_the_mount_table_again_under_the_locks() {
     let now = now_after_write(8);
@@ -524,9 +509,7 @@ fn the_removal_reads_the_clock_and_the_mount_table_again_under_the_locks() {
     assert!(target.join("debug/deps/liblay.rlib").exists());
 }
 
-/// A build directory a search from `$HOME` found (`~/repo/target`, its
-/// discovery root `~`) serves `~/repo`, the git worktree above it — not `~`:
-/// a session working in `~` itself does not keep it, one in `~/repo` does.
+/// A build directory discovered from `$HOME` is judged against its enclosing git worktree.
 #[test]
 fn a_build_directory_found_from_home_serves_the_checkout_above_it() {
     let now = now_after_write(8);
@@ -574,10 +557,7 @@ fn a_build_directory_found_from_home_serves_the_checkout_above_it() {
     );
 }
 
-/// TIER 3 EMPTIES ONLY CARGO'S OWN OUTPUTS of a profile: its caches,
-/// `examples/`, its dep-info files and its uplifted artifacts (a byte-identical
-/// copy of its hashed `deps/` twin, a hard link to it, a `.dSYM` link into
-/// `deps/`).
+/// Tier 3 deletes only Cargo's own profile outputs and keeps user files.
 #[test]
 fn the_removal_takes_only_cargos_outputs_and_keeps_the_rest_of_a_profile() {
     let now = now_after_write(8);
@@ -673,8 +653,7 @@ fn the_removal_takes_only_cargos_outputs_and_keeps_the_rest_of_a_profile() {
     );
 }
 
-/// The uplift rule, pure: `<stem><ext>` and its hashed twin
-/// `<stem>-<hash><ext>`, `-` read as `_`.
+/// `uplift_twin` matches an uplifted artifact to its hashed `deps/` twin.
 #[test]
 fn an_uplift_is_named_by_its_hashed_twin() {
     use super::super::target::uplift_twin;
@@ -690,11 +669,7 @@ fn an_uplift_is_named_by_its_hashed_twin() {
     assert!(!uplift_twin(".hidden", "-0123456789abcdef.hidden"));
 }
 
-/// Clause 4 is read again UNDER EACH PROFILE'S LOCKS, the first included,
-/// right before its delete: a `between` that refuses (a `cargo test` started
-/// from an idle profile after the survey, cargo having given its lock up)
-/// keeps every profile, nothing deleted, and it is asked only once the locks
-/// are held.
+/// Process usage is rechecked under the profile locks before any deletion.
 #[test]
 fn the_process_check_runs_under_the_locks_before_the_first_delete() {
     let now = now_after_write(8);
@@ -743,9 +718,7 @@ fn the_process_check_runs_under_the_locks_before_the_first_delete() {
     assert!(done.units.contains(&target.join("debug")));
 }
 
-/// THE OWNER'S VERB NEVER TAKES A TIER-3 ROW, whatever `disk.apply` says: its
-/// plan for `cargo-targets` lists the whole idle build directory as reported,
-/// never removed.
+/// Explicit `cargo-targets` cleanup reports tier-3 rows without removing them.
 #[test]
 fn the_verb_reports_tier_3_and_never_takes_it() {
     let now = now_after_write(8);
@@ -769,10 +742,7 @@ fn the_verb_reports_tier_3_and_never_takes_it() {
     }));
 }
 
-/// CLAUSE 1's CHECKOUT is the build directory's own: a `target` reached
-/// through a link from `~/a-wt` into `~/z-main/target.noindex` is not judged
-/// by `~/a-wt`'s quiet (refused, said); an agent's `CARGO_TARGET_DIR` is never
-/// tier 3's; a build directory with no git checkout above it is refused.
+/// Tier 3 judges the checkout that owns the build directory.
 #[test]
 fn tier_3_judges_the_checkout_the_build_directory_lies_in() {
     let now = now_after_write(8);
@@ -815,11 +785,7 @@ fn tier_3_judges_the_checkout_the_build_directory_lies_in() {
     );
 }
 
-/// Links are resolved ONE COMPONENT AT A TIME, and only on local,
-/// non-automounted mounts of a table read whole: a link chain resolves; the
-/// same chain where the table calls its volume remote (a stalled share) or
-/// automounted is never followed (`None`), nor is anything on a table read
-/// short.
+/// Symlinks are resolved component by component and only on local, non-automounted volumes.
 #[test]
 fn links_are_resolved_only_on_local_mounts() {
     let tmp = Tmp::new("idle-resolve");
@@ -906,10 +872,7 @@ fn links_are_resolved_only_on_local_mounts() {
     );
 }
 
-/// A walk ends only on a local folder ([`resolve_local`]): `/` where the
-/// table calls its mount remote holds no component for a step to place, and
-/// resolves to nothing — as a link onto a remote root does, which ends the
-/// walk there (the old walk answered the root it ended on).
+/// Resolving `/` on a remote mount returns `None`.
 #[test]
 fn a_walk_that_ends_on_a_remote_root_resolves_to_nothing() {
     let root = |local: bool| aterm_sysprobe::volumes::Table {
@@ -933,9 +896,7 @@ fn a_walk_that_ends_on_a_remote_root_resolves_to_nothing() {
     );
 }
 
-/// The other-user fence of a whole removal past a sizing walk cut short: a
-/// walk that runs past its bound, or a folder it cannot read, rules nothing
-/// out (`Some`).
+/// An ownership walk that hits its entry limit or an unreadable directory refuses removal.
 #[test]
 fn an_ownership_walk_cut_short_rules_nothing_out() {
     use std::os::unix::fs::PermissionsExt as _;

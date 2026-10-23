@@ -55,7 +55,7 @@ impl Sums {
         self.gone = self.gone.saturating_add(other.gone);
     }
 
-    /// Entries counted: files and directories.
+    /// Entries counted.
     #[inline]
     #[must_use]
     pub const fn entries(&self) -> u64 {
@@ -90,7 +90,7 @@ pub struct DirRec {
     pub depth: u16,
     /// The files directly in it, and its own allocation.
     pub own: Sums,
-    /// It and everything under it; a lower bound while not [`Self::complete`].
+    /// It and everything under it ([`Self::complete`]).
     pub subtree: Sums,
     /// Entries directly in the directory.
     pub direct_entries: u32,
@@ -344,7 +344,7 @@ impl Tree {
         self.biggest_in(DirId::ROOT, n)
     }
 
-    /// Return the `n` largest subtrees inside `within` where no single child holds at least half the allocation.
+    /// Return the `n` largest subtrees inside `within` where no child holds at least half.
     #[must_use]
     pub fn biggest_in(&self, within: DirId, n: usize) -> Vec<DirId> {
         let len = self.dirs.len();

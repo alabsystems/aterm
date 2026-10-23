@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-effects' integration suite: one test binary for every file mounted below. Each file keeps
-//! its path and its own `#[test]`s, named `<file>::<test>` here.
-//!
-//! The shared helpers mount first: `common`, `trail_host` (the modules below use its
-//! `core_deref!` macro, hence `#[macro_use]` and its place) and `walk_census`; each file reaches
-//! them as `crate::<helper>`. The files share one process, so none sets an environment variable,
-//! installs a hook or re-executes itself, and no process static changes another test's verdict;
-//! the files that install a `#[global_allocator]` to assert allocation counts are their own
-//! `[[test]]`s in `Cargo.toml`.
-//!
-//! Sharing a process was checked, not assumed: no file below sets or removes an
-//! environment variable, installs a hook, re-executes itself or keeps a
-//! process global (the `thread_local!`s, in `walk_census` and `alloc_count`,
-//! are per thread). The exact-allocation pins share it too: `alloc_count` is
-//! the suite's one `#[global_allocator]`, and it counts only the thread whose
-//! window is armed, so no test bleeds into another's count.
-//!
-//! The trick conformances are unit modules mounted by `src/lib.rs`, alongside
-//! their implementations' model anchors. With `autotests = false`, every other
-//! test file must be a mod here or a [[test]]. Run one suite file's tests with
-//! `targo --unverified test -p aterm-effects --test effects_suite -- <file>::`.
+//! Unified integration test suite for `aterm-effects`.
 
 mod alloc_count;
 mod common;

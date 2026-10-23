@@ -146,8 +146,7 @@ fn not_a_file(dest: &Path) -> Error {
     ))
 }
 
-/// Usage for a destination that is itself a part file's name: a later download of the
-/// destination it belongs to would remove it, finished and verified as it was.
+/// Reject a destination whose name ends in [`PART_SUFFIX`].
 fn refuse_part_name(dest: &Path) -> Result<()> {
     if is_part_name(dest) {
         return Err(Error::usage(format!(
@@ -168,8 +167,6 @@ fn wire_read(e: &std::io::Error) -> Error {
     let kind = wire_kind_of(e);
     Error::could_not_run(format!("{}: {e}", kind.slug())).with_sub(Sub::Wire(kind))
 }
-
-/// The directory a rename into `dest` changes.
 fn parent_of(dest: &Path) -> &Path {
     dest.parent()
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -184,11 +181,7 @@ fn remove_quietly(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Whether `path` still names the open `file`. A second download of the same destination
-/// removes the part file it finds and makes its own, so a part whose name now points at
-/// another file belongs to that download: renaming or removing it by name would move or
-/// delete the other run's bytes. Unix compares device and inode; elsewhere std has no stable
-/// file identity, and the answer is always yes.
+/// Whether `path` still names the same inode as the open `file`.
 #[cfg(unix)]
 fn still_named(path: &Path, file: &File) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -198,10 +191,7 @@ fn still_named(path: &Path, file: &File) -> bool {
     }
 }
 
-/// Whether `path` still names the open `file`. Off unix std has no stable file identity, but
-/// none is needed: `Part::create` opens the part file sharing only reads (no
-/// `FILE_SHARE_DELETE`), so while it is open no other download can remove or rename it, and
-/// that download refuses at its own removal instead.
+/// Off Unix, `Part::create` opens without `FILE_SHARE_DELETE`, preventing replacement while open.
 #[cfg(not(unix))]
 fn still_named(_path: &Path, _file: &File) -> bool {
     true
@@ -211,8 +201,7 @@ fn still_named(_path: &Path, _file: &File) -> bool {
 #[cfg(windows)]
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 
-/// A part file, removed when dropped unless it was renamed into place or another download of
-/// the same destination replaced it.
+/// Staging part file removed on drop unless renamed into place or replaced.
 struct Part {
     path: PathBuf,
     /// The open part file; `None` once `finish` or `drop` closed it, before the rename or the
@@ -222,9 +211,7 @@ struct Part {
 }
 
 impl Part {
-    /// A leftover part file of `dest` is removed, then a fresh one is made (`create_new`). A
-    /// `dest` that is itself a part file's name is usage, and nothing is removed. On Windows
-    /// it is opened sharing reads only, so no other download removes it while it is open.
+    /// Remove any leftover part file for `dest` and create a fresh one.
     fn create(dest: &Path) -> Result<Part> {
         refuse_part_name(dest)?;
         let path = part_path(dest);
@@ -246,19 +233,16 @@ impl Part {
         })
     }
 
-    /// The CouldNotRun of a use of the part file after it was closed.
     fn closed(&self) -> Error {
         Error::could_not_run(format!("{}: the part file is closed", self.path.display()))
             .with_sub(Sub::Local)
     }
 
-    /// The open part file.
     fn file(&mut self) -> Result<&mut File> {
         let closed = self.closed();
         self.file.as_mut().ok_or(closed)
     }
 
-    /// `durable` on the open part file.
     fn durable(&self) -> Result<()> {
         let Some(file) = &self.file else {
             return Err(self.closed());
@@ -266,9 +250,7 @@ impl Part {
         aterm_durable::durable(file).map_err(|e| local("cannot make durable", &self.path, &e))
     }
 
-    /// Rename into `dest`, then `durable_dir` of its directory. A part file another download
-    /// of `dest` replaced is left to that download: CouldNotRun `Local`, nothing renamed. The
-    /// file is closed just before the rename; a failed rename removes it.
+    /// Close and rename the part file into `dest`, syncing the parent directory on Unix.
     fn finish(mut self, dest: &Path) -> Result<()> {
         let ours = self
             .file
@@ -586,7 +568,7 @@ fn fetch_inner(
     Ok(done)
 }
 
-/// Step 3: the call for the bytes.
+/// Build the download request for `asset`.
 fn request(
     gh: &Github,
     slug: &Slug,
@@ -621,8 +603,7 @@ fn request(
 mod tests {
     use super::*;
 
-    /// A second download of the same destination removed this one's part file and made its
-    /// own: this one neither renames nor removes the other's bytes.
+    /// If a second download replaces the part file, the first neither renames nor removes it.
     #[test]
     fn a_part_file_another_download_replaced_is_left_to_it() {
         let root = aterm_tempfile::Builder::new()

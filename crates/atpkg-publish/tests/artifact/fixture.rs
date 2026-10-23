@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The artifact tests' fixtures: object headers written byte by byte (so the aarch64 cases
-//! run on an x86_64 box, the Mach-O cases on Linux and the PE cases everywhere), trust
-//! checkouts with bare origins, and a compiler the client's lineage checker admits.
+//! Synthetic binary headers, git checkouts, and fake tool runners for artifact tests.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -112,8 +110,6 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
             "commit.gpgsign=false",
             "-c",
             "init.defaultBranch=main",
-            // No template: a fixture repository carries no sample hooks, no description and
-            // no info/exclude, files every test lays down and removes and nothing reads.
             "-c",
             "init.templateDir=",
         ])
@@ -222,8 +218,7 @@ pub fn push_from_elsewhere(bare: &Path, scratch: &Path, ledger: Option<&str>) {
     git(&pusher, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
 }
 
-/// What a client does with a pack's pair: fetch and verify the channel head, then verify
-/// and parse the manifest under the roster that authorized it.
+/// Verify the channel head and parse the manifest under the authorizing roster.
 ///
 /// # Panics
 ///
@@ -430,7 +425,6 @@ impl Tools for FakeTools {
         }
     }
 
-    /// aterm-zstd's raw-block writer: the fake packs with no zstd CLI on the box.
     fn compressor(&self) -> &dyn atpkg_publish::artifact::tarwrite::Compressor {
         &atpkg_publish::artifact::tarwrite::RawFrames::WHOLE
     }
@@ -467,8 +461,6 @@ pub const SEAL_DRIVER: &str = "librustc_driver-fixture.so";
 pub fn seal_fixture(root: &Path) -> (PathBuf, PathBuf) {
     let source = root.join("seal");
     let private = root.join("rustc-private-sysroots/exact-fixture");
-    // Native heads for the target, so the client's checker admits the compiler and the
-    // arch gate reads its bin/.
     let native = |body: &str| {
         let mut b = elf(EM_AARCH64, 2, 1);
         b.extend(body.as_bytes());

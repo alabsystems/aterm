@@ -206,6 +206,14 @@ pub fn mislabelled_code() -> ToyCode {
     }
 }
 
+/// A code value whose artifact is an acceptance policy.
+pub fn policy_labelled_code() -> ToyCode {
+    ToyCode {
+        id: ArtifactId::new(ArtifactKind::Policy, "toy-policy", 1, b""),
+        variant: Variant::Good,
+    }
+}
+
 /// The order-sensitive fold of what the task was fed.
 pub fn mix(seen: u64, tag: u64, value: u64) -> u64 {
     seen.wrapping_mul(1_000_003)

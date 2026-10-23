@@ -64,8 +64,6 @@ const XI2_EVENTS: [&str; 33] = [
     "GestureSwipeEnd",
 ];
 
-/// One request line: its connection, sequence number, extension (empty for
-/// the core protocol), name and the rest of the line.
 struct Request<'a> {
     seq: String,
     ext: &'a str,
@@ -100,8 +98,6 @@ fn request(line: &str) -> Option<Request<'_>> {
     })
 }
 
-/// The request's name, with its extension when it has one
-/// (`XInputExtension:XISelectEvents`).
 fn kind(r: &Request<'_>) -> String {
     if r.ext.is_empty() {
         r.name.to_string()
@@ -110,8 +106,6 @@ fn kind(r: &Request<'_>) -> String {
     }
 }
 
-/// The value of `key=` in `args`, up to the next space, `,` excluded only
-/// where `end` says.
 fn value<'a>(args: &'a str, key: &str, end: &[char]) -> Option<&'a str> {
     let at = args.find(&format!("{key}="))? + key.len() + 1;
     let rest = &args[at..];
@@ -119,13 +113,10 @@ fn value<'a>(args: &'a str, key: &str, end: &[char]) -> Option<&'a str> {
     Some(&rest[..stop])
 }
 
-/// A hex number as `0x…` prints it.
 fn hex(s: &str) -> Option<u128> {
     u128::from_str_radix(s.trim_start_matches("0x"), 16).ok()
 }
 
-/// What `id` is to the client: the screen's `root`, a `window` it made,
-/// `none` (window 0) or an `other`'s.
 fn role(root: &str, own: &BTreeSet<String>, id: &str) -> String {
     if id == root {
         "root".into()
@@ -138,7 +129,6 @@ fn role(root: &str, own: &BTreeSet<String>, id: &str) -> String {
     }
 }
 
-/// XI2's event mask, by name.
 fn xi2_events(mask: u128) -> String {
     let names: Vec<String> = (0..128)
         .filter(|bit| mask & (1u128 << bit) != 0)
@@ -358,8 +348,6 @@ pub fn summary(log: &str) -> Vec<(&'static str, String)> {
 mod tests {
     use super::*;
 
-    /// Lines of the log aterm-gui's trace at main gave (2026-10-21), cut to
-    /// what each summary line reads.
     const LOG: &str = "\
 001:<: am lsb-first want 11:0 authorising with '' of length 0
 001:>: Success, version is 11:0 vendor='The X.Org Foundation' roots={root=0x0000021f default-colormap=0x00000020 white-pixel=0x00ffffff}
@@ -415,8 +403,6 @@ mod tests {
         );
     }
 
-    /// The root's raw XI2 events (bits 13-17), which a06dcfbb0a stopped
-    /// selecting, read as names, and each window by its role.
     #[test]
     fn the_selections_name_the_window_and_the_events() {
         assert_eq!(
@@ -431,8 +417,6 @@ mod tests {
         );
     }
 
-    /// The two REMOVE messages 104dad2238 dropped and 6a6777e2b3 sends again:
-    /// without them the line says so.
     #[test]
     fn the_wm_state_messages_name_their_action_and_atoms() {
         assert_eq!(

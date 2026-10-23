@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Explicit Windows shell-profile acceptance. Run with `--profile test`.
+//!
+//! STOCK EXCEPTION: its work is Windows only, and Trust has no Windows std, so only stock Rust
+//! builds it (the Windows lane's guest pins its version: `aterm-lab/src/windows_guest.rs`).
 
 #[path = "../../aterm-conformance/benches/support/mod.rs"]
 #[cfg_attr(

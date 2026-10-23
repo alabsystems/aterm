@@ -10,40 +10,40 @@ use crate::state::State;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum ActionType {
-    /// No action
+    /// No action.
     #[default]
     None = 0,
-    /// Print the character
+    /// Print the character.
     Print,
-    /// Execute C0/C1 control
+    /// Execute C0/C1 control.
     Execute,
-    /// Clear parameters and intermediates
+    /// Clear parameters and intermediates.
     Clear,
-    /// Collect intermediate byte
+    /// Collect intermediate byte.
     Collect,
-    /// Add digit to current parameter
+    /// Add digit to current parameter.
     Param,
-    /// Dispatch ESC sequence
+    /// Dispatch ESC sequence.
     EscDispatch,
-    /// Dispatch CSI sequence
+    /// Dispatch CSI sequence.
     CsiDispatch,
-    /// Hook DCS
+    /// Hook DCS.
     DcsHook,
-    /// Put DCS byte
+    /// Put DCS byte.
     DcsPut,
-    /// Start OSC
+    /// Start OSC.
     OscStart,
-    /// Put OSC byte
+    /// Put OSC byte.
     OscPut,
-    /// End OSC
+    /// End OSC.
     OscEnd,
-    /// Ignore this byte
+    /// Ignore this byte.
     Ignore,
-    /// Start APC
+    /// Start APC.
     ApcStart,
-    /// Put APC byte
+    /// Put APC byte.
     ApcPut,
-    /// End APC
+    /// End APC.
     ApcEnd,
 }
 
@@ -51,9 +51,9 @@ pub enum ActionType {
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct Transition {
-    /// Next state
+    /// Next state.
     pub next_state: State,
-    /// Action to perform
+    /// Action to perform.
     pub action: ActionType,
 }
 

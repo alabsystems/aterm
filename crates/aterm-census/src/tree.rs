@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The census's reads of the checkout it walks. The walkers ask here, never
-//! `std::fs` directly, and outside tests each function is the `std::fs` call
-//! it names.
+//! The census's reads of the checkout it walks.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -83,8 +81,6 @@ pub(crate) mod memory {
             }
         }
 
-        /// Why nothing is at `rel`: a file stands where a directory of its
-        /// path would, or nothing does.
         fn missing(&self, rel: &Path) -> io::Error {
             if rel.ancestors().skip(1).any(|up| self.held.contains_key(up)) {
                 io::ErrorKind::NotADirectory.into()
@@ -144,10 +140,8 @@ pub(crate) mod memory {
         }
     }
 
-    /// Every live tree, by root.
     static TREES: Mutex<BTreeMap<PathBuf, Files>> = Mutex::new(BTreeMap::new());
 
-    /// Roots are never reused within a process.
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     fn trees() -> MutexGuard<'static, BTreeMap<PathBuf, Files>> {
@@ -235,10 +229,6 @@ pub(crate) mod memory {
         use super::Tree;
         use std::path::{Path, PathBuf};
 
-        /// A tree's answers, every one, as data: what each query of `rels`
-        /// under `root` says (a read's text or error kind, the directory
-        /// test, the file test, a listing's entries relative to `root` or its
-        /// error kind).
         fn answers(root: &Path, rels: &[&str]) -> Vec<String> {
             let rel = |p: &PathBuf| p.strip_prefix(root).map(Path::to_path_buf);
             rels.iter()
@@ -264,12 +254,6 @@ pub(crate) mod memory {
                 .collect()
         }
 
-        /// A memory tree answers every query as the same files on the disk
-        /// do: files read, each ancestor of one is a directory listing its
-        /// children, a read of a directory or below a file fails as the disk
-        /// fails, and a missing path is not found. Then a write and a removal
-        /// move it as they move the disk, and a dropped tree's root reads the
-        /// disk again, where nothing is.
         #[test]
         fn a_memory_tree_answers_as_the_same_files_on_disk() {
             let files = [

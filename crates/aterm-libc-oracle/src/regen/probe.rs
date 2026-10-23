@@ -89,7 +89,6 @@ impl Probe {
         self.lines.push(line);
     }
 
-    /// Measure `expr` (a `usize` const expression) as `key`.
     fn measure(&mut self, expr: &str, key: Key) {
         self.lines
             .push(format!("const _: [(); 999999] = [(); {expr}];  // {key}"));
@@ -105,7 +104,6 @@ impl Probe {
     }
 
     /// Pair the compiler's reports (1-based line -> value) with this probe's facts.
-    ///
     /// # Errors
     /// The facts no report answered, when any.
     pub fn read(&self, reported: &BTreeMap<usize, u64>) -> Result<BTreeMap<Key, u64>, Vec<Key>> {
@@ -155,7 +153,6 @@ pub fn types_and_offsets(decls: &Decls) -> Probe {
 }
 
 /// Pass 2: the bytes of every constant whose value rustdoc does not state.
-///
 /// # Errors
 /// When a constant's type was not sized by pass 1, or its value cannot be parsed.
 pub fn constant_bytes(decls: &Decls, sizes: &BTreeMap<String, u64>) -> Result<Probe, String> {
@@ -200,7 +197,6 @@ pub fn field_types(decls: &Decls) -> Probe {
     probe
 }
 
-/// What a probe line reports.
 const FOUND: &str = "expected an array with a size of 999999, found one with a size of ";
 
 /// The values the compiler reported for `file`.
@@ -259,7 +255,6 @@ pub struct Measured {
 
 impl Measured {
     /// File one pass's facts.
-    ///
     /// # Errors
     /// When a byte measured out of range.
     pub fn record(&mut self, facts: BTreeMap<Key, u64>) -> Result<(), String> {
@@ -353,7 +348,6 @@ mod tests {
         );
     }
 
-    /// One E0308 as cargo prints it (captured from a pass-3 probe), plus noise.
     #[test]
     fn the_compilers_reports_are_read_back_to_their_facts() {
         let e0308 = |line: u32, size: u32| {
@@ -395,8 +389,6 @@ mod tests {
         );
     }
 
-    /// A probe that measured nothing says why in the compiler's words: cargo
-    /// puts them in the JSON on stdout, and stderr holds only its summary.
     #[test]
     fn an_unmeasured_probe_shows_the_errors_that_are_not_measurements() {
         let measurement = r#"{"reason":"compiler-message","message":{"rendered":"error[E0308]: mismatched types","message":"mismatched types","code":{"code":"E0308"},"level":"error","spans":[{"file_name":"src/measure_mac.rs","line_start":3,"is_primary":true,"label":"expected an array with a size of 999999, found one with a size of 40"}]}}"#;

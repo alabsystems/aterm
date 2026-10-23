@@ -14,27 +14,14 @@ use std::{
     },
 };
 
-/// Counts every allocation, reallocation and zeroed allocation on a thread
-/// whose [`COUNTING`] is set, keeping the first [`SIZE_SLOTS`] sizes so a
-/// failure names what allocated.
 struct CountingAllocator;
 
 /// How many sizes a counted window keeps.
 pub const SIZE_SLOTS: usize = 16;
 
 thread_local! {
-    /// Per thread, not process-wide: libtest's main thread may wake (the 60 s
-    /// "has been running" report) and allocate during a counted tick, every
-    /// other test of the suite runs beside the counted one, and the frame-cost
-    /// laws' cells run concurrently on `par_map`'s pool, each counting its own
-    /// window. No pin's code starts a thread, so everything it allocates is
-    /// still counted on the thread that drives it. All three are
-    /// const-initialised with no destructor, so reading them never allocates
-    /// and is safe inside `GlobalAlloc`.
     static COUNTING: Cell<bool> = const { Cell::new(false) };
-    /// This thread's allocations while [`COUNTING`] was set.
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
-    /// The sizes of this thread's first [`SIZE_SLOTS`] of them.
     static ALLOCATION_SIZES: Cell<[usize; SIZE_SLOTS]> = const { Cell::new([0; SIZE_SLOTS]) };
 }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Per-session UI CHROME composer (session-metadata stage 2).
+//! Per-session UI chrome composer.
 
 use aterm_session::SessionId;
 
@@ -331,8 +331,6 @@ pub(crate) fn relative_age(age_ms: u64) -> String {
     }
 }
 
-/// The `~`-abbreviated display cwd ([`crate::app_tabs::home_relative_suffix`] matches whole
-/// components, so `/Users//foobar` under `home=/Users//foo` stays verbatim).
 fn display_cwd(cwd: &str, home: Option<&str>) -> String {
     let display = match home.and_then(|h| crate::app_tabs::home_relative_suffix(cwd, h)) {
         Some(rest) => format!("~{rest}"),
@@ -345,8 +343,6 @@ fn display_cwd(cwd: &str, home: Option<&str>) -> String {
     display_description(&display)
 }
 
-/// The identity title line, `<icon> <label>` or the bare label: the first line of both the
-/// tooltip and the menu.
 fn title_line(input: &SessionChromeInput) -> String {
     let label = crate::session_timeline::sanitize_presentation_line(&input.label, usize::MAX);
     match input
@@ -359,9 +355,6 @@ fn title_line(input: &SessionChromeInput) -> String {
     }
 }
 
-/// One descriptive prose line, truncated for display to [`DESCRIPTION_DISPLAY_MAX`] grapheme
-/// clusters with a trailing ellipsis, so the cut never lands inside a ZWJ sequence or between
-/// a base and its combining mark.
 fn display_description(prose: &str) -> String {
     use aterm_grapheme::GraphemeClusters;
     let mut it = prose.graphemes();
@@ -373,8 +366,6 @@ fn display_description(prose: &str) -> String {
     }
 }
 
-/// One connection's display line, shared by the tooltip and the menu's per-peer header:
-/// `⇥ pushes into "build" · live`, `⇤ pulled by "operator"`, `⇆ peer "claude (b)"`.
 fn connection_line(fact: &ConnectionFact) -> String {
     let title = display_description(&crate::session_timeline::sanitize_presentation_line(
         &fact.peer_title,
@@ -391,14 +382,10 @@ fn connection_line(fact: &ConnectionFact) -> String {
     format!("{head} \"{title}\"{live}")
 }
 
-/// The per-connection lines, in the caller's order.
 fn connection_lines(input: &SessionChromeInput) -> Vec<String> {
     input.connections.iter().map(connection_line).collect()
 }
 
-/// The shared identity HEADER LINES (title, durable description, status
-/// activity, cwd, the lifecycle state when it is news — `exited`, not the
-/// `alive` every live tab is) — the one list both surfaces render.
 fn header_lines(input: &SessionChromeInput) -> (Vec<String>, usize) {
     let mut identity = vec![title_line(input)];
     if let Some(description) = input.description.as_deref().and_then(|description| {
@@ -435,10 +422,6 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, usize) {
     (identity, clause_at)
 }
 
-/// The clause's words as a line shows them (`now: <head>`, and a shown
-/// label's ` · by the harness` or ` · by you` after them, outside the head's
-/// 48 bytes), through the presentation sanitizer every header line takes (a
-/// bidi or C1 character in a label is stripped); `None` when nothing is left.
 fn clause_words(clause: &ClauseLine) -> Option<String> {
     let head = crate::session_timeline::sanitize_presentation_line(
         &clause.head,
@@ -450,9 +433,6 @@ fn clause_words(clause: &ClauseLine) -> Option<String> {
     })
 }
 
-/// The menu's newest-first timeline tail: each shown event
-/// ([`timeline_row_shown`], at most [`TIMELINE_TAIL`]) as a row its surface
-/// ages ([`TabMenuEntry::Event`]).
 fn timeline_rows(input: &SessionChromeInput) -> Vec<TabMenuEntry> {
     input
         .timeline
@@ -523,7 +503,6 @@ pub(crate) fn timeline_tail(
         .collect()
 }
 
-/// A timeline event kind in a person's words; a kind with no entry is printed as recorded.
 fn event_words(kind: &str) -> &str {
     match kind {
         "spawned" => "started",
@@ -559,7 +538,6 @@ pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
         .is_some();
     let attention = attention_line(input);
     if identity.len() <= 1 && !icon && connections.is_empty() && attention.is_none() {
-        // Only the bare title line: nothing the chip does not already say.
         return None;
     }
     let mut lines = identity;
@@ -574,8 +552,6 @@ pub(crate) const NEEDS_ATTENTION_PREFIX: &str = "Needs attention: ";
 /// The hover's line for a harness's need in the worker's own words (`App::presence_hover`, design §12.2.1) starts with this in place of [`NEEDS_ATTENTION_PREFIX`].
 pub(crate) const NEEDS_YOU_PREFIX: &str = "Needs you: ";
 
-/// The tooltip's `Needs attention: <reason>` line, sanitized and capped by the `attention`
-/// field's rules, then display-truncated; `None` when no reason is recorded.
 fn attention_line(input: &SessionChromeInput) -> Option<String> {
     let reason = input
         .attention
@@ -790,16 +766,8 @@ mod tests {
         );
     }
 
-    /// The instant the tests' timelines are aged against
-    /// ([`crate::turn_ledger::now_ms`]'s clock).
     const NOW: u64 = 1_000_000_000;
 
-    /// THE CLOCK MOVES A COMPOSITION ONLY BY AN UPGRADE'S WORDS (the
-    /// Together run): a timeline row carries
-    /// its event's stamp and is aged where the menu is shown, so one
-    /// composition reads `2m ago` now and `3m ago` a minute on and arms no
-    /// wake; the upgrade's words read the clock, so a tab with one is
-    /// re-derived every period; a cache entry with no expiry is never due.
     #[test]
     fn the_clock_moves_a_composition_only_by_an_upgrades_words() {
         let mut input = full_input();
@@ -901,9 +869,6 @@ mod tests {
         }
     }
 
-    /// The tooltip renders identity lines in the pinned order (icon+title,
-    /// durable description, status activity, ~-abbreviated cwd) — one exact
-    /// byte shape, so surfaces never drift apart silently.
     #[test]
     fn tooltip_orders_identity_with_home_abbreviation() {
         let tip = compose_tooltip(&full_input()).expect("full metadata composes");
@@ -969,8 +934,6 @@ mod tests {
         }));
     }
 
-    /// A recorded attention reason is one `Needs attention: <reason>` line after the identity
-    /// lines, and earns a tooltip on its own.
     #[test]
     fn the_tooltip_names_why_a_tab_needs_a_look() {
         let stalled = SessionChromeInput {
@@ -996,7 +959,6 @@ mod tests {
         );
     }
 
-    /// The reason is sanitized and display-capped like every other line.
     #[test]
     fn the_reason_is_capped_and_sanitized() {
         let input = SessionChromeInput {
@@ -1020,7 +982,6 @@ mod tests {
         );
     }
 
-    /// A session with nothing beyond its label composes no tooltip.
     #[test]
     fn empty_metadata_degrades_to_no_tooltip() {
         let input = SessionChromeInput {
@@ -1038,7 +999,6 @@ mod tests {
         assert_eq!(compose_tooltip(&dashed), None);
     }
 
-    /// A multi-codepoint cluster straddling the cap is kept or dropped whole, never split.
     #[test]
     fn description_truncation_never_splits_a_grapheme_cluster() {
         let family = "👨\u{200D}👩\u{200D}👧";
@@ -1086,7 +1046,6 @@ mod tests {
         assert!(line.ends_with('…'), "the trailing `zz` is truncated away");
     }
 
-    /// The menu's timeline tail is capped to [`TIMELINE_TAIL`]; the tooltip carries none.
     #[test]
     fn timeline_tail_is_capped() {
         let mut input = full_input();
@@ -1110,8 +1069,6 @@ mod tests {
         assert_eq!(headers, TIMELINE_TAIL);
     }
 
-    /// Kinds that say nothing without their payload are no rows, and the cut runs before the
-    /// cap, so a burst of them never hides older rows.
     #[test]
     fn timeline_tail_leaves_out_agent_moves_and_typing() {
         let newest_first = [
@@ -1159,9 +1116,6 @@ mod tests {
         );
     }
 
-    /// The menu opens with the SAME header text the tooltip shows (one
-    /// composer, two surfaces), plus the timeline tail; the `AGENT` marker is
-    /// the one menu-only header, being structure rather than a fact.
     #[test]
     fn menu_matches_tooltip_headers_and_orders_actions() {
         let mut input = full_input();
@@ -1221,11 +1175,6 @@ mod tests {
         );
     }
 
-    /// THE AGENT SECTION per state (design §4): a plain session offers Take
-    /// Over, the harness log and the role; under the person's hold the first
-    /// row is Hand Back; a worker adds `Go to <manager>` (Show, the manager's
-    /// sid) and Stop Worker… (on its own sid); a manager adds a `Workers (n)`
-    /// header and one Show row per worker.
     #[test]
     fn the_agent_section_offers_the_hold_and_the_team_rows() {
         let rows = |input: &SessionChromeInput| -> Vec<(String, ConnVerb)> {
@@ -1293,8 +1242,6 @@ mod tests {
         );
     }
 
-    /// The tooltip still carries each connection line (§4: never
-    /// visual-only), and a hostile peer title cannot forge a line.
     #[test]
     fn the_tooltip_carries_connection_lines_and_no_forged_one() {
         let mut peers = full_input();
@@ -1332,10 +1279,6 @@ mod tests {
         );
     }
 
-    /// A bare session still gets a menu (label header + sections + actions),
-    /// with the acts that need a session GREYED, not hidden — and only TWO
-    /// separators (no empty timeline group; the AGENT section is always
-    /// present because its floor is).
     #[test]
     fn bare_session_menu_greys_unavailable_copies() {
         let input = SessionChromeInput {
@@ -1376,10 +1319,6 @@ mod tests {
         )));
     }
 
-    /// The `chrome` verb's mirror line serialises EXACTLY the composed model:
-    /// one token per entry, separators as `---`, disabled actions annotated,
-    /// a session-argument row flat with its `@<sid>` — so the introspected
-    /// listing IS the on-screen menu.
     #[test]
     fn chrome_line_mirrors_composed_model() {
         let mut input = SessionChromeInput {
@@ -1411,8 +1350,6 @@ mod tests {
         );
     }
 
-    /// A pending agent upgrade composes an `AGENT UPGRADE` section under the identity: what it
-    /// moves, then every word that does something, each carrying its build.
     #[test]
     fn a_pending_upgrade_offers_the_owners_words_for_its_build() {
         use aterm_messages::UpgradeWord::{NotToday, Now, Skip};
@@ -1463,7 +1400,6 @@ mod tests {
         assert_eq!(compose_tab_menu(&input), plain, "no word: no section");
     }
 
-    /// A clause as the composer is handed it (`SessionLog::chrome_clause`).
     fn clause(head: &str, since_ms: u64, until_ms: Option<u64>) -> ClauseLine {
         ClauseLine {
             head: head.to_string(),
@@ -1473,9 +1409,6 @@ mod tests {
         }
     }
 
-    /// D6: a shown label's line
-    /// names its author after its words, outside the head's 48 bytes, in the
-    /// tooltip and in the menu's aged row: `by the harness` or `by you`.
     #[test]
     fn a_shown_label_names_its_author_after_its_words() {
         let mut input = full_input();
@@ -1515,9 +1448,6 @@ mod tests {
         assert!(!bare.contains("\u{b7} by "), "{bare:?}");
     }
 
-    /// THE CLAUSE'S LINE AND ROW (phase 3B; addendum A12 item 3): the
-    /// tooltip's `now: <head>` sits right after `activity:` with no age, and
-    /// the menu's row at the same place, aged as the menu pops.
     #[test]
     fn the_clause_is_a_now_line_after_activity_and_an_aged_menu_row() {
         let plain = full_input();
@@ -1563,9 +1493,6 @@ mod tests {
         );
     }
 
-    /// A label's words reach the chrome through the presentation sanitizer
-    /// every header line takes: a bidi override or a control character is
-    /// stripped, and a clause with nothing left is no line at all.
     #[test]
     fn the_clauses_words_are_sanitized_like_every_header() {
         let mut input = full_input();
@@ -1578,10 +1505,6 @@ mod tests {
         assert_eq!(compose_tab_menu(&input), compose_tab_menu(&full_input()));
     }
 
-    /// a shown label leaves at its `until`, so the composition's
-    /// expiry is the earlier of the upgrade's term and that instant, and
-    /// with the switch off (no clause) it is exactly the upgrade's term —
-    /// `None` for a quiet tab, never `composed + 30 s`.
     #[test]
     fn a_shown_labels_until_bounds_the_compositions_expiry() {
         let mut input = full_input();

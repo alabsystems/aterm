@@ -10,7 +10,6 @@ use crate::supervise::policy::probe::LiveProbe;
 use crate::supervise::run::WorkerSource;
 use crate::supervise::tape::header::Roots;
 
-/// Roots a test's paths are written under.
 fn roots() -> Roots {
     Roots::of(vec![
         ("home", PathBuf::from("/Users//owner")),
@@ -18,8 +17,6 @@ fn roots() -> Roots {
     ])
 }
 
-/// Every fact set, the worker known by its environment (with a secret in
-/// it), and a question answered by a text priority.
 fn every_fact() -> BoxFacts {
     BoxFacts {
         program: Some("claude".to_string()),
@@ -63,21 +60,16 @@ fn every_fact() -> BoxFacts {
     }
 }
 
-/// `facts` written as a recorder writes them under [`roots`].
 fn written(facts: &BoxFacts) -> String {
     let roots = roots();
     facts.to_json(7, &|p: &Path| roots.encode(p))
 }
 
-/// `text` read back under [`roots`].
 fn read(text: &str) -> (BoxFacts, Vec<&'static str>) {
     let roots = roots();
     BoxFacts::from_json(text, &|raw| roots.decode(raw)).expect("the facts read")
 }
 
-/// THE FACTS READ BACK AS WRITTEN: every field, written and read, writes the
-/// same text again, and a mark that carries them all needs nothing. Paths
-/// are written under the run's roots, and the worker by its digest and pid.
 #[test]
 fn facts_read_back_as_written() {
     let facts = every_fact();
@@ -91,8 +83,6 @@ fn facts_read_back_as_written() {
     assert_eq!(back.shell_cwds, facts.shell_cwds);
     assert_eq!(back.worker_agent, Some(aterm_phase::Program::Gemini));
     assert!(text.contains("\"worker_agent\":\"gemini\""), "{text}");
-    // A tape breaker-4's build wrote carries the transcript's call, a field
-    // this build no longer reads: it is ignored, and needs nothing.
     let old = text.replacen(
         '{',
         r#"{"box_command":{"Ok":{"id":"toolu_lab16914d0fee39f3eb","command":"echo x"}},"#,
@@ -110,10 +100,6 @@ fn facts_read_back_as_written() {
     );
 }
 
-/// THE WORKER'S ENVIRONMENT NEVER REACHES A MARK: a planted secret in it is
-/// nowhere in the facts' text. Negative control: the same value as a fact
-/// the facts do hold (a transcript candidate) is found, so the search sees
-/// what is written.
 #[test]
 fn the_workers_environment_is_never_written() {
     let text = written(&every_fact());
@@ -126,10 +112,6 @@ fn the_workers_environment_is_never_written() {
     assert!(written(&control).contains("sk-planted-secret"));
 }
 
-/// A FACT A LATER BUILD GREW, READ BY THIS ONE, AND ONE AN EARLIER BUILD
-/// LACKED: a key this build does not know is ignored; a field the mark does
-/// not carry reads at its default and is NAMED among what the decision
-/// needs, never presented as what the recorded run knew.
 #[test]
 fn a_missing_fact_is_named_and_an_unknown_one_ignored() {
     let text = written(&every_fact());
@@ -149,9 +131,6 @@ fn a_missing_fact_is_named_and_an_unknown_one_ignored() {
     assert_eq!(all, FIELDS.to_vec(), "an empty object needs every fact");
 }
 
-/// Facts this build cannot read are refused, never guessed: a worker's
-/// digest that is not hex, a priority it does not know, a path under a root
-/// the header does not name, text that is no object.
 #[test]
 fn facts_this_build_cannot_read_are_refused() {
     let roots = roots();
@@ -174,11 +153,6 @@ fn facts_this_build_cannot_read_are_refused() {
     );
 }
 
-/// THE CONTEXT IS THE FACTS' AND THE POLICY'S: what the loop learned lands
-/// where the policy reads it — the cwd known, the footer's bypass, the grant
-/// row's rule withheld at a mount the reset was passed over for, the
-/// question's answer by its priority — and with no facts the context is the
-/// policy's own (the cwd unknown, the switches as the owner set them).
 #[test]
 fn the_context_is_built_from_the_facts_and_the_policy() {
     let config = SupervisorConfig {
@@ -204,8 +178,6 @@ fn the_context_is_built_from_the_facts_and_the_policy() {
     assert_eq!(ctx.worker_agent, None, "no spawn's worker");
     assert!(ctx.limit_reset);
     assert!(!ctx.answer_questions);
-    // `[harness] usage_credits` reaches the context as written, off by
-    // default and on where the policy says so; no fact moves it.
     assert!(!ctx.usage_credits, "the subscription by default");
     let credits = SupervisorConfig {
         usage_credits: true,

@@ -18,7 +18,6 @@ use std::thread::JoinHandle;
 
 use state::{Rule, State};
 
-/// sha256 of `domain` ‖ `seed`, as lowercase hex.
 fn seeded_hex(domain: &[u8], seed: &str) -> String {
     let mut hasher = aterm_digest::Sha256::new();
     hasher.update(domain);
@@ -461,7 +460,6 @@ impl FakeGithub {
         self.ports
     }
 
-    /// The state, under its lock.
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -571,8 +569,7 @@ impl FakeGithub {
         });
     }
 
-    /// Ends every [`Fault::Hang`], held now or asked for later: each connection closes as
-    /// though its time had run out.
+    /// Ends every [`Fault::Hang`], held now or asked for later.
     pub fn end_hangs(&self) {
         self.state().hangs_ended = true;
     }
@@ -601,8 +598,7 @@ impl FakeGithub {
             .collect()
     }
 
-    /// Release `release_id` as the fake holds it now: what it says, and each asset's name and
-    /// bytes in the order added; `None` once it is deleted.
+    /// Release `release_id` as the fake holds it now.
     #[must_use]
     pub fn release_state(&self, release_id: u64) -> Option<(ReleaseSpec, Vec<NamedBytes>)> {
         let state = self.state();

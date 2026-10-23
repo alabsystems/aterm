@@ -9,7 +9,8 @@ use aterm_time::{Duration, Instant};
 
 use super::ffi::{AutoreleasePool, Device, Library, PixelFormat};
 use super::pipelines;
-use crate::pipeline_table::{Pipeline, ShaderLibrary};
+use crate::FetchProbe;
+use crate::pipeline_table::{FetchTwin, Pipeline, ShaderLibrary};
 
 /// What decides a first window's first frames beyond their text: the launch's config, as the window will pin it onto its renderer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -26,8 +27,11 @@ pub struct FirstFrameKnobs {
     pub fx: bool,
 }
 
-/// What a first window builds over its first frames under `knobs`, in the order it needs them, as `(row, swapchain format)`: the text frame's rows (the colour-glyph row for a prompt that carries an emoji), the present blit at both swapchain formats (which one a window gets depends on its screen's EDR potential, which only the attach can read), then what the first prompt's aurora binds: its additive glow, the bloom and the crown, then the fx Exact row a card's layers bind.
-pub(crate) fn first_frame_rows(knobs: FirstFrameKnobs) -> Vec<(Pipeline, PixelFormat)> {
+/// What a first window builds over its first frames under `knobs`, in the order it needs them, as `(row, swapchain format)`: the text frame's rows (the colour-glyph row for a prompt that carries an emoji), the present blit at both swapchain formats (which one a window gets depends on its screen's EDR potential, which only the attach can read), then what the first prompt's aurora binds: its additive glow, the bloom and the crown, then the fx Exact row a card's layers bind. Where `fetch` (the device passed the framebuffer-fetch probe) the frame draws its glow and fx through their twins ([`first_frame_twins`]), so the glow row is the bloom's extract alone and the fx row is never bound.
+pub(crate) fn first_frame_rows(
+    knobs: FirstFrameKnobs,
+    fetch: bool,
+) -> Vec<(Pipeline, PixelFormat)> {
     use PixelFormat::{Bgra8Unorm, Rgba16Float};
     let mut rows = vec![
         (Pipeline::Bg, Bgra8Unorm),
@@ -37,7 +41,9 @@ pub(crate) fn first_frame_rows(knobs: FirstFrameKnobs) -> Vec<(Pipeline, PixelFo
         (Pipeline::Blit, Rgba16Float),
     ];
     if knobs.aurora {
-        rows.push((Pipeline::GlowAdd, Bgra8Unorm));
+        if !fetch || knobs.bloom {
+            rows.push((Pipeline::GlowAdd, Bgra8Unorm));
+        }
         if knobs.bloom {
             rows.push((Pipeline::Bloom, Bgra8Unorm));
         }
@@ -48,10 +54,22 @@ pub(crate) fn first_frame_rows(knobs: FirstFrameKnobs) -> Vec<(Pipeline, PixelFo
             rows.push((Pipeline::SdrGlow, Bgra8Unorm));
         }
     }
-    if knobs.fx {
+    if knobs.fx && !fetch {
         rows.push((Pipeline::Fx, Bgra8Unorm));
     }
     rows
+}
+
+/// The framebuffer-fetch twins a first window's frames bind under `knobs` where `fetch`: the aurora's glow and the card's fx.
+pub(crate) fn first_frame_twins(knobs: FirstFrameKnobs, fetch: bool) -> Vec<FetchTwin> {
+    let mut twins = Vec::new();
+    if fetch && knobs.aurora {
+        twins.push(FetchTwin::GlowAdd);
+    }
+    if fetch && knobs.fx {
+        twins.push(FetchTwin::Fx);
+    }
+    twins
 }
 
 /// One compile or build a warm can have in flight.
@@ -61,6 +79,10 @@ pub(crate) enum WarmItem {
     Library(ShaderLibrary),
     /// A PSO build, keyed by its row and the colour attachment it resolves to (`pipelines::metal_format`): what Metal's pipeline cache keys on, so a frame row built against any swapchain format is the same item.
     Pipeline(Pipeline, PixelFormat),
+    /// The device's framebuffer-fetch probe ([`super::fetch::verdict`]), which the cell lane runs once the rows its frames bind whatever the verdict are built.
+    FetchProbe,
+    /// A framebuffer-fetch twin's PSO build.
+    Twin(FetchTwin),
 }
 
 impl WarmItem {
@@ -82,7 +104,7 @@ enum Phase {
     /// A warm began at `began` and has `in_flight` under way, by lane
     /// ([`Lane`]; `cell.metal` from the claim on, before its worker even
     /// runs); `owed` holds the [`OWED`] libraries it has not compiled yet, by
-    /// index.
+    /// index, and [`OWED_PROBE`] until its framebuffer-fetch probe ran.
     Running {
         began: Instant,
         in_flight: [Option<WarmItem>; 2],
@@ -117,6 +139,12 @@ impl Lane {
 /// `blit.metal` a second time (the CS-1 bench: 12.6 ms of main thread with the
 /// window at +60 ms).
 const OWED: [ShaderLibrary; 2] = [ShaderLibrary::Cell, ShaderLibrary::Blit];
+
+/// [`Phase::Running`]'s `owed` bit for the device's framebuffer-fetch probe,
+/// which the warm owes from the claim on: a window that drew Unorm-law light
+/// before it landed routes that frame on the split rather than probing a second
+/// time or waiting ([`WarmLatch::probe_pending`]).
+const OWED_PROBE: u8 = 1 << OWED.len();
 
 /// The rendezvous between a warm and the first window.
 pub(crate) struct WarmLatch {
@@ -155,7 +183,7 @@ impl WarmLatch {
         *phase = Phase::Running {
             began: Instant::now(),
             in_flight: [Some(WarmItem::Library(ShaderLibrary::Cell)), None],
-            owed: (1 << OWED.len()) - 1,
+            owed: ((1 << OWED.len()) - 1) | OWED_PROBE,
         };
         Some(FirstFrameWarm { latch: self })
     }
@@ -171,16 +199,26 @@ impl WarmLatch {
     /// The warm's `lane` finished `item`, done or failed: nothing in flight
     /// there, and an [`OWED`] library no longer owed.
     fn finish(&self, lane: Lane, item: WarmItem) {
+        self.hand_off(lane, item, None);
+    }
+
+    /// [`Self::finish`] `item` and start `next` on `lane` under one lock, so
+    /// a window released by `item` finds `next` in flight rather than
+    /// running it a second time.
+    fn hand_off(&self, lane: Lane, item: WarmItem, next: Option<WarmItem>) {
         let mut phase = self.phase.lock().unwrap_or_else(PoisonError::into_inner);
         if let Phase::Running {
             in_flight, owed, ..
         } = &mut *phase
         {
-            in_flight[lane as usize] = None;
+            in_flight[lane as usize] = next;
             if let WarmItem::Library(lib) = item
                 && let Some(i) = OWED.iter().position(|o| *o == lib)
             {
                 *owed &= !(1 << i);
+            }
+            if item == WarmItem::FetchProbe {
+                *owed &= !OWED_PROBE;
             }
         }
         drop(phase);
@@ -219,7 +257,7 @@ impl WarmLatch {
     pub(crate) fn await_item(&self, item: WarmItem) {
         let owed_bit = match item {
             WarmItem::Library(lib) => OWED.iter().position(|o| *o == lib).map(|i| 1 << i),
-            WarmItem::Pipeline(..) => None,
+            WarmItem::Pipeline(..) | WarmItem::FetchProbe | WarmItem::Twin(_) => None,
         };
         let mut phase = self.phase.lock().unwrap_or_else(PoisonError::into_inner);
         while let Phase::Running {
@@ -244,6 +282,14 @@ impl WarmLatch {
             self.waiting
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// Whether the warm still owes the device's framebuffer-fetch verdict: it is running and has not finished its probe. A window asks rather than waits, so the probe never sits on a frame's path.
+    pub(crate) fn probe_pending(&self) -> bool {
+        matches!(
+            self.current_phase(),
+            Phase::Running { owed, .. } if owed & OWED_PROBE != 0
+        )
     }
 
     /// Whether a warm began on this latch.
@@ -294,15 +340,11 @@ impl FirstFrameWarm {
         knobs: FirstFrameKnobs,
         compile: impl Fn(&Device, ShaderLibrary) -> Result<Library, String> + Sync,
     ) -> Result<(), String> {
-        let rows = first_frame_rows(knobs);
         let latch = self.latch;
-        let lane = |lane: Lane| -> Vec<(Pipeline, PixelFormat)> {
-            rows.iter()
-                .copied()
-                .filter(|(row, _)| Lane::of(row.spec().library) == lane)
-                .collect()
-        };
-        let (cell, present) = (lane(Lane::Cell), lane(Lane::Present));
+        let present: Vec<(Pipeline, PixelFormat)> = first_frame_rows(knobs, false)
+            .into_iter()
+            .filter(|(row, _)| Lane::of(row.spec().library) == Lane::Present)
+            .collect();
         std::thread::scope(|scope| {
             let compile = &compile;
             let present = scope.spawn(move || {
@@ -313,7 +355,7 @@ impl FirstFrameWarm {
                     walk_lane(latch, Lane::Present, &dev, &present, compile)
                 })
             });
-            let cell = latch.run_lane(|| walk_lane(latch, Lane::Cell, dev, &cell, compile));
+            let cell = latch.run_lane(|| walk_cell_lane(latch, dev, knobs, compile));
             let present = present
                 .join()
                 .unwrap_or_else(|_| Err("the warm's present lane panicked".to_owned()));
@@ -355,6 +397,64 @@ fn walk_lane(
     Ok(())
 }
 
+/// The cell lane: `cell.metal`, the rows its frames bind whatever the verdict,
+/// then the device's framebuffer-fetch probe, then the glow and fx rows or
+/// twins its verdict leaves the first window to bind. The probe runs after the
+/// text frame's rows, off its path: a window routes its Unorm-law light on the split
+/// while the warm still owes the verdict ([`WarmLatch::probe_pending`]).
+fn walk_cell_lane(
+    latch: &WarmLatch,
+    dev: &Device,
+    knobs: FirstFrameKnobs,
+    compile: &(impl Fn(&Device, ShaderLibrary) -> Result<Library, String> + Sync),
+) -> Result<(), String> {
+    let cell_rows = |fetch| {
+        first_frame_rows(knobs, fetch)
+            .into_iter()
+            .filter(|(row, _)| Lane::of(row.spec().library) == Lane::Cell)
+    };
+    let either: Vec<(Pipeline, PixelFormat)> = cell_rows(true).collect();
+    let item = WarmItem::Library(ShaderLibrary::Cell);
+    latch.start(Lane::Cell, item);
+    let lib = compile(dev, ShaderLibrary::Cell);
+    let next = either
+        .first()
+        .filter(|_| lib.is_ok())
+        .map(|&(row, present)| WarmItem::pipeline(row, present));
+    latch.hand_off(Lane::Cell, item, next);
+    let lib = lib?;
+    let build_row = |row: Pipeline, present: PixelFormat| {
+        let item = WarmItem::pipeline(row, present);
+        latch.start(Lane::Cell, item);
+        let built = pipelines::build(dev, &lib, row.spec(), present);
+        latch.finish(Lane::Cell, item);
+        built.map(drop)
+    };
+    for &(row, present) in &either {
+        build_row(row, present)?;
+    }
+    latch.start(Lane::Cell, WarmItem::FetchProbe);
+    let fetch = super::fetch::compiled_with_twins(dev, &lib) && {
+        let loss = std::sync::Arc::new(super::loss::LossLatch::new());
+        super::encoder::EncodeSession::new(dev, std::sync::Arc::clone(&loss)).map(|session| {
+            let mint = super::resources::MetalResourceDevice::new(dev, loss);
+            super::fetch::verdict(&mint, &session, &lib)
+        }) == Ok(FetchProbe::Passed)
+    };
+    latch.finish(Lane::Cell, WarmItem::FetchProbe);
+    for (row, present) in cell_rows(fetch).filter(|r| !either.contains(r)) {
+        build_row(row, present)?;
+    }
+    for twin in first_frame_twins(knobs, fetch) {
+        let item = WarmItem::Twin(twin);
+        latch.start(Lane::Cell, item);
+        let built = pipelines::build(dev, &lib, &twin.spec(), PixelFormat::Bgra8Unorm);
+        latch.finish(Lane::Cell, item);
+        built?;
+    }
+    Ok(())
+}
+
 impl Drop for FirstFrameWarm {
     fn drop(&mut self) {
         self.latch.settle();
@@ -383,7 +483,10 @@ fn bench_compile(
     move |dev: &Device, lib: ShaderLibrary| -> Result<Library, String> {
         let opts = super::ffi::CompileOptions::aterm_default()
             .ok_or_else(|| "no MTLCompileOptions".to_owned())?;
-        let src = format!("{}\n// bench nonce {nonce}\n", super::shaders::source(lib));
+        let src = format!(
+            "{}\n// bench nonce {nonce}\n",
+            super::shaders::source_for(lib, super::fetch::capable(dev))
+        );
         dev.new_library_with_options(&src, &opts)
     }
 }
@@ -413,7 +516,7 @@ pub fn first_frame_bench_warm(
     })
 }
 
-/// THE FIRST-FRAME COMPILE MEASUREMENT's main half: the first mint's compiles on the calling thread (`cell.metal`, the text frame's rows, the present blit), each after waiting out the same item in flight on a warm the caller began, as the arm's own do, then what the first prompt's aurora binds (the glow row, the bloom, the SDR crown).
+/// THE FIRST-FRAME COMPILE MEASUREMENT's main half: the first mint's compiles on the calling thread (`cell.metal`, the text frame's rows, the present blit; the device's framebuffer-fetch verdict is not on a mint's path, which routes Unorm-law light on the split while the warm owes it), each after waiting out the same item in flight on a warm the caller began, as the arm's own do, then what the first prompt's aurora binds (the glow row, the bloom, the SDR crown).
 /// # Errors
 /// No Metal device, or a shipped shader that does not compile.
 #[doc(hidden)]
@@ -426,7 +529,7 @@ pub fn first_frame_bench_main(nonce: u128) -> Result<[Duration; 5], String> {
     let dev = Device::preferred().ok_or_else(|| "no Metal device".to_owned())?;
     let cell = compile(&dev, ShaderLibrary::Cell)?;
     let lib = arrived.elapsed();
-    for (row, present) in first_frame_rows(FirstFrameKnobs::default())
+    for (row, present) in first_frame_rows(FirstFrameKnobs::default(), false)
         .into_iter()
         .filter(|(row, _)| row.spec().library == ShaderLibrary::Cell)
     {
@@ -653,5 +756,31 @@ mod tests {
         let mut warm = LATCH.begin().expect("the latch's first warm");
         warm.run_on(&dev, BENCH_KNOBS, pipelines::compile_library)
             .expect("the first-frame warm on the shipped shaders");
+        assert!(!LATCH.probe_pending(), "the warm ran the probe it owed");
+        let cell = pipelines::compile_library(&dev, ShaderLibrary::Cell).expect("cell.metal");
+        assert!(
+            crate::metal::fetch::known(&dev, &cell).is_some(),
+            "the warm left the device's verdict for the window to read"
+        );
+    }
+
+    /// The warm owes the device's framebuffer-fetch verdict from the claim until its probe ran, and a window only asks: pending while owed or in flight, not once the probe finished, before a warm began, or after it ended.
+    #[test]
+    fn the_probe_is_pending_from_the_claim_until_the_warm_ran_it() {
+        static LATCH: WarmLatch = WarmLatch::new(DEADLINE);
+        assert!(!LATCH.probe_pending(), "no warm began");
+        let warm = LATCH.begin().expect("the latch's first warm");
+        assert!(LATCH.probe_pending(), "owed from the claim");
+        LATCH.finish(Lane::Cell, WarmItem::Library(ShaderLibrary::Cell));
+        LATCH.start(Lane::Cell, WarmItem::FetchProbe);
+        assert!(LATCH.probe_pending(), "under way");
+        LATCH.finish(Lane::Cell, WarmItem::FetchProbe);
+        assert!(!LATCH.probe_pending(), "the probe ran");
+        drop(warm);
+        assert!(!LATCH.probe_pending());
+
+        static ENDED: WarmLatch = WarmLatch::new(DEADLINE);
+        drop(ENDED.begin().expect("the latch's first warm"));
+        assert!(!ENDED.probe_pending(), "a warm that ended owes nothing");
     }
 }

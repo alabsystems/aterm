@@ -13,7 +13,7 @@ description = "aterm's menu-bar keep-awake mug (`aterm caffeine`): a click keeps
 # The state directory, the logs directory and $HOME (`dirs`), the origin line
 # the about row prints (`identity`).
 aterm-types = { workspace = true }
-# The workspace clock (`unix_secs`).
+# The wall clock (`unix_secs`), which a timed span's end is shown on.
 aterm-time = { workspace = true }
 # The menu-bar icon is drawn here as coverage and handed to AppKit as PNG.
 aterm-png = { workspace = true }
@@ -24,7 +24,9 @@ aterm-log = { workspace = true }
 aterm-durable = { workspace = true }
 # `spawnfd::command` (launchctl, the re-exec into the bundle copy),
 # `ownerlock::probe` (is a mug running), `process::read_process_path|argv`
-# (is the lock's pid that mug), `peer::our_uid` (the GUI domain).
+# (is the lock's pid that mug), `peer::our_uid` (the GUI domain),
+# `process::continuous_ms` (the boot clock a timed span's deadline is on: it
+# counts time asleep, and no change of the date moves it).
 aterm-uds = { workspace = true }
 # THE BOOT the state file is stamped with (a restart of the Mac turns the mug
 # off): `boot_session`, the kernel's boot id as 16 bytes (`instance::boot_id`),

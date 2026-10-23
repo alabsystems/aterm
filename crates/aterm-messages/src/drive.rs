@@ -233,8 +233,6 @@ impl View {
                 && matches!(&self.layout, Some((f, c, _)) if *f == fp && *c == cols))
     }
 
-    /// The layout at the view's width: the kept one when current, else a
-    /// fresh one; `None` with no committed row.
     fn layout_now(&self, center: &MessageCenter, lay: &Lay) -> Option<Cow<'_, Presentation>> {
         let fp = center.fingerprint(lay.cols);
         if fp == 0 {
@@ -246,7 +244,6 @@ impl View {
         })
     }
 
-    /// One next-change scan from `from`, counted.
     fn scan(
         &self,
         center: &MessageCenter,

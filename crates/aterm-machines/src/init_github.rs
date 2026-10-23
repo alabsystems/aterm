@@ -72,7 +72,6 @@ pub fn items(sys: &dyn System, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> 
     ])
 }
 
-/// The admitted, decoded `~/.config/aterm/init.toml`; `None` when there is none.
 fn profile(sys: &dyn System, user: &User) -> Result<Option<Config>, String> {
     let path = Path::new(&user.home).join(".config/aterm/init.toml");
     let bytes = match sys.read_owned_file(&path, user.uid, INPUT_MAX, false) {
@@ -83,10 +82,7 @@ fn profile(sys: &dyn System, user: &User) -> Result<Option<Config>, String> {
     decode(&bytes, user).map(Some)
 }
 
-/// The checkouts the GitHub item verifies (a top-level worktree in the home whose one origin
-/// is the configured owner's repository) that are aterm workspaces: what `aterm init
-/// --develop` records when it runs outside one (design §4.1). None without a `[github]`
-/// table, or before the login keychain holds a token that signs in as its account.
+/// Returns aterm workspace checkouts in the home directory owned by the configured account.
 ///
 /// # Errors
 /// The profile cannot be admitted, or the listing or a worktree cannot be read.
@@ -189,9 +185,6 @@ pub(super) fn identity(sys: &dyn System, user: &User, token: &Secret) -> Result<
         .ok_or_else(|| "GitHub returned an invalid authenticated account".into())
 }
 
-/// The token the login keychain holds for `account` at github.com, when it still signs in as
-/// that account. A token GitHub no longer accepts, or a check the network did not answer, is
-/// not ready: the apply stores the source's token again and fails there if GitHub refuses it.
 fn stored(sys: &dyn System, user: &User, account: &str) -> Result<Option<Secret>, String> {
     let Some(token) = Git::keychain().fill(sys, Some(user), GITHUB, account)? else {
         return Ok(None);
@@ -202,9 +195,6 @@ fn stored(sys: &dyn System, user: &User, account: &str) -> Result<Option<Secret>
     })
 }
 
-/// What git's github.com settings resolve to (the keychain helper alone, as the account, or the
-/// setting that keeps them from it), and the keychain's token for the account, when it signs
-/// in as the account.
 fn readiness(
     sys: &dyn System,
     user: &User,
@@ -435,7 +425,6 @@ mod tests {
     fn approve(u: &User) -> String {
         script::credential(Some(u), "approve")
     }
-    /// No call carries the token source's bytes or the keychain's, and none runs gh.
     fn clean(sys: &Fake) {
         let calls = sys.calls();
         assert!(
@@ -674,9 +663,6 @@ mod tests {
         clean(&sys);
     }
 
-    /// The read-back after setup fails for its own reason, named. A setting configure does not
-    /// own that still hands github.com lookups to another helper is git's; a keychain token
-    /// GitHub does not vouch for on the second check is the credential's, not the helper's.
     #[test]
     fn the_read_back_after_setup_names_what_did_not_read_back() {
         let (sys, auth, context) = fixture();

@@ -2102,9 +2102,7 @@ mod tests {
         );
     }
 
-    /// Shrinking clamps and never restructures the tree, in the canonical planner too:
-    /// `constrained_extent` makes children plus divider tile the parent, so no rect
-    /// leaves the bounds, no leaf drops, and growing back restores the geometry.
+    /// Shrinking clamps to bounds without dropping leaves, and regrowing restores the geometry.
     #[test]
     fn shrinking_a_canonical_plan_stays_inside_the_bounds_and_drops_no_leaf() {
         let (_, views) = view_store_with(4);
@@ -2229,8 +2227,7 @@ mod tests {
         assert!(!aggregate.closable);
     }
 
-    /// The mixed native/terminal close path re-seats focus by the same rule as
-    /// `pane::PaneTree`: onto the leaf that inherits the removed leaf's space.
+    /// `remove_view` re-seats focus onto the leaf that inherits the removed leaf's space.
     #[test]
     fn remove_view_repairs_focus_onto_the_leaf_that_inherits_the_space() {
         let (_, views) = view_store_with(4);
@@ -2310,8 +2307,7 @@ mod tests {
         assert!(!model.check_invariant("FocusInRange", &dangling));
     }
 
-    /// `any_leaf` agrees with `leaves.contains` on every leaf of a nested tree and
-    /// stops at the first match.
+    /// `any_leaf` agrees with `leaves().contains()` and short-circuits on the first match.
     #[test]
     fn any_leaf_agrees_with_leaves_any_and_stops_at_the_first_match() {
         let (_, views) = view_store_with(3);

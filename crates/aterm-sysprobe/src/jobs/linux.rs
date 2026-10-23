@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The job probe's Linux arm: `/proc/<pid>/…` read under a root, so it is compiled and tested on
-//! every host against fixture trees.
+//! The job probe's Linux arm: `/proc/<pid>/…` read under a root.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -142,8 +141,7 @@ pub fn parse_io(text: &str) -> IoLine {
     }
 }
 
-/// `/proc/<pid>/status`'s uid (the real one, first of four) and context switches (voluntary +
-/// involuntary).
+/// Parse `/proc/<pid>/status`'s real uid and context switches.
 #[must_use]
 pub fn parse_status(text: &str) -> (Option<u32>, Option<u64>) {
     let uid = text.lines().find_map(|l| {
@@ -285,8 +283,6 @@ pub struct TcpRow {
     pub rx_queue: u64,
 }
 
-/// `ADDR:PORT` in the table's hex: the address as the kernel's native-order
-/// words, the port as a plain number.
 fn parse_addr(field: &str, v6: bool) -> Option<(IpAddr, u16)> {
     let (addr, port) = field.split_once(':')?;
     let port = u16::from_str_radix(port, 16).ok()?;
@@ -396,7 +392,6 @@ fn threads(dir: &Path, hz: u64) -> Option<(Vec<ThreadReading>, bool)> {
     Some((out, truncated))
 }
 
-/// The process's sockets' TCP rows, from its own network namespace's tables.
 fn tcp_rows(dir: &Path) -> Vec<TcpRow> {
     let mut rows = Vec::new();
     for (name, v6) in [("tcp", false), ("tcp6", true)] {

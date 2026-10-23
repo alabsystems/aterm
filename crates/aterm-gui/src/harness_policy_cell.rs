@@ -2,45 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 //! The supervisor's running policy, in a type of its own.
-//!
-//! The policy the window runs changes in exactly one place,
-//! [`HarnessPolicyCell::offer`], and `offer` cannot be called without a
-//! [`StampedHarnessPolicy`]. A stamp is made only by
-//! [`HarnessStampSource::stamp`], and the one source is the config watcher's
-//! (`config_watcher::watch`, the thread `config_watcher::spawn` starts): each
-//! read of `aterm.toml` it posts is stamped with the next generation. So "the
-//! watcher is the policy's one writer" is what the types say, and `offer` is
-//! a join: a stamp no newer than the one in force changes nothing, wherever
-//! its wake lands.
-//!
-//! The fields are private and nothing is generic so that the Trust seals in
-//! `harness_policy_cell_island.rs` can say the rest.
 
 use crate::app_config::HarnessPolicy;
 
-// Trust seals on the three types below, mounted on the seal lane (`--cfg trust_seals`), whose
-// toolchain has `Trust.Protocol.Seal`.
 #[cfg(all(clean_islands, trust_seals))]
 #[path = "harness_policy_cell_island.rs"]
 mod island;
 
-/// Mints the generation of each policy the watcher posts: strictly
-/// increasing, one source per watcher thread.
+/// Mints the generation of each policy the watcher posts.
 #[derive(Debug)]
 pub(crate) struct HarnessStampSource {
     last: u64,
 }
 
-/// A policy read from disk, with the generation its source gave it. Not
-/// `Clone`: a stamp is offered once.
+/// A policy read from disk, with the generation its source gave it.
 #[derive(Debug)]
 pub(crate) struct StampedHarnessPolicy {
     generation: u64,
     policy: HarnessPolicy,
 }
 
-/// The policy in force, and the generation it came with (`0`: the launch
-/// read, before any stamp).
+/// The policy in force, and the generation it came with (`0`: the launch read, before any stamp).
 #[derive(Debug)]
 pub(crate) struct HarnessPolicyCell {
     in_force: u64,
@@ -71,8 +53,7 @@ impl StampedHarnessPolicy {
 }
 
 impl HarnessPolicyCell {
-    /// The cell at launch: `launch` is the policy the launch read of
-    /// `aterm.toml` wrote, in force until the watcher's first post.
+    /// Create the cell with `launch` policy in force until the watcher's first post.
     pub(crate) const fn new(launch: HarnessPolicy) -> Self {
         HarnessPolicyCell {
             in_force: 0,
@@ -81,7 +62,6 @@ impl HarnessPolicyCell {
     }
 
     /// Adopt `stamped` when it is newer than what is in force: the join.
-    /// Whether it was adopted.
     pub(crate) fn offer(&mut self, stamped: StampedHarnessPolicy) -> bool {
         if self.in_force < stamped.generation {
             self.in_force = stamped.generation;
@@ -97,8 +77,7 @@ impl HarnessPolicyCell {
         &self.policy
     }
 
-    /// The generation of the policy in force (`0`: the launch read): what
-    /// `harness policy` answers as `gen=` and its event names.
+    /// The generation of the policy in force (`0`: the launch read).
     pub(crate) const fn generation(&self) -> u64 {
         self.in_force
     }
@@ -117,8 +96,6 @@ mod tests {
         HarnessPolicy::read(text)
     }
 
-    /// The join: the newest stamp wins whatever order the two arrive in, and a
-    /// stamp offered after a newer one changes nothing.
     #[test]
     fn the_newest_stamp_wins_in_either_order() {
         for older_first in [true, false] {

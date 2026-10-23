@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the CLI puts on a REAL TERMINAL (round fifteen, OUT-1 and OUT-3): the
-//! binary runs with its stdout, or its stderr, on the slave of a pty built
-//! here, against a private protocol peer whose reply is hostile — a fabric
-//! peer's mail body, a server's error. The master side reads exactly
-//! what a terminal emulator would have been given, and it must hold no byte a
-//! terminal acts on. The other stream stays a pipe and gets the bytes as they
-//! came (`inbox_metadata.rs` holds the pipe branch for every framing).
-//!
-//! The line discipline maps `\n` to `\r\n` (`ONLCR`), and macOS's can write that CR twice
-//! when its queue fills mid-line, so CRs right before a line break are folded away.
+//! End-to-end PTY output sanitization tests for `aterm-ctl`.
 
 #![cfg(unix)]
 
@@ -19,10 +10,8 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::time::{Duration, Instant};
 
-/// How long anything here may take before it is a hang, not a slow machine.
 const HANG: Duration = Duration::from_secs(60);
 
-/// A pty pair: the master this test reads, the slave the CLI writes.
 struct Pty {
     master: std::fs::File,
     slave: OwnedFd,
@@ -42,8 +31,6 @@ impl Pty {
         Self { master, slave }
     }
 
-    /// Everything the slave was given so far. The test holds the slave open,
-    /// so the master reads what is queued and then would block, never EOF.
     fn drain(&mut self, into: &mut Vec<u8>) {
         let mut buf = [0u8; 4096];
         loop {
@@ -64,15 +51,11 @@ enum Tty {
     Stderr,
 }
 
-/// What one run left: the terminal's bytes (CRLF folded back to LF) and the
-/// other stream's, which is a pipe.
 struct Seen {
     terminal: Vec<u8>,
     pipe: Vec<u8>,
 }
 
-/// Run `aterm-ctl <args>` with `tty` on a pty against a peer that answers
-/// `reply`, and return what each stream got.
 fn run(tty: Tty, args: &[&str], reply: &[u8]) -> Seen {
     let scratch = aterm_tempfile::Builder::new()
         .prefix("at-tty-")
@@ -153,8 +136,6 @@ fn run(tty: Tty, args: &[&str], reply: &[u8]) -> Seen {
     }
 }
 
-/// `bytes` with every CR that directly precedes a line break removed: the
-/// pty's own `ONLCR` output, however many it wrote.
 fn fold_line_ends(bytes: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     for &b in bytes {
@@ -168,8 +149,6 @@ fn fold_line_ends(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The bytes a terminal acts on or reorders text around, other than the line
-/// break: what must never reach it from a server.
 fn active(bytes: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(bytes)
         .chars()
@@ -182,8 +161,6 @@ fn active(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// A hostile mail body from `inbox get` reaches the terminal as text, every word of it; the
-/// header on the stderr pipe is the server's line as it came.
 #[test]
 fn a_mail_body_on_a_terminal_is_shown_not_obeyed() {
     let body: &[u8] = b"Deploy report from the build node:\n\x1b]2;PWNED-BY-PEER\x07\x1b[1A\
@@ -214,9 +191,6 @@ fn a_mail_body_on_a_terminal_is_shown_not_obeyed() {
     );
 }
 
-/// A server's refusal on a terminal (OUT-3): the clipboard write,
-/// the retitle and the erase that would wipe the `aterm-ctl:` prefix are
-/// shown, and the refusal's second line too.
 #[test]
 fn a_servers_error_on_a_terminal_is_shown_not_obeyed() {
     let seen = run(
@@ -239,9 +213,6 @@ fn a_servers_error_on_a_terminal_is_shown_not_obeyed() {
     assert!(seen.pipe.is_empty(), "{:?}", seen.pipe);
 }
 
-/// A status line and line-framed rows on a terminal (OUT-3): a server's
-/// `cursor` answer and `text` rows carry no instruction to the reader's
-/// terminal; the local server's own encoded words come through unchanged.
 #[test]
 fn status_lines_and_rows_on_a_terminal_are_shown_not_obeyed() {
     let seen = run(
@@ -275,7 +246,6 @@ fn status_lines_and_rows_on_a_terminal_are_shown_not_obeyed() {
     );
 }
 
-/// A `text` read of an unfinished frame (`frame=open`) prints its rows and says so on stderr.
 #[test]
 fn a_half_frame_read_says_so_on_stderr() {
     let seen = run(

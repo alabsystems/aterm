@@ -29,26 +29,19 @@ pub(crate) enum Step {
 pub(crate) struct DevToolsWatch {
     /// The launch read was asked for.
     read_once: bool,
-    /// The last reading said `not_granted`: the owner may be off switching it on, so
-    /// coming back to aterm reads again.
+    /// Whether the last reading was `NotGranted`.
     awaiting_owner: bool,
     /// When a focus gain last asked for a read.
     last_read: Option<Instant>,
-    /// This process already asked for the pane brought up: two readings that land
-    /// before the hand-over writes its marker ask once.
+    /// Whether this process already requested opening the Settings pane.
     handed_over: bool,
-    /// aterm brought the owner to the pane since the last read: the next focus gain reads
-    /// regardless of `last_read` and `awaiting_owner`.
+    /// Whether the next focus gain should re-read immediately after a Settings hand-over.
     read_on_return: bool,
-    /// macOS should be asked about aterm again ([`Self::take_refresh`]): a reading said
-    /// `not_granted` and a later one `granted`, or the owner said they switched it on.
+    /// Whether a transition to `Granted` owes a macOS verdict refresh.
     refresh_owed: bool,
-    /// The ask for this switch-on was made: readings that keep saying `granted`, the
-    /// Settings card's every two minutes among them, ask no more. The next
-    /// `not_granted` reading re-arms it.
+    /// Whether the current switch-on already requested a refresh.
     refreshed: bool,
-    /// The owner's return read is out ([`Self::take_return_prime`]): the focus gain
-    /// after aterm brought them to the page asked for it.
+    /// Whether a hand-over return read is currently in flight.
     prime_on_return: bool,
 }
 
@@ -136,8 +129,7 @@ impl DevToolsWatch {
 mod tests {
     use super::*;
 
-    /// The launch read once; then reads only while the owner is wanted; the hand-over is
-    /// asked once per version; `unknown` never moves anything.
+    /// Reads once at launch, re-reads only while `NotGranted`, and hands over once per version.
     #[test]
     fn the_watch_reads_at_launch_and_while_the_owner_is_wanted() {
         let t0 = Instant::now();
@@ -183,10 +175,7 @@ mod tests {
         );
     }
 
-    /// After aterm brings the owner to the pane, the focus gain that brings them back
-    /// reads, though the launch read was seconds before; one read, then the gate is back.
-    /// It reads whatever the last reading said. Negative control: the same return with no
-    /// hand-over reads nothing.
+    /// Returning from a Settings hand-over bypasses the cooldown for a single read.
     #[test]
     fn the_return_from_a_hand_over_reads_however_soon_it_comes() {
         let t0 = Instant::now();
@@ -223,12 +212,7 @@ mod tests {
         }
     }
 
-    /// MACOS IS ASKED ABOUT ATERM AGAIN once per switch-on, and only by a process it
-    /// checked before the switch went on: `not_granted` then `granted` owes one ask, and
-    /// the `granted` readings after it (the Settings card's every two minutes) none.
-    /// NEGATIVE CONTROLS: a launch already `granted` was never refused and owes none;
-    /// `unknown` owes none. Switched off and on again owes one more. The owner's "I've
-    /// switched it on" owes one, and the `granted` reading it brings about no second.
+    /// Requests a verdict refresh once per `NotGranted`-to-`Granted` transition or manual confirm.
     #[test]
     fn macos_is_asked_about_aterm_again_once_per_switch_on() {
         let mut watch = DevToolsWatch::default();
@@ -263,11 +247,7 @@ mod tests {
         );
     }
 
-    /// THE OWNER'S RETURN ASKS ONCE when aterm cannot read the list: a process checked
-    /// before the switch went on never reads `granted` by itself there, so the reading
-    /// the return from the page brings asks macOS again whatever happened on it.
-    /// NEGATIVE CONTROLS: no return without a hand-over; a list read (Full Disk Access)
-    /// or a `granted` answer asks nothing; one ask per return.
+    /// Returning from a hand-over primes once when the list cannot be read directly.
     #[test]
     fn the_owners_return_asks_once_when_the_list_cannot_be_read() {
         let t0 = Instant::now();

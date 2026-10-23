@@ -103,6 +103,16 @@ pub struct CursorComet {
 }
 
 impl CursorComet {
+    /// Reset animation state while preserving the light-theme memos.
+    #[inline]
+    pub fn reset(&mut self) {
+        *self = Self {
+            light_ink_memo: self.light_ink_memo,
+            light_fill_memo: self.light_fill_memo,
+            ..Self::default()
+        };
+    }
+
     /// Whether the host must keep arming the animation tick: only while the comet is charged.
     #[must_use]
     #[inline]

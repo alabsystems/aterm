@@ -11,10 +11,8 @@ use aterm_uds::procwatch::{ProcEvent, ProcWatch, short_info};
 use crate::foreground_handback::{FgCutter, ProcSeen};
 use crate::holder_image::EdgeKind;
 
-/// A wait for something that must happen: a hang detector, never a latency budget.
 const MUST_HAPPEN: Duration = aterm_spec::wait::MUST_HAPPEN;
 
-/// An interactive zsh with no startup files on its own PTY.
 struct Zsh {
     shell: aterm_pty::SpawnedShell,
     out: Vec<u8>,
@@ -61,7 +59,6 @@ impl Zsh {
         unsafe { libc::tcgetpgrp(self.shell.master) }
     }
 
-    /// Read what the shell wrote so far (the tty never fills).
     fn pump(&mut self) {
         let mut buf = [0u8; 4096];
         loop {
@@ -108,14 +105,11 @@ impl Drop for Zsh {
     }
 }
 
-/// One drain heard: its events and `tcgetpgrp` read right after it.
 struct Heard {
     events: Vec<ProcEvent>,
     fg: i32,
 }
 
-/// Drain `watch` (and the shell's output) until `done` holds over every
-/// drain so far, parking on the watch between drains.
 fn hear_until(
     zsh: &mut Zsh,
     watch: &mut ProcWatch,
@@ -161,7 +155,6 @@ fn forks(heard: &[Heard]) -> Vec<i32> {
         .collect()
 }
 
-/// The first drain that heard an `exec` of `pid`, and that event's group.
 fn first_exec(heard: &[Heard], pid: i32) -> Option<(&Heard, i32)> {
     heard.iter().find_map(|h| {
         h.events.iter().find_map(|e| match e {
@@ -171,7 +164,6 @@ fn first_exec(heard: &[Heard], pid: i32) -> Option<(&Heard, i32)> {
     })
 }
 
-/// The late flag of each `exec` of `pid` heard, in order.
 fn execs_of(heard: &[Heard], pid: i32) -> Vec<bool> {
     heard
         .iter()
@@ -183,7 +175,6 @@ fn execs_of(heard: &[Heard], pid: i32) -> Vec<bool> {
         .collect()
 }
 
-/// A fifo named `name` in `dir`.
 fn mkfifo(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     let path = dir.join(name);
     let c_path = std::ffi::CString::new(path.display().to_string()).expect("path");
@@ -192,8 +183,6 @@ fn mkfifo(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     path
 }
 
-/// The write end of `fifo`, once a reader has it open (a nonblocking
-/// writer's open finds one): the reader is past every `exec` before its open.
 fn open_writer(zsh: &mut Zsh, fifo: &std::path::Path) -> std::os::fd::OwnedFd {
     use std::os::fd::FromRawFd as _;
     let c_path = std::ffi::CString::new(fifo.display().to_string()).expect("path");
@@ -215,7 +204,6 @@ fn open_writer(zsh: &mut Zsh, fifo: &std::path::Path) -> std::os::fd::OwnedFd {
     }
 }
 
-/// Let the reader held at `gate` go on.
 fn release(gate: std::os::fd::OwnedFd) {
     use std::os::fd::AsRawFd as _;
     // SAFETY: a bounded write to the gate's write end, which this test owns.
@@ -223,7 +211,6 @@ fn release(gate: std::os::fd::OwnedFd) {
     assert_eq!(wrote, 3, "release the gate");
 }
 
-/// What `watch` holds now, drained.
 fn quiet(watch: &mut ProcWatch) -> Vec<ProcEvent> {
     let mut events = Vec::new();
     watch.drain(&mut events);
@@ -238,14 +225,6 @@ fn script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
     path
 }
 
-/// A reroute stub `exec`ing a twin `exec`ing `/bin/sleep`, typed at the
-/// prompt, each link held at a gate until the one before was heard: the
-/// shell's fork is heard first, and at the stub's `exec` the child already
-/// holds the terminal, so it is a Group edge from the shell. Then each link is
-/// exactly one `exec` event of the child. The stub was found exec'd by the
-/// fork's own read (it was past its `exec` when the fork was drained), so it
-/// is reported late, and so is the twin's, the child's first kernel `exec`,
-/// which may restate it; `sleep`'s is not.
 #[test]
 fn a_reroute_chain_is_a_fork_then_one_exec_per_link() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -322,8 +301,6 @@ fn a_reroute_chain_is_a_fork_then_one_exec_per_link() {
     assert!(short_info(child).expect("lives").execed);
 }
 
-/// Control: a subshell that runs only builtins is a fork the watch hears and
-/// never an `exec`, though it takes the terminal.
 #[test]
 fn a_subshell_that_never_execs_is_no_exec() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -353,10 +330,6 @@ fn a_subshell_that_never_execs_is_no_exec() {
     release(gate);
 }
 
-/// Control: a command substitution at the prompt forks a child that `exec`s
-/// in the shell's own group while the shell keeps the terminal: heard, and no
-/// edge of either kind. The child (`cat` on a gate) lives until the gate
-/// closes, after the judging.
 #[test]
 fn a_command_substitution_at_the_prompt_is_no_group_edge() {
     let dir = aterm_tempfile::tempdir().expect("scratch");

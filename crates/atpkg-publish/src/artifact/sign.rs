@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg-publish sign`: manifest signing and verification under [`Authority`]
-//! ([`sign_checked`], [`super::lineage_switch`]).
+//! `atpkg-publish sign`: manifest signing and verification under [`Authority`].
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
@@ -55,7 +54,6 @@ impl Authority {
     }
 }
 
-/// The channel head's roster pair, downloaded into `dir`.
 fn head_roster(ctx: &Ctx, dir: &Path) -> std::result::Result<Option<PathBuf>, String> {
     let slug = ctx.index_slug();
     let n = match quad::head_build(ctx, &slug) {
@@ -102,7 +100,6 @@ pub fn authority(ctx: &Ctx) -> Result<Authority> {
     elect(ctx, &candidates)
 }
 
-/// The roster pairs on this machine: the aterm checkout's `dist/` and the installed one.
 fn local_candidates(ctx: &Ctx) -> Vec<(String, PathBuf)> {
     [
         ctx.repo_root.join("dist").join(QUAD_FILES[2]),
@@ -143,7 +140,6 @@ pub fn elected(ctx: &Ctx) -> Result<Arc<Authority>> {
     Ok(fresh)
 }
 
-/// The election is the index's ([`newest_roster`]).
 fn elect(ctx: &Ctx, candidates: &[(String, PathBuf)]) -> Result<Authority> {
     let paths: Vec<PathBuf> = candidates.iter().map(|(_, p)| p.clone()).collect();
     let pair = newest_roster(ctx, &paths, &mut Log::echo("atpkg-publish"))?;

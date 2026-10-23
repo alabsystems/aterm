@@ -2,7 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Multi-leg `await inbox|agent|edit` client loop ([`await_task::DEFAULT_TOTAL`]).
-//! Uses [`replaced_before_reply`] to handle server handoffs.
 
 use std::io::{self, BufReader};
 use std::process::ExitCode;
@@ -21,7 +20,6 @@ struct Wait {
     timeout: Option<Duration>,
 }
 
-/// `parts` (`@self` expanded) as a re-armed wait.
 fn parse(parts: &[String]) -> Option<Wait> {
     let at = usize::from(parts.first().is_some_and(|p| p.starts_with('@')));
     if parts.get(at).map(String::as_str) != Some("await")
@@ -87,10 +85,8 @@ enum Leg {
     Failed(io::Error),
 }
 
-/// One leg's round trip: `(sock, origin, request line, the wait it asks for)`.
 type LegFn<'a> = dyn FnMut(&str, TargetOrigin, &str, Duration) -> Leg + 'a;
 
-/// Send one leg to `sock` and read its line.
 fn socket_leg(sock: &str, origin: TargetOrigin, request: &str, wait: Duration) -> Leg {
     let stream = match connect_served(sock, origin, Some(wait + await_task::LEG_SLACK)) {
         Ok(Ok(stream)) => stream,
@@ -150,7 +146,6 @@ fn socket_leg(sock: &str, origin: TargetOrigin, request: &str, wait: Duration) -
     }
 }
 
-/// The request line one leg sends: the wait's words and the leg's own `timeout=`.
 fn leg_request(parts: &[String], wait: Duration) -> io::Result<String> {
     let mut parts = parts.to_vec();
     parts.push(format!("timeout={}", wait.as_millis()));
@@ -288,9 +283,6 @@ mod tests {
         line.split_whitespace().map(String::from).collect()
     }
 
-    /// The re-armed forms: `await inbox`, `await agent` and `await edit`, a leading
-    /// selector or none, the timeout as `timeout=<ms>` or `timeout <ms>`
-    /// taken out of the words every leg sends, the rest kept as given.
     #[test]
     fn the_inbox_and_agent_waits_are_parsed_with_their_timeout_taken_out() {
         assert_eq!(
@@ -350,14 +342,12 @@ mod tests {
         }
     }
 
-    /// What a scripted run sent and printed.
     struct Run {
         sent: Vec<(String, Duration)>,
         printed: Vec<String>,
         code: ExitCode,
     }
 
-    /// `wait` run to `until` against scripted legs.
     fn run(wait: &Wait, until: Option<Instant>, script: Vec<Leg>) -> Run {
         let mut script = script.into_iter();
         let mut sent = Vec::new();
@@ -393,10 +383,6 @@ mod tests {
         }
     }
 
-    /// RE-ARMED UNTIL NEWS: two legs time out at the server's bound and the
-    /// third answers — every leg the same words, `since=` unchanged, each
-    /// asking for the server's bound while the hour lasts; the answer is
-    /// printed once, exit 0, and no `OK timeout` is ever printed before it.
     #[test]
     fn a_wait_is_re_armed_with_the_same_since_until_a_leg_answers() {
         let wait = parse(&parts("@s-ab await inbox since=4 topic=lab")).expect("re-armed");
@@ -437,11 +423,6 @@ mod tests {
         }
     }
 
-    /// AT THE WHOLE WAIT'S DEADLINE, `OK timeout` and exit 124: a wait of
-    /// 50 ms asks its one leg for no more than that, and prints the timeout
-    /// once. NEGATIVE CONTROLS: a refusal ends the run at its leg, with no
-    /// line printed here (the leg said it on stderr); a hang-up with no
-    /// successor to follow is the original error.
     #[test]
     fn the_deadline_ends_the_wait_and_a_refusal_ends_it_at_once() {
         let wait = parse(&parts("await inbox since=4")).expect("re-armed");

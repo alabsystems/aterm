@@ -214,7 +214,6 @@ pub fn filling(free: u64, rates: &Rates, ttf: Option<f64>) -> Option<Filling> {
 mod tests {
     use super::*;
 
-    /// Midnight on some day, unix ms.
     const T0: i64 = 1_791_936_000_000;
     const MIN: i64 = 60_000;
 
@@ -260,13 +259,10 @@ mod tests {
         );
     }
 
-    /// A Disk ring of bytes used, a reading every 10 s for `minutes`, used
-    /// growing by `per_s` bytes a second.
     fn filling_ring(minutes: i64, per_s: f64) -> BucketRing {
         missing_ring(minutes, per_s, 0..0)
     }
 
-    /// [`filling_ring`] with the readings `missed` (by index) not taken.
     fn missing_ring(minutes: i64, per_s: f64, missed: std::ops::Range<i64>) -> BucketRing {
         let mut r = BucketRing::default();
         for i in (0..minutes * 6).filter(|i| !missed.contains(i)) {

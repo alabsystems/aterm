@@ -123,8 +123,7 @@ impl From<WireFault> for CheckpointFault {
 pub enum RestoreRefusal {
     /// The checkpoint belongs to another task, schema or profile.
     Identity(IdentityMismatch),
-    /// The stored state digest is not the digest of the stored state under the restoring schema's
-    /// digest: the checkpoint was captured under another schema than the one its provenance names.
+    /// Stored state digest does not match the state digest under the restoring schema's digest.
     StateDigest {
         /// The digest the checkpoint carries.
         stored: Digest,
@@ -257,12 +256,8 @@ impl Checkpoint {
         })
     }
 
-    /// Validates task/schema/profile against `expect` (the code may differ: applying other code is
-    /// a separately recorded transition), re-derives the state digest under `schema`'s digest, and
-    /// returns the decoded state.
-    ///
+    /// Validate task/schema/profile against `expect`, re-derive the state digest, and decode state.
     /// # Errors
-    ///
     /// [`RestoreRefusal::Identity`] (task, schema or profile, in that order),
     /// [`RestoreRefusal::StateDigest`], or [`RestoreRefusal::Wire`] (the state does not decode, or
     /// does not re-encode to its own bytes).

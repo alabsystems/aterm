@@ -154,7 +154,6 @@ pub fn caps_to_control() -> PValue {
     ])
 }
 
-/// A mapping array in words: `Caps Lock→Left Control, Left Command→Left Option`.
 fn describe(read: &Read<PValue>) -> String {
     match read {
         Read::Value(PValue::Array(items)) if !items.is_empty() => items
@@ -337,7 +336,6 @@ pub struct SeenKeyboards {
     before: Mutex<Vec<(Model, Read<PValue>)>>,
 }
 
-/// One seen model: what its key holds, and what it must become (`None`: nothing).
 struct SeenPlan {
     model: Model,
     read: Read<PValue>,
@@ -345,7 +343,6 @@ struct SeenPlan {
 }
 
 impl SeenKeyboards {
-    /// Each uncovered seen model, what its key holds, and what it must become.
     fn plans(&self, sys: &dyn System) -> Result<Vec<SeenPlan>, String> {
         let types = Target::system(KEYBOARD_TYPE, "keyboardtype");
         let models: Vec<Model> = seen_models(&types.entries(sys)?)?
@@ -546,17 +543,14 @@ mod tests {
     use crate::model::{Keyboard, Mode, Outcome};
     use crate::port::{Fake, Ran};
 
-    /// `defaults -currentHost export -g -` for the 27.0 VM's admin.
     const VM_CURRENT_HOST_GLOBAL: &[u8] =
         include_bytes!("../../fixtures/prefs/vm-27.0-currenthost-global.plist");
 
-    /// `defaults export /Library/Preferences/com.apple.keyboardtype -` fixture.
     const SEEN_KEYBOARDTYPE: &str = "<dict>\n\t<key>keyboardtype</key>\n\t<dict>\n\t\t<key>321-9456-0</key>\n\t\t<integer>40</integer>\n\t\t<key>49299-1133-0</key>\n\t\t<integer>40</integer>\n\t\t<key>8352-9456-0</key>\n\t\t<integer>40</integer>\n\t</dict>\n</dict>";
 
     const GLOBAL: &str = "admin$ /usr/bin/defaults -currentHost export -g -";
     const TYPES: &str = "/usr/bin/defaults export /Library/Preferences/com.apple.keyboardtype -";
 
-    /// The VM's keyboards, as its `hidutil list` printed them.
     fn vm_ctx() -> Ctx {
         let mut c = ctx(&[user("admin", 501)]);
         c.facts.form = Form::Virtual;
@@ -696,7 +690,6 @@ mod tests {
         );
     }
 
-    /// One entry, keys in the order `defaults export` sorts them.
     fn entry(src: i64, dst: i64) -> PValue {
         PValue::Dict(vec![
             (DST.into(), PValue::Int(dst)),

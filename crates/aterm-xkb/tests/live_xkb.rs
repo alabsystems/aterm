@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Declarations checked against the system's `libxkbcommon`.
+//!
+//! STOCK EXCEPTION: Linux only, and Trust has no Linux std, so only stock Rust builds this (the
+//! Linux lane's guest pins its version: `aterm-lab/src/linux_guest.rs`).
 
 #![cfg(target_os = "linux")]
 

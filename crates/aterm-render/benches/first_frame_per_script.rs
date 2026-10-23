@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! WHAT THE FIRST NON-LATIN FRAME COSTS ON WINDOWS — the other half of the mapped-font question.
+//!
+//! STOCK EXCEPTION: its work is Windows only, and Trust has no Windows std, so only stock Rust
+//! builds it (the Windows lane's guest pins its version: `aterm-lab/src/windows_guest.rs`).
 
 #[cfg(windows)]
 use aterm_core::terminal::Terminal;

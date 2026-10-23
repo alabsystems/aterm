@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-vitals: specs behind the stuck-process engine's 56 tests
+# aterm-vitals: specs behind the stuck-process engine's 57 tests
 
 > Status: specs for the stuck-process engine (`src/jobs/`, design
 > `docs/DESIGN-system-awareness-2026-10-16.md` §11 and `docs/DESIGN-hung-background-call-2026-10-20.md`
@@ -13,7 +13,7 @@ Source: `crates/aterm-vitals/src/jobs/` (`mod.rs`, `units.rs`, `step.rs`, `wait.
 tests in `src/jobs/tests.rs`, `tests/stuck_scenarios.rs` and `tests/conformance_stuck_verdict.rs`, and the
 scripted machine they share in `tests/support/{world,scenarios}.rs`.
 
-Result: **22 specs** over **56 tests**. Every test is a spec sample (§4).
+Result: **22 specs** over **57 tests**. Every test is a spec sample (§4).
 
 ## 0. Notation used in the statements
 
@@ -53,14 +53,14 @@ JB-ROW	contract	JobRow::wire, Jobs::absorb	The §11.10 example rows A–G, run i
 JB-TABLE	table-property	Jobs::absorb	Every Table scenario, in each shape it names, reads the verdict, class, wait, φ and first-crossing time its row states at 60 s and 20 min (stretch 1 and the 60 s prior unless the row says otherwise). A full-screen program in front with no key queued reads tty-raw however often it wakes (never POLLING); a typed sleep-poll loop is one POLLING job that reaches stuck at 18 min 25 s × stretch.	S::every_scenario_of_the_expectation_table_reads_as_the_table_says; S::a_typed_sleep_poll_loop_is_one_polling_job_that_reaches_stuck; S::a_full_screen_program_waking_often_with_no_key_queued_reads_keys_not_polling	the whole engine over W	0,1,2,3,13
 JB-UNITS-BLOCK	invariant	units::discover, Jobs::absorb	An open OSC 133 block is one job keyed by (tab, block): its members are the shell, the shell's own group and each group in front while it is open, so ids never repeat within a tab; it exits at D with D's status and never orphans the shell. Ctrl-Z makes the stopped group a background job keeping its id and quiet clock; `fg` makes it the next block's foreground job again, and that block's D closes it.	S::every_command_of_a_block_is_one_job_with_one_id; S::fg_makes_a_parked_job_the_next_blocks_foreground_job_again; S::ctrl_z_carries_the_jobs_id_and_quiet_clock_into_the_background; S::an_exited_block_keeps_its_row_and_status_for_a_minute	BTreeMap/HashMap bookkeeping across ticks	0,1,2,3,13
 JB-UNITS-DETACHED	invariant	units::discover, Jobs::absorb	A child that leads its own session with no terminal is a job whose consumer is its parent; it stays an agent call when its leader exits unreaped; what outlives a job is an orphan with consumer nobody, no φ and findings only; a reused pid with a new start is a new job, and an exited job never shares its id with a live one.	S::a_call_whose_leader_exits_leaves_an_orphan_with_findings_only; S::a_call_whose_leader_exits_unreaped_reads_exited_as_the_call; S::a_reused_pid_is_a_new_job	maps keyed by (pid, start)	0,1,2,3,13
-JB-STEP	refinement	step::classify_tick	An episode opens at the first suspect verdict and says each rank once until progress, exit or a legit class held 2 ticks closes it; the shown wait name changes only after 2 agreeing ticks; program-check alone shows and counts at once (JB-TIERA-PROGRAMCHECK); a job with ≥ 3 progress intervals teaches its command class at exit, and μ is max(10 s, own, else class, else 60 s).	S::an_episode_opens_once_and_a_new_one_after_progress; S::the_shown_wait_name_changes_after_two_agreeing_ticks; S::a_completed_job_teaches_its_command_class	a state machine over a struct	0,1,2,3
+JB-STEP	refinement	step::classify_tick	An episode opens at the first suspect verdict and says each rank once until progress, exit or a legit class held 2 ticks closes it; the shown wait name changes only after 2 agreeing ticks; program-check alone shows and counts at once (JB-TIERA-PROGRAMCHECK); a job whose command is known (a shell job's leader or block command, or the command a call's join names; an agent's call no join names has none, its leader being the agent's shell wrapper) with ≥ 3 progress intervals teaches its command class at exit, and μ is max(10 s, own, else its class (none without a command), else 60 s).	S::an_episode_opens_once_and_a_new_one_after_progress; S::the_shown_wait_name_changes_after_two_agreeing_ticks; S::a_completed_job_teaches_its_command_class; S::an_agent_calls_class_is_the_command_its_join_names_never_its_shell_wrapper	a state machine over a struct	0,1,2,3
 JB-DEMAND	contract	units::demand_of	Demand is Fast while any live row runs, is stuck or is suspect, Slow when the live rows are legitimate waits not all the person's, and Idle when nothing runs or only the person is waited on; a program-check finding or an open backed-up episode moves no Demand (the host reads them with no window).	S::demand_is_fast_for_suspects_slow_for_legit_waits_and_idle_for_the_person; S::a_held_program_leaves_demand_to_the_jobs; S::a_program_at_the_persons_raw_read_parks_demand_even_while_it_writes_files; S::a_tab_is_parked_only_while_every_live_job_waits_at_the_persons_read; S::a_full_screen_program_logging_to_its_own_file_parks_demand	iterator over rows	0,1,3
 JB-FINDINGS	contract	Jobs::findings, Jobs::note_held	Findings count stopped processes and zombies (first seen ≥ 10 s, grouped by parent, with their rate) for every user, D-state ≥ 10 s and own-uid processes against the per-user limit for aterm's user. Own-uid processes macOS's program check holds (JobTick.held, members of a job or not) are findings each held since the first reading that saw its (pid, exec) held, so an exec starts a new time, with its member's tab (none outside every job) and, of the ones aterm started, the count and the oldest. One backed-up episode opens at the first reading where a key held now was held at the reading before or three are held at once, and closes at the second reading in a row with none held; the closing view alone says it drained, open to its last held reading.	S::findings_count_stopped_d_state_and_the_process_table; S::held_rows_count_from_their_first_sighting_and_open_one_episode_when_backed_up	maps across ticks	0,1,2,3
 JB-MODEL	refinement	step::classify_tick, Jobs::absorb	Each covered Table run, projected tick by tick onto (cls, q band, v), is a run of the StuckVerdict model (aterm_models_misc::stuck_verdict_model, ty_model!). Each injected defect (accrue on a legit wait, reset the age on a refused read, let unnamed reach stuck, never raise a named wait, count CR redraws, idle churn or logical-write noise as progress, ignore the program check) makes some run leave the model or miss its flag. The model's held input is read from each view's program-check findings (the job waits, and its waiting process is one of them), never from the row: Hold on the first such tick, Release on the first after.	C::every_covered_scenario_is_a_run_of_the_model; C::accruing_on_a_legit_wait_is_caught_by_legit_wait_never_accrues; C::resetting_the_age_on_a_refused_read_is_caught_by_refused_reading_is_not_zero_progress; C::letting_unnamed_reach_stuck_is_caught_by_unnamed_never_enters_stuck; C::never_raising_a_named_wait_is_caught_by_flagged_on_time; C::a_cr_redraw_counted_as_progress_never_flags_the_spinner_over_a_silent_socket; C::churn_without_work_counted_as_progress_never_flags_the_sleep_poll_loop; C::logical_write_noise_counted_as_progress_never_flags_the_spinner; C::ignoring_the_program_check_is_caught_by_held_wait_never_quiet	model interpretation, fault injection	0,1,2,3,13
 JB-NOPROGRESS	contract	step::classify_tick, Jobs::absorb, JobRow::wire	A row says no_progress exactly when it is an agent's call (kind agent-call; consumer agent-fg, agent-bg or agent) at verdict quiet with φ × 1000 ≥ PHI_STUCK_MILLI and Σ ΔCPU over its members across the current suspect run × 60,000 < the run's quiet_ms × NO_PROGRESS_CPU_NS_PER_MIN (1 ms a minute, the design's first bound). The sum restarts with the suspect clock (progress, a legit class held 2 ticks, a new job); a refused reading in the run, or the baseline reading after one, makes the run's CPU unknown and the word false until the clock restarts. It is a word beside the verdict, never a verdict: the verdict stays quiet and unnamed never reaches stuck. In W: deadlock.setsid (I4's shape) reads it from 1,106 s on and is still quiet at 26 h; deadlock_eperm.setsid only in its third, clean run, from 3,506 s; trickle.setsid (3 ms a minute), every10.setsid (it prints), spin.setsid (busy) and sleep.pty (the person's) never; every other row of the table that says it is a quiet agent's call at φ ≥ 8.	S::every_scenario_of_the_expectation_table_reads_as_the_table_says; C::every_covered_scenario_is_a_run_of_the_model; C::letting_unnamed_reach_stuck_is_caught_by_unnamed_never_enters_stuck	u128 arithmetic, an Option sum carried across ticks, the whole engine over W	0,1,2,3,13
 ```
 
-## 2. Test → spec map (TSV; all 56)
+## 2. Test → spec map (TSV; all 57)
 
 ```tsv
 file	test	primary	also
@@ -101,6 +101,7 @@ S	the_shown_wait_name_changes_after_two_agreeing_ticks	JB-STEP
 S	a_reused_pid_is_a_new_job	JB-UNITS-DETACHED	
 S	an_episode_opens_once_and_a_new_one_after_progress	JB-STEP	
 S	a_completed_job_teaches_its_command_class	JB-STEP	JB-CLASSTABLE
+S	an_agent_calls_class_is_the_command_its_join_names_never_its_shell_wrapper	JB-STEP	JB-UNITS-DETACHED
 S	verdict_and_class_words_are_closed_and_share_only_exited	JB-WORDS	
 S	every_command_of_a_block_is_one_job_with_one_id	JB-UNITS-BLOCK	JB-EXE
 S	a_typed_sleep_poll_loop_is_one_polling_job_that_reaches_stuck	JB-TABLE	JB-UNITS-BLOCK
@@ -124,7 +125,7 @@ C	ignoring_the_program_check_is_caught_by_held_wait_never_quiet	JB-MODEL	JB-TIER
 
 ## 3. Coverage
 
-- 56 tests, 22 specs, all in `src/jobs/` and the two integration tests above.
+- 57 tests, 22 specs, all in `src/jobs/` and the two integration tests above.
 - Not recovered here yet: the 30 tests of the earlier modules, `src/model.rs` (9: attribution, deltas,
   naming, cores, clusters, memory), `src/trend.rs` (9: the two averages, momentum, variance, history),
   `src/words.rs` (6: the Deck's sentences and units) and `src/ink.rs` (6: OkLab, the ramp and the scope

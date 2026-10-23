@@ -1,11 +1,10 @@
-<!-- aterm skill v6 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v7 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # The aterm fabric: inbox, outbox and the halt
 
-Every aterm session has a mailbox where peers on this machine (sessions, agents, humans)
-post addressed messages. Mail is never typed into your terminal and nothing aterm types
-wakes you for it: a wake is a wait you chose to run. `aterm help fabric` is the full
-reference.
+Every aterm session has a mailbox where peers (sessions, agents, people) post addressed
+messages. Mail is never typed into your terminal and nothing aterm types wakes you for it:
+a wake is a wait you chose to run. `aterm help fabric` is the full reference.
 
 ## Is it on?
 
@@ -22,8 +21,8 @@ aterm ctl @self inbox get @<off>         # one body by broker offset, even after
 aterm ctl @self inbox seen <id> handled  # the handled watermark (or refused, deferred); acks an ask or task
 ```
 
-A sender's quota counts your unlisted rows, so only peeking fills it. `aterm ctl help inbox`
-lists every field.
+A sender's quota counts your unlisted rows, so a session that only peeks fills it.
+`aterm ctl help inbox` lists every field.
 
 ## Send
 
@@ -40,9 +39,9 @@ arrives `trust=human` with `re=<off>`. `aterm ctl help post` has the kinds and o
   a duplicate unless it carries the same `key=`.
 - `no-bridge=1` is queued too: `aterm fabric on` starts a bridge and drains the outbox
   (`aterm ctl fabric attach` arms only the `[fabric] command` aterm.toml names).
-- `ERR unroutable|ambiguous|undeliverable id=<n>` is the one outcome that is not queued:
-  `unroutable` means the address resolves to nothing or to an exited/withdrawn session. Fix
-  the address before posting again.
+- `ERR unroutable|ambiguous|undeliverable|refused|subject-budget id=<n>` retires the post
+  and `ERR outbox full` queues nothing. `unroutable` means the address resolves to nothing
+  or to an exited/withdrawn session: fix the address before posting again.
 - A post to an `away` session (its aterm or bridge went silent) queues on the bus and
   arrives when it returns.
 
@@ -90,12 +89,13 @@ worker (Claude Code, Gemini CLI, agy or Muse Code) goes as its first prompt, not
 
 `hold=1` means driving this session was halted: every verb that types into it answers
 `ERR halted reason=<r> origin=<person|remote|local|fleet>` (`reason=` is what to quote) until
-the hold lifts. Reads, `post`, `inbox seen`, `meta set` and `lease` still work.
+the hold lifts. Reads, `post`, `inbox seen`, `meta set` and `lease` still work. While any
+tab is held, `invoke`, `tab`, `pane`, `hwkey`, `pointer` and `confirm` are halted across
+that aterm.
 
 - `origin=person` (`reason=taken-over`): the person at the window took the tab over (Take
   Over). Only their Hand Back lifts it (`hold <sid> off` answers `OK hold=1` and lifts
-  nothing); while it stands, `invoke`, `tab`, `pane`, `hwkey`, `pointer` and `confirm` are
-  halted across that aterm. Wait, or `post` them a note.
+  nothing). Wait, or `post` them a note.
 - `origin=remote`: another Mac's node holds the session over the fleet (`status
   hold_by=remote`; `aterm help fleet`, DRIVE). Only that Mac's `aterm ctl --host <h> hold
   <sid> off`, or the local person's Take Over / Hand Back, lifts it (`hold <sid> off` here
@@ -104,8 +104,8 @@ the hold lifts. Reads, `post`, `inbox seen`, `meta set` and `lease` still work.
 - `origin=fleet`: a person's bus halt, lifted only with `aterm fabric halt --cap-file
   <their cap> off` (`hold off` answers `ERR denied`). `reason=fabric-lost` is a lost
   bridge's halt and lifts when a bridge reconnects.
-- Both can stand at once (`hold_origin=fleet,local`): `ERR halted` names the fleet's, and
-  the session stays held until both lift.
+- Several can stand at once (`hold_origin=fleet,local`): `ERR halted` names the first of
+  person, remote, fleet and local, and the session stays held until each lifts.
 
 `fleet` in `origin=fleet` is this machine's fabric bus; `aterm fleet` is the LAN fleet across
 Macs (`aterm help fleet`).

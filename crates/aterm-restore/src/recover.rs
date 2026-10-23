@@ -224,9 +224,7 @@ impl Restored {
     }
 
     /// Compute the history join inputs for this restore, or why the head cannot be joined.
-    ///
     /// # Errors
-    ///
     /// Returns [`HeadLost`] if the history identity moved or detached across replay.
     pub fn join_facts(&self) -> Result<JoinFacts, HeadLost> {
         let held = !self.keyframe.fence.detached
@@ -276,7 +274,7 @@ impl Restored {
         })
     }
 
-    /// Chunks in [`RingRun::chunks`] and leading-line skip needed to import `take` lines from `export`.
+    /// Chunks in [`RingRun::chunks`] and leading-line skip to import `take` lines from `export`.
     #[must_use]
     pub fn ring_chunks_for(&self, export: &RingExport, take: u64) -> (Range<usize>, u64) {
         if take == 0 {
@@ -388,9 +386,7 @@ pub fn read_erased_turn_count<V: RegionView + ?Sized>(view: &V) -> Option<u64> {
 }
 
 /// Read and validate a region's header without restoring the screen.
-///
 /// # Errors
-///
 /// Returns the [`HeaderFault`] that refuses the region.
 pub fn read_header<V: RegionView + ?Sized>(view: &V) -> Result<HeaderFacts, HeaderFault> {
     let magic = load(view, OFF_MAGIC)
@@ -563,7 +559,6 @@ struct Walk {
     superseded: bool,
 }
 
-/// Walk the tail's live window, replaying from the keyframe's `tail_from` when `apply`.
 fn walk_tail<V: RegionView + ?Sized>(
     view: &V,
     geometry: &Geometry,
@@ -714,7 +709,6 @@ fn walk_tail<V: RegionView + ?Sized>(
     walk
 }
 
-/// Read the history ring's run between its words.
 fn read_ring<V: RegionView + ?Sized>(view: &V, geometry: &Geometry) -> RingRun {
     let mut run = RingRun::default();
     let words = (
@@ -747,7 +741,6 @@ fn read_ring<V: RegionView + ?Sized>(view: &V, geometry: &Geometry) -> RingRun {
     };
     run.end_row = end_row;
     if lo >= hi {
-        // Empty: never written, just reset, or a stop mid-way through an eviction.
         return run;
     }
     if cap == 0 || cap > geometry.hist_cap_phys || hi - lo > cap as u64 {
@@ -933,7 +926,6 @@ pub fn recover<V: RegionView + ?Sized>(
     let mut engine = make_engine(keyframe.checkpoint.rows, keyframe.checkpoint.cols);
     engine.restore_checkpoint(&keyframe.checkpoint);
     if keyframe.head.integration_on {
-        // The live engine's posture, never its nonce (`RecoverPolicy::scratch_nonce`).
         engine.authorize_shell_integration(policy.scratch_nonce);
     }
     let fence_before = engine.history_fence();

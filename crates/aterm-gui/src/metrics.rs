@@ -258,6 +258,10 @@ window_ledger! {
         pub(crate) stage: Last,
         /// The pass-economy ablation the latest frame ran under (a dev seam), as its [`ablation_code`].
         pub(crate) unorm_ablation: LastLabel,
+        /// Where the latest frame drew its Unorm-law light, as its [`route_code`].
+        pub(crate) unorm_route: LastLabel,
+        /// The device's framebuffer-fetch verdict as of the latest frame, as its [`probe_code`].
+        pub(crate) fetch_probe: LastLabel,
         /// The fx instances the arm staged in the latest frame, and the fx bytes it uploaded (instances, palette, atlas texels).
         pub(crate) fx_instances: Last,
         pub(crate) fx_upload_bytes: Last,
@@ -935,6 +939,43 @@ fn ablation_of(code: u8) -> Option<aterm_gpu::UnormAblation> {
         .find(|&mode| ablation_code(mode) == code)
 }
 
+const fn route_code(route: aterm_gpu::UnormRoute) -> u8 {
+    match route {
+        aterm_gpu::UnormRoute::Split => 0,
+        aterm_gpu::UnormRoute::Fetch => 1,
+    }
+}
+
+/// A framebuffer-fetch verdict's [`GpuLedger::fetch_probe`] code: 0 while none settled.
+const fn probe_code(probe: Option<aterm_gpu::FetchProbe>) -> u8 {
+    match probe {
+        None => 0,
+        Some(aterm_gpu::FetchProbe::Unsupported) => 1,
+        Some(aterm_gpu::FetchProbe::Passed) => 2,
+        Some(aterm_gpu::FetchProbe::Failed { .. }) => 3,
+        Some(aterm_gpu::FetchProbe::Refused) => 4,
+    }
+}
+
+/// The `gpu_fetch_probe=` word of a [`probe_code`]: the verdict's name, `pending` before one settled.
+const fn probe_name(code: u64) -> &'static str {
+    match code {
+        0 => "pending",
+        1 => "unsupported",
+        2 => "passed",
+        3 => "failed",
+        4 => "refused",
+        _ => "unknown",
+    }
+}
+
+fn route_of(code: u8) -> Option<aterm_gpu::UnormRoute> {
+    use aterm_gpu::UnormRoute::{Fetch, Split};
+    [Split, Fetch]
+        .into_iter()
+        .find(|&route| route_code(route) == code)
+}
+
 impl GpuLedger {
     fn note_time(&self, frame: aterm_gpu::gpu_time::GpuFrameTime) {
         let _ = self.time.record(frame.gpu_ns);
@@ -950,6 +991,9 @@ impl GpuLedger {
         self.stage.set(shape.stage_ns);
         self.unorm_ablation
             .set(usize::from(ablation_code(shape.ablation)));
+        self.unorm_route.set(usize::from(route_code(shape.route)));
+        self.fetch_probe
+            .set(usize::from(probe_code(shape.fetch_probe)));
         for (slot, count) in self.instances.iter().zip(shape.instances) {
             slot.set(u64::from(count));
         }
@@ -963,6 +1007,17 @@ impl GpuLedger {
             .ok()
             .and_then(ablation_of)
             .map_or("unknown", aterm_gpu::UnormAblation::name)
+    }
+
+    fn fetch_probe_name(&self) -> &'static str {
+        probe_name(self.fetch_probe.get())
+    }
+
+    fn unorm_route_name(&self) -> &'static str {
+        u8::try_from(self.unorm_route.get())
+            .ok()
+            .and_then(route_of)
+            .map_or("unknown", aterm_gpu::UnormRoute::name)
     }
 
     fn sample_fx_totals(&self) {
@@ -1036,6 +1091,8 @@ fn emit_gpu(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink) {
     s.decimal("gpu_build_last_ms", ms(gpu.build.get()));
     s.decimal("gpu_stage_last_ms", ms(gpu.stage.get()));
     s.label("gpu_unorm_ablation", gpu.unorm_ablation_name());
+    s.label("gpu_unorm_route", gpu.unorm_route_name());
+    s.label("gpu_fetch_probe", gpu.fetch_probe_name());
     s.count("fx_instances_last", gpu.fx_instances.get());
     s.count("fx_upload_bytes_last", gpu.fx_upload_bytes.get());
     s.count("fx_refused_last", gpu.fx_refused.get());
@@ -2970,6 +3027,45 @@ mod present_glass_tests {
     }
 
     #[test]
+    fn every_unorm_route_reads_back_as_itself() {
+        use aterm_gpu::UnormRoute::{Fetch, Split};
+        for route in [Split, Fetch] {
+            assert_eq!(super::route_of(super::route_code(route)), Some(route));
+        }
+        assert_eq!(super::route_of(2), None);
+        let m = super::Metrics::new();
+        m.window.gpu.unorm_route.set(2);
+        assert_eq!(m.window.gpu.unorm_route_name(), "unknown");
+    }
+
+    #[test]
+    fn every_fetch_verdict_publishes_its_own_name() {
+        use aterm_gpu::{FetchProbe, FetchStage};
+        let failed = FetchProbe::Failed {
+            stage: FetchStage::InPass,
+            channel: 1,
+            want: 2,
+            got: 3,
+        };
+        for verdict in [
+            FetchProbe::Unsupported,
+            FetchProbe::Passed,
+            failed,
+            FetchProbe::Refused,
+        ] {
+            assert_eq!(
+                super::probe_name(u64::from(super::probe_code(Some(verdict)))),
+                verdict.name()
+            );
+        }
+        assert_eq!(
+            super::probe_name(u64::from(super::probe_code(None))),
+            "pending"
+        );
+        assert_eq!(super::probe_name(5), "unknown");
+    }
+
+    #[test]
     fn glass_samples_book_on_glass_and_skipped_apart() {
         let m = Metrics::new();
         let ctx = wire::ReadCtx::inert(&m, 0);
@@ -3049,6 +3145,8 @@ mod gpu_tests {
             build_ns: 2_000_000,
             stage_ns: 3_000_000,
             ablation: aterm_gpu::UnormAblation::Thin,
+            route: aterm_gpu::UnormRoute::Fetch,
+            fetch_probe: Some(aterm_gpu::FetchProbe::Passed),
             fx_instances: 6,
             fx_upload_bytes: 1_216,
             fx_refused: 2,
@@ -3078,6 +3176,8 @@ mod gpu_tests {
             "gpu_build_last_ms=2.00",
             "gpu_stage_last_ms=3.00",
             "gpu_unorm_ablation=thin",
+            "gpu_unorm_route=fetch",
+            "gpu_fetch_probe=passed",
             "fx_instances_last=6",
             "fx_upload_bytes_last=1216",
             "fx_refused_last=2",
@@ -3091,6 +3191,8 @@ mod gpu_tests {
         assert_eq!(object["n_gpu_time"].as_u64(), Some(1));
         assert_eq!(object["instances_by_stream"]["glyph"].as_u64(), Some(8));
         assert_eq!(object["gpu_unorm_ablation"].as_str(), Some("thin"));
+        assert_eq!(object["gpu_unorm_route"].as_str(), Some("fetch"));
+        assert_eq!(object["gpu_fetch_probe"].as_str(), Some("passed"));
         assert_eq!(object["fx_instances_last"].as_u64(), Some(6));
         assert_eq!(object["fx_upload_bytes_last"].as_u64(), Some(1_216));
         assert_eq!(object["fx_refused_last"].as_u64(), Some(2));
@@ -3115,6 +3217,8 @@ mod gpu_tests {
             Some(0)
         );
         assert_eq!(object["gpu_unorm_ablation"].as_str(), Some("off"));
+        assert_eq!(object["gpu_unorm_route"].as_str(), Some("split"));
+        assert_eq!(object["gpu_fetch_probe"].as_str(), Some("pending"));
         assert_eq!(object["gpu_time_source"].as_str(), Some(empty_source));
         assert_eq!(object["fx_instances_last"].as_u64(), Some(0));
         assert_eq!(object["fx_upload_bytes_last"].as_u64(), Some(0));

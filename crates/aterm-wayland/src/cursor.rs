@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Cursors on Wayland: the six pointer shapes aterm shows, as cursor-shape-v1 shapes (the
-//! compositor draws them) and, where a compositor lacks that protocol, as images from the user's
-//! cursor theme through libwayland-cursor (`libwayland-cursor.so.0`, opened at run time).
+//! Wayland cursors via cursor-shape-v1 and `libwayland-cursor.so.0`.
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::ptr::NonNull;
@@ -146,8 +144,7 @@ pub struct Theme {
 unsafe impl Send for Theme {}
 
 impl Theme {
-    /// Load `name` (the user's theme when `None`, libwayland-cursor's built-in cursors when it has
-    /// none) at `size` pixels, its buffers made from `shm` (and on `shm`'s queue).
+    /// Load `name` (or the default theme when `None`) at `size` pixels using `shm`.
     /// # Safety
     /// `shm` is a live `wl_shm` that outlives the theme.
     pub unsafe fn load(name: Option<&CStr>, size: u32, shm: Proxy) -> Result<Theme, Error> {
@@ -172,8 +169,7 @@ impl Theme {
         self.frame_named(icon.names())
     }
 
-    /// The first frame of the cursor under the first of `names` the theme has (a caller with icons
-    /// of its own names them, CSS name first).
+    /// The first frame of the cursor under the first of `names` the theme has.
     pub fn frame_named(&self, names: &[&CStr]) -> Option<Frame> {
         names.iter().find_map(|name| {
             // SAFETY: a live theme and a NUL-terminated name; the cursor and its images live as

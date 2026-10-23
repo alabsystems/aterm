@@ -123,6 +123,15 @@ pub struct CursorDroplet {
 }
 
 impl CursorDroplet {
+    /// Reset animation state while preserving the contrast-band memo.
+    #[inline]
+    pub fn reset(&mut self) {
+        *self = Self {
+            band_memo: self.band_memo,
+            ..Self::default()
+        };
+    }
+
     /// Returns whether the droplet surge is still active and requires animation ticks.
     #[must_use]
     #[inline]

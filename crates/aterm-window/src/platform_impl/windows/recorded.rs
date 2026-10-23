@@ -81,9 +81,7 @@ impl RecordedLayout {
         ((0xA7E0 + u64::from(self.variant)) << 16) | u64::from(self.lang)
     }
 
-    /// The `Layout` `LayoutCache::prepare_layout` would build: every key at every modifier
-    /// state the cache keys (Shift, Ctrl, Alt and Caps Lock), Alt alone typing the unmodified
-    /// level, and the left and right Alt keys.
+    /// Builds the [`Layout`] that `LayoutCache::prepare_layout` would build.
     fn layout(&self) -> Layout {
         let mut keys = HashMap::new();
         for bits in 0..WindowsModifiers::FLAGS_END.bits() {
@@ -191,8 +189,7 @@ impl Message {
 pub struct Typist {
     keys: [u8; 256],
     messages: Vec<Message>,
-    /// The last key press was a system key (Alt held, Ctrl not): its characters are
-    /// `WM_SYSCHAR`s.
+    /// Last key press had Alt held without Ctrl (`WM_SYSCHAR`).
     sys: bool,
     last_lparam: isize,
 }
@@ -583,7 +580,6 @@ mod tests {
     use super::*;
     use crate::event::ElementState;
 
-    /// The presses among `events`: `(logical key, text)`.
     fn presses(events: &[Replayed]) -> Vec<(Key, Option<String>)> {
         events
             .iter()
@@ -600,9 +596,6 @@ mod tests {
         Key::Character(SmolStr::new(text))
     }
 
-    /// de-DE AltGr+Q: Windows posts a left Ctrl press ahead of the right Alt's. The window
-    /// drops that Ctrl as AltGr's and reports no Ctrl or Alt while AltGr is down, so `@` arrives
-    /// as a bare character.
     #[test]
     fn altgr_drops_its_fake_ctrl_and_types_the_character_bare() {
         let typed = Typist::new().press(LCTRL).press(RALT).tap(Q, "@").release(LCTRL).release(RALT);
@@ -627,9 +620,6 @@ mod tests {
         assert_eq!(mods_then, ModifiersState::empty(), "{events:#?}");
     }
 
-    /// A dead key then a letter: the dead key reports `Dead` with no text, the letter the
-    /// composed character. Then Space types the accent itself, and a letter that does not
-    /// compose types both characters (US-International `'` then `s`).
     #[test]
     fn a_dead_key_composes_with_the_next_key() {
         let typed = Typist::new()
@@ -656,8 +646,6 @@ mod tests {
         ]);
     }
 
-    /// Alt, 0, 2, 3, 3 on the NumLock-on keypad: each digit is a system key with no
-    /// character, and Alt's release posts `é`, which arrives as a commit.
     #[test]
     fn an_alt_code_commits_its_character() {
         let mut typed = Typist::new().toggled(0x90).press(LALT);
@@ -676,9 +664,6 @@ mod tests {
         assert_eq!(events.last(), Some(&Replayed::Ime(Ime::Commit("é".to_owned()))));
     }
 
-    /// A Japanese IME: the keys it takes arrive as `VK_PROCESSKEY` with no character, the
-    /// composition as preedit with the converted clause targeted, and the result once as a
-    /// commit.
     #[test]
     fn an_input_methods_result_is_committed_once() {
         let converted = "日本語";
@@ -734,8 +719,6 @@ mod tests {
         );
     }
 
-    /// The Hangul IME commits at the end of a composition and then sends the result again in a
-    /// `WM_IME_COMPOSITION`: the window commits it once.
     #[test]
     fn the_hangul_ime_commits_once() {
         let typed = Typist::new()
@@ -758,8 +741,6 @@ mod tests {
         assert_eq!(commits, 1, "{events:#?}");
     }
 
-    /// Text `SendInput` types (`VK_PACKET`, the emoji panel's way into a window): a surrogate
-    /// pair in two `WM_CHAR`s is one character of text on an unidentified key.
     #[test]
     fn a_packet_key_carries_its_text() {
         let typed = Typist::new().tap(PACKET, "😀");

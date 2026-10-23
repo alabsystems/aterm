@@ -20,7 +20,6 @@ pub(super) const LONGEST: Duration = Duration::from_secs(4 * 60);
 /// Maximum consecutive failed change attempts before waiting for an external change.
 pub(super) const TRIES: u32 = 2;
 
-/// How many builds a row of tries remembers having tried.
 const BUILDS: usize = 16;
 
 /// What can change a Secrets try's answer without the person, read before and after it.
@@ -55,11 +54,6 @@ pub(super) fn pace(reads: &dyn Reads) -> Pace {
     }
 }
 
-/// A digest of what a Secrets try's answer hangs on here: the addresses this Mac's traffic
-/// leaves by and, from this Mac's own files, its vault state (the source, its key, its
-/// membership and the version it holds, the files it wrote, whether its subscriber runs),
-/// and whether this aterm is a copy that goes away, which no subscriber may run
-/// ([`SecretsOps::fleeting`]).
 fn marks(reads: &dyn Reads) -> String {
     use aterm_secrets::client::Membership;
     use aterm_secrets::service::State;
@@ -133,8 +127,6 @@ struct Attempt {
 }
 
 impl Attempt {
-    /// The record, or `None` when there is none or it cannot be read: a try is then due,
-    /// as it was before the record existed.
     fn load(root: &Path) -> Option<Self> {
         let bytes = std::fs::read(root.join(RECORD)).ok()?;
         let record: Value = aterm_json::from_slice(&bytes).ok()?;
@@ -186,20 +178,14 @@ impl Attempt {
         )
     }
 
-    /// Whether a try at `pace` is in this row of tries of `revision`: the same network and
-    /// vault state.
     fn same_row(&self, revision: u64, pace: &Pace) -> bool {
         self.revision == revision && self.marks == pace.marks
     }
 
-    /// Whether nothing that could change this try's answer changed before `pace`: the same
-    /// row, read by a build that tried in it. Two builds taking turns (an app updated beside
-    /// a session of its predecessor) share the row's pause once each has tried.
     fn unchanged(&self, revision: u64, pace: &Pace) -> bool {
         self.same_row(revision, pace) && self.builds.contains(&pace.build)
     }
 
-    /// Whether the last [`TRIES`] tries failed, so the next waits for a change.
     const fn held(&self) -> bool {
         self.failures >= TRIES
     }
@@ -224,7 +210,6 @@ pub(super) fn paused(root: &Path, revision: u64, pace: &Pace) -> Option<Vec<Row>
 }
 
 /// Records the outcome of a Secrets attempt for `revision` at `pace`.
-///
 /// # Errors
 /// The record cannot be written or removed.
 pub(super) fn record(
@@ -286,10 +271,8 @@ pub(super) fn record(
     .save(root)
 }
 
-/// What a try whose change failed [`TRIES`] times in a row says of the next.
 const HELD: &str = "aterm tried this twice by itself and it did not take, so it tries again only when this Mac's network or vault changes, after an update of aterm, or on Apply in System State";
 
-/// What an unfinished try's row says of the next.
 fn note(pause: Duration) -> String {
     let minutes = pause.as_secs() / 60;
     let after = if minutes == 1 {
@@ -322,8 +305,6 @@ mod tests {
         }]
     }
 
-    /// The pause doubles from a minute and stops at [`LONGEST`], which stays under the
-    /// subscriber's own five-minute wait after an error.
     #[test]
     fn the_pause_doubles_to_four_minutes() {
         let minutes: Vec<u64> = (1..=6).map(|tries| pause(tries).as_secs() / 60).collect();
@@ -332,10 +313,6 @@ mod tests {
         assert!(LONGEST < Duration::from_secs(5 * 60));
     }
 
-    /// An unfinished try pauses the next for as long as nothing changes, showing the same
-    /// rows; a new network or vault state, another build, another run, a clock set back or
-    /// an unreadable record each make a try due. Negative control: a finished try leaves
-    /// nothing paused.
     #[test]
     fn a_pause_ends_with_its_time_or_any_change() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -382,9 +359,6 @@ mod tests {
         assert!(paused(root, 3, &pace("n", 1_303)).is_none());
     }
 
-    /// Two builds taking turns share the row's pause once each has tried in it: a build
-    /// that has not tried yet tries at once, then neither ends the other's pause. Negative
-    /// control: a third build that has not tried ends it.
     #[test]
     fn builds_taking_turns_share_one_pause() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -411,10 +385,6 @@ mod tests {
         assert!(paused(root, 3, &third).is_none(), "the control");
     }
 
-    /// A try whose change failed is made at most [`TRIES`] times in a row, and the row then
-    /// says only a change brings another; any change does (another network, a build that has
-    /// not tried, a new run). A try that did not fail (stood aside offline) ends the failures
-    /// in a row. Negative control: a row that never failed is paused only for its time.
     #[test]
     fn a_change_that_keeps_failing_is_tried_twice_then_held_until_a_change() {
         let root = aterm_tempfile::tempdir().unwrap();

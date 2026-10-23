@@ -55,10 +55,6 @@ fn event(arrow: Arrow, state: ElementState, repeat: bool) -> KeyEvent {
     )
 }
 
-/// The four Alt+arrows bound to pane focus by a `[keybindings]` table, as the
-/// platform seeds them off macOS. A user's table is the case every platform shares
-/// (macOS seeds none), and the rule is the action's, so it is the one pinned here;
-/// `the_seeded_alt_arrows_follow_the_same_rule` covers the seed itself. Alt is held.
 fn app_with_alt_arrow_pane_focus() -> (App, WindowId) {
     let mut app = App::headless_for_test();
     app.keybindings = crate::keybinding::Keybindings::resolved(Some(
@@ -95,10 +91,6 @@ fn owner(app: &App, arrow: Arrow) -> Option<PhysicalPressOwner> {
         .cloned()
 }
 
-/// The session a press was forwarded to and the bytes the seam writes for it:
-/// `encode_key_with_text`, the seam's own encoder (`input::seam_egress_inner`),
-/// over the press `on_key` booked and that session's live keyboard mode. Panics
-/// when the press was not forwarded to the program at all.
 fn forwarded(app: &App, arrow: Arrow) -> (u64, Vec<u8>) {
     let Some(PhysicalPressOwner::Forwarded {
         session,
@@ -141,10 +133,6 @@ fn consumed(app: &App, wid: WindowId, arrow: Arrow) -> bool {
         .contains(&PhysicalKey::Code(arrow.code))
 }
 
-/// A one-pane tab has nowhere to move focus, so every Alt+arrow reaches the
-/// program: booked as a forwarded press (not a GUI-consumed one), in the focused
-/// session, encoded as xterm's Alt+arrow. Alt+←/→ are the word motion the shell
-/// integrations bind. Before the rule the chord was claimed and did nothing.
 #[test]
 fn alt_arrows_on_a_one_pane_tab_reach_the_program() {
     let (mut app, wid) = app_with_alt_arrow_pane_focus();
@@ -166,8 +154,6 @@ fn alt_arrows_on_a_one_pane_tab_reach_the_program() {
     }
 }
 
-/// With a pane that way the chord is still pane focus: focus moves, the press is
-/// the GUI's (consumed, its release swallowed) and nothing reaches the program.
 #[test]
 fn alt_left_into_a_split_moves_focus_and_the_program_sees_nothing() {
     let (mut app, wid) = app_with_alt_arrow_pane_focus();
@@ -197,9 +183,6 @@ fn alt_left_into_a_split_moves_focus_and_the_program_sees_nothing() {
     release(&mut app, wid, RIGHT);
 }
 
-/// At the edge of a split, and on a zoomed pane, the chord passes through to the
-/// FOCUSED pane's program and leaves focus where it was, while a direction that
-/// has a pane still moves.
 #[test]
 fn at_the_edge_of_a_split_or_zoomed_the_chord_passes_through() {
     let (mut app, wid) = app_with_alt_arrow_pane_focus();
@@ -240,10 +223,6 @@ fn at_the_edge_of_a_split_or_zoomed_the_chord_passes_through() {
     release(&mut app, wid, LEFT);
 }
 
-/// A passed-through press is booked exactly like any PTY-bound press, so its
-/// auto-repeat replays it to the same session and its release reaches the
-/// encoder rather than being swallowed. A claimed press's repeat is held and
-/// moves focus no further.
 #[test]
 fn a_passed_through_press_keeps_its_repeats_and_release() {
     let (mut app, wid) = app_with_alt_arrow_pane_focus();
@@ -328,10 +307,6 @@ fn the_seeded_alt_arrows_follow_the_same_rule() {
     release(&mut app, wid, LEFT);
 }
 
-/// Over a native view (Settings) the same rule holds: a pane-focus chord with no
-/// pane that way is no command, so the key reaches the view's editor, where
-/// Alt+← is a Settings field's word motion (`app_native`'s `alt_word`). It used to
-/// be claimed as pane focus there and the caret stayed put.
 #[test]
 fn over_a_native_view_alt_left_reaches_the_field_as_word_motion() {
     use crate::native_app::{AppEvent, TextInputEvent};
@@ -365,11 +340,6 @@ fn over_a_native_view_alt_left_reaches_the_field_as_word_motion() {
     release(&mut app, wid, LEFT);
 }
 
-/// A pane-focus binding OFF the arrows keeps its key with nowhere to move
-/// (`keybinding::pane_focus_passes_through`): `ctrl+j = "focus_pane_down"` on a
-/// one-pane tab is the GUI's press, a no-op, and never Ctrl+J's LF to the shell,
-/// which bash runs as accept-line (the half-typed command). The control: unbound,
-/// the same press is forwarded and encodes to that LF.
 #[test]
 fn a_ctrl_letter_pane_focus_binding_never_hands_its_byte_to_the_shell() {
     use aterm_window::keyboard::SmolStr;

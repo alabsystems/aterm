@@ -7,7 +7,6 @@ use super::*;
 use std::time::Duration;
 
 const WID: WindowId = WindowId(0);
-/// The composer's caret and the repaint's write position (0-based, in the focused pane's cells).
 const CARET: (u16, u16) = (20, 10);
 const WRITE: (u16, u16) = (3, 30);
 const FRAME: Duration = Duration::from_millis(16);
@@ -36,7 +35,6 @@ fn feed(app: &App, bytes: &[u8], at: Instant) {
     );
 }
 
-/// The flying head's sprite: the one companion body (no words, no pet).
 fn head(app: &App) -> Option<(i32, i32)> {
     app.windows[&WID]
         .input_scratch
@@ -46,7 +44,6 @@ fn head(app: &App) -> Option<(i32, i32)> {
         .map(|s| (s.x, s.y))
 }
 
-/// Present every frame from `*t` through `*t + span`.
 fn run(app: &mut App, t: &mut Instant, span: Duration) {
     let end = *t + span;
     while *t + FRAME <= end {
@@ -55,7 +52,6 @@ fn run(app: &mut App, t: &mut Instant, span: Duration) {
     }
 }
 
-/// The front terminal's frame, by the program's account.
 fn unfinished(app: &App) -> bool {
     let term = app
         .front_terminal(WID)
@@ -65,7 +61,6 @@ fn unfinished(app: &App) -> bool {
     crate::term_lock(&term).sync_frame_unfinished()
 }
 
-/// The flying kitty over a Claude-shaped screen in `arm` ([`CARET`]).
 fn summoned(arm: Arm) -> (App, Instant, i32) {
     let mut app = App::headless_for_test();
     app.config.serious_mode = Some(false);
@@ -109,7 +104,6 @@ fn row_of(y: i32, ch: i32) -> i32 {
     (y + ch / 2).div_euclid(ch)
 }
 
-/// The head's row, asserted beside the hidden caret.
 fn home_row(app: &App, ch: i32, arm: Arm) -> i32 {
     let (_, home_y) = head(app).unwrap_or_else(|| {
         panic!("{arm:?}: the summoned head is on glass beside the hidden caret")
@@ -122,12 +116,6 @@ fn home_row(app: &App, ch: i32, arm: Arm) -> i32 {
     home
 }
 
-/// The head summoned over a Claude-shaped screen with the caret hidden, in
-/// each arm. One bracket opens, moves the hidden cursor to [`WRITE`] and
-/// writes there, and stays open past the hold: every torn present keeps the
-/// head at the caret's row. Negative control: the bracket closes with the
-/// hidden cursor left at [`WRITE`] (a finished frame, where a hidden cursor
-/// is the caret), and the head goes there.
 #[test]
 fn a_torn_repaint_keeps_the_flying_head_at_the_caret() {
     for arm in ARMS {
@@ -177,14 +165,6 @@ fn a_torn_repaint_keeps_the_flying_head_at_the_caret() {
     }
 }
 
-/// The same head over a program that never brackets its frames (an Ink app
-/// without synchronized output, a TUI under tmux), in each arm: the cursor
-/// hidden throughout, each spinner repaint moves it to [`WRITE`], writes, and
-/// puts it back, and a present lands mid-write once a repaint. A hidden
-/// cursor's move is taken only once it has rested (`aterm_effects::companion`'s
-/// `HIDDEN_REST`), so the head never takes the write position for the caret:
-/// every present keeps it at the caret's row. Negative control: the hidden
-/// cursor left at [`WRITE`] rests there, and the head goes to it.
 #[test]
 fn an_unbracketed_repaint_keeps_the_flying_head_at_the_caret() {
     for arm in ARMS {
@@ -238,12 +218,6 @@ fn an_unbracketed_repaint_keeps_the_flying_head_at_the_caret() {
     }
 }
 
-/// A capture (`image`) draws the head where the glass has it, in each arm:
-/// beside the hidden caret, and through a torn repaint still beside it. The
-/// capture read the painted caret only, so a lab still under a program that
-/// hides its cursor had no head the window showed. Negative control: once the
-/// bracket closes with the hidden cursor at [`WRITE`], the capture's head
-/// goes there with the glass's.
 #[test]
 fn a_capture_draws_the_flying_head_where_the_glass_has_it() {
     let capture = |app: &mut App, t: Instant| {

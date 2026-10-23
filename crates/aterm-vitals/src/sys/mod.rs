@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE AGENT INTERFACE: `aterm ctl sys` and `await sys`
-//! (`docs/DESIGN-system-awareness-2026-10-16.md` §13).
+//! The agent interface: `aterm ctl sys` and `await sys`.
 
 pub mod delta;
 pub mod disk;
@@ -22,7 +21,7 @@ pub use view::{Reply, render_json, render_text};
 use crate::events::Event;
 use crate::model::Snapshot;
 
-/// The unavailable words a figure may carry (§13.4), the closed set.
+/// Closed set of unavailable words a figure may carry.
 pub const UNAVAILABLE_WORDS: &[&str] = &[
     "unsupported",
     "needs_privilege:",
@@ -61,7 +60,7 @@ pub fn is_unavailable_word(word: &str) -> bool {
     })
 }
 
-/// A process's `exe=` word: its name when it matches `^[A-Za-z0-9._+-]{1,32}$`, else `-` (§13.3).
+/// A process's `exe=` word: its name when it matches `^[A-Za-z0-9._+-]{1,32}$`, else `-`.
 #[must_use]
 pub fn exe_word(name: &str) -> &str {
     let ok = !name.is_empty()
@@ -148,15 +147,14 @@ pub struct Target {
     pub fg_pgid: Option<u32>,
 }
 
-/// One folder a scope works in (a disk root, §10.4).
+/// One folder a scope works in (a disk root).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Root {
     /// What it is (`cwd`).
     pub kinds: Vec<&'static str>,
     /// Its path.
     pub path: String,
-    /// The sessions (local keys) whose folder it is: its path and its subtrees' print only to a
-    /// caller in one of their tabs (§13.3 rule 4).
+    /// Local session keys whose folder it is; paths print only to a caller in one of their tabs.
     pub keys: Vec<u64>,
     /// The tab it belongs to (1-based), where known.
     pub tab: Option<usize>,
@@ -207,8 +205,7 @@ pub struct VolumeFacts {
     pub free: u64,
     /// Free to this user, bytes.
     pub available: u64,
-    /// The disk watch's level word (`ok`, `low`, `short`, `emergency`), where it measured this
-    /// volume.
+    /// The disk watch's level word (`ok`, `low`, `short`, `emergency`), when measured.
     pub level: Option<String>,
 }
 
@@ -267,8 +264,7 @@ pub struct Ctx<'a> {
     pub events: &'a [Event],
     /// Why a `since=` reply is full.
     pub gap: Option<Gap>,
-    /// The newest snapshot seq the host published (a machine-only reading's included, whose events
-    /// the cursor has passed); 0 for the snapshot's.
+    /// Newest snapshot seq the host published (including machine-only readings), or `0`.
     pub head_seq: u64,
 }
 
@@ -282,8 +278,7 @@ impl Ctx<'_> {
         }
     }
 
-    /// Whether a folder of the sessions `keys` may print its path: one of them is in the caller's
-    /// own tab, or there is no caller (§13.3 rule 4).
+    /// Whether a folder of `keys` may print its path (caller shares its tab, or no caller).
     #[must_use]
     pub fn path_ok(&self, keys: &[u64]) -> bool {
         self.caller_panes
@@ -326,8 +321,7 @@ pub fn clock_s(ms: u64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
-/// Pct-encode `text` for a record value: every byte outside `[A-Za-z0-9._~/+:@,=-]` becomes `%XX`,
-/// so a space, `;` or newline cannot split a field or end a line.
+/// Pct-encode `text` outside `[A-Za-z0-9._~/+:@,=-]` so spaces, `;`, or `\n` cannot split fields.
 #[must_use]
 pub fn pct(text: &str) -> String {
     let mut out = String::with_capacity(text.len());

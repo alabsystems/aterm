@@ -7,8 +7,6 @@ use aterm_uds::process::{Identity, Lineage, ProcessBirth};
 use std::path::PathBuf;
 use std::time::{Duration, UNIX_EPOCH};
 
-/// An orphan is named with its facts and the `kill` that ends it; an instance whose launcher
-/// still runs gets its uptime only.
 #[test]
 fn an_orphan_is_named_with_its_remedy_and_a_live_one_is_not() {
     let orphan = ForeignFacts::Writer {
@@ -30,7 +28,6 @@ fn an_orphan_is_named_with_its_remedy_and_a_live_one_is_not() {
     assert_eq!(ForeignFacts::default().describe(), None);
 }
 
-/// The entry was last written at this second; births are placed around it.
 const WRITTEN: u64 = 1_790_000_000;
 
 fn at(seconds: u64) -> ProcessBirth {
@@ -40,11 +37,8 @@ fn at(seconds: u64) -> ProcessBirth {
     }
 }
 
-/// launchd's pid version in these readings.
 const LAUNCHD: i32 = 4_100;
 
-/// The lineage of pid 42199 born at `birth`, adopted by launchd, its launcher's pid version
-/// `launcher_version`.
 fn lineage(birth: ProcessBirth, launcher_version: i32) -> Lineage {
     Lineage {
         identity: Identity {
@@ -60,8 +54,6 @@ fn lineage(birth: ProcessBirth, launcher_version: i32) -> Lineage {
     }
 }
 
-/// A reading of an orphaned aterm on its installed binary, born at `birth`, adopted by launchd
-/// from a launcher that exited, and unchanged through the reads: the case a `kill` is offered for.
 fn orphan_reading(birth: ProcessBirth) -> ProcessReading {
     ProcessReading {
         birth,
@@ -74,7 +66,6 @@ fn orphan_reading(birth: ProcessBirth) -> ProcessReading {
     }
 }
 
-/// The image at `path`, which the kernel marks deleted or not.
 fn image(path: &str, deleted: bool) -> Image {
     Image {
         path: PathBuf::from(path),
@@ -87,14 +78,10 @@ fn judge(r: ProcessReading) -> ForeignFacts {
     ForeignFacts::judge(Some(written), written + Duration::from_secs(3600), r)
 }
 
-/// A process born after the entry was last written cannot have written it, however much it
-/// looks like the orphan: it is stale and offered no `kill`. Control: born before the write,
-/// it is the writer and is offered one.
 #[test]
 fn a_pid_younger_than_its_entry_is_stale_and_never_offered_a_kill() {
     let stranger = judge(orphan_reading(at(WRITTEN + 600)));
     assert_eq!(stranger, ForeignFacts::Stale);
-    // A stale entry is no instance: the note does not count it.
     assert_eq!(
         foreign_note_text(&[(501, "/tmp/aq/a.sock", &stranger)]),
         None
@@ -106,8 +93,6 @@ fn a_pid_younger_than_its_entry_is_stale_and_never_offered_a_kill() {
     assert!(note.contains("`kill 501`"), "{note}");
 }
 
-/// A birth inside the write slack is still the writer, one past it is not, and with no entry
-/// time nothing is proven.
 #[test]
 fn identity_needs_an_entry_time_and_tolerates_only_the_write_slack() {
     assert!(judge(orphan_reading(at(WRITTEN + 1))).orphaned());
@@ -119,8 +104,6 @@ fn identity_needs_an_entry_time_and_tolerates_only_the_write_slack() {
     );
 }
 
-/// Only `aterm` or `aterm-*` executables (the dev-only `aterm-gui` included) get facts or a
-/// `kill`.
 #[test]
 fn a_process_that_is_not_aterm_gets_no_facts_and_no_kill() {
     for name in ["Safari", "loginwindow", "atermx", "aterm_ctl-0123abcd"] {
@@ -136,9 +119,6 @@ fn a_process_that_is_not_aterm_gets_no_facts_and_no_kill() {
     assert!(judge(r).orphaned(), "an aterm-* binary is aterm");
 }
 
-/// "running a deleted binary" is the kernel's word: an image it marks deleted. An image the
-/// kernel names no path for proves nothing, not even that the process is aterm, and a process
-/// that ended or changed hands mid-read says nothing.
 #[test]
 fn a_deleted_binary_is_claimed_only_on_the_kernel_s_word() {
     let deleted = |facts: &ForeignFacts| {
@@ -198,7 +178,6 @@ fn this_process_is_judged_by_its_real_birth() {
     assert_eq!(ForeignFacts::read(me, None), ForeignFacts::Unknown);
 }
 
-/// The parent `judge` read of `r`.
 fn parent_of(r: ProcessReading) -> Parent {
     match judge(r) {
         ForeignFacts::Writer { parent, .. } => parent,
@@ -206,8 +185,6 @@ fn parent_of(r: ProcessReading) -> Parent {
     }
 }
 
-/// A process launchd started itself (its launcher's pid version is launchd's) is NEVER an
-/// orphan: it is named as launchd's, and no `kill` is offered for it.
 #[test]
 fn a_launchd_started_instance_is_never_offered_a_kill() {
     let born = at(WRITTEN - 60);
@@ -231,8 +208,6 @@ fn a_launchd_started_instance_is_never_offered_a_kill() {
     assert!(said.contains("launchd started it"), "{said}");
 }
 
-/// An instance whose launcher exited (another launcher version) is named as adopted, with the
-/// `kill` that ends it.
 #[test]
 fn an_adopted_instance_is_named_with_its_kill() {
     let facts = judge(orphan_reading(at(WRITTEN - 60)));
@@ -253,8 +228,6 @@ fn an_adopted_instance_is_named_with_its_kill() {
     assert!(said.contains("its launcher exited"), "{said}");
 }
 
-/// With flavors 17 and 18 unread (no lineage, or launchd's version unread), a child of launchd
-/// keeps the words that say both cases and is offered no `kill`: it may be one launchd started.
 #[test]
 fn unread_flavors_keep_todays_words_and_offer_no_kill() {
     let born = at(WRITTEN - 60);
@@ -288,8 +261,6 @@ fn unread_flavors_keep_todays_words_and_offer_no_kill() {
     assert_eq!(parent_of(not_launchds), Parent::Other);
 }
 
-/// A lineage read of another process given the same pid (another birth), or one that no longer
-/// names launchd as the parent, proves nothing about this one.
 #[test]
 fn a_lineage_of_another_birth_proves_nothing() {
     let born = at(WRITTEN - 60);
@@ -329,7 +300,6 @@ fn a_process_whose_launcher_exited_reads_as_adopted_through_both_readers() {
         .read_line(&mut line)
         .expect("the launcher prints its child's pid");
     let pid: u32 = line.trim().parse().expect("a pid");
-    // The sleep is this test's: its pid came from the shell this test started.
     struct Ends(u32);
     impl Drop for Ends {
         fn drop(&mut self) {

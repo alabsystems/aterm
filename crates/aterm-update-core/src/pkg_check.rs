@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Whether the toolchain package manager (atpkg) has completed an update check on this machine,
-//! whether its last one reached the signed index, and how it ended, read off its `status.toml`
-//! alone so edges that must not link atpkg (the `aterm` session lane, the window) can decide on it.
+//! Read-only `status.toml` stamps and scheduling rules for `atpkg` update passes.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -246,16 +244,12 @@ pub fn full_pass_due_in(stamps: &Stamps, now_unix: i64) -> u64 {
     spacing.max(failed).max(interval)
 }
 
-/// Whether `every_secs` have passed since `then` at `now_unix`. A stamp more than a period in
-/// the future counts as passed: a clock since set back wrote it, and trusting it would stall
-/// the lane until that clock came round again.
 fn elapsed(then: i64, now_unix: i64, every_secs: u64) -> bool {
     let every = i64::try_from(every_secs).unwrap_or(i64::MAX);
     let age = now_unix.saturating_sub(then);
     age >= every || age < every.saturating_neg()
 }
 
-/// Seconds left until [`elapsed`] answers true for `then`, never more than one period.
 fn remaining(then: i64, now_unix: i64, every_secs: u64) -> u64 {
     if elapsed(then, now_unix, every_secs) {
         return 0;
@@ -265,7 +259,6 @@ fn remaining(then: i64, now_unix: i64, every_secs: u64) -> u64 {
     u64::try_from(left).unwrap_or(0).min(every_secs)
 }
 
-/// How long [`claim`] waits for a sibling that is claiming the same slot this instant.
 const CLAIM_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Claim a lane's once-per-`every_secs` slot in `stamp` (unix seconds, one line) at `now_unix`.
@@ -304,8 +297,6 @@ mod tests {
         d.join("status.toml")
     }
 
-    /// The success, the attempt, the outcome and the index build are read off the record;
-    /// absent, empty and unparseable read as none, and `updated_at` is read by nothing.
     #[test]
     fn the_stamps_are_read_off_the_record() {
         let p = scratch("stamps");
@@ -360,8 +351,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// A pass that stamped a success is `ok` whatever it exited, one that reached no host is
-    /// `offline`, anything else `failed`; each word reads back as itself.
     #[test]
     fn a_pass_records_its_outcome_by_what_it_stamped() {
         assert_eq!(PassOutcome::of_pass(true, 0), PassOutcome::Ok);
@@ -382,9 +371,6 @@ mod tests {
         }
     }
 
-    /// A seven-hour-old success and a write a minute ago: the walk is owed now, since the
-    /// write is no failed pass. Negative control: the same record whose last pass failed holds
-    /// the interval from that pass.
     #[test]
     fn a_write_after_the_last_success_is_no_failed_pass() {
         let now = 1_790_000_000_i64;
@@ -412,9 +398,6 @@ mod tests {
         );
     }
 
-    /// Only a pass that ended `ok` strictly after the lane's own failure heals it (a
-    /// cache-served pass records `failed`). A launch owes a pass at once when none ever
-    /// succeeded or the last failed, else the rest of the interval since the last success.
     #[test]
     fn a_failure_is_healed_only_by_a_later_ok_pass_and_a_launch_retries_it_at_once() {
         let now = 1_790_000_000_i64;
@@ -455,8 +438,6 @@ mod tests {
         );
     }
 
-    /// A full pass with nothing to check records `ok` without a success stamp, and the walk
-    /// counts from it; a later success is the walk's, and a failed pass end is no success.
     #[test]
     fn a_pass_with_nothing_to_check_counts_as_the_last_success() {
         let now = 1_790_000_000_i64;
@@ -489,9 +470,6 @@ mod tests {
         assert!(failed.last_failed());
     }
 
-    /// Never succeeded or a six-hour-old success ⇒ owed; a younger one ⇒ not, with
-    /// [`full_pass_due_in`] naming the rest; nothing while a pass installs or within the
-    /// spacing of the last attempt anywhere on the machine.
     #[test]
     fn a_full_pass_is_owed_on_the_interval_or_never_checked_and_never_back_to_back() {
         let now = 1_790_000_000_i64;
@@ -551,9 +529,6 @@ mod tests {
         assert!(at(None, Some(now + spacing - 1)).attempted_recently(now));
     }
 
-    /// Once the last pass failed after the last success (or none ever succeeded), nothing is
-    /// owed for the interval after it: a record whose passes never succeed costs one pass per
-    /// interval, not one per tab.
     #[test]
     fn a_failing_pass_is_owed_again_only_after_the_interval() {
         let now = 1_790_000_000_i64;
@@ -601,9 +576,6 @@ mod tests {
         assert!(!Stamps::default().last_failed(), "never attempted");
     }
 
-    /// The first claim wins and stamps, a second inside the period is refused, one a period
-    /// later wins; a garbage or far-future stamp is claimable, and a stamp with no directory
-    /// answers `true`.
     #[test]
     fn a_lane_slot_is_claimed_once_per_period() {
         let dir = scratch("claim");
@@ -633,7 +605,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
-    /// A sibling holding the claim lock makes the claim answer `false` within its short wait.
     #[test]
     fn a_claim_held_elsewhere_is_not_taken_twice() {
         let dir = scratch("claim-held");
@@ -650,7 +621,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
-    /// Strict about the zone, tolerant of a fraction.
     #[test]
     fn the_stamp_parser_is_pinned() {
         assert_eq!(rfc3339_to_unix("1970-01-02T00:00:00Z"), Some(86_400));

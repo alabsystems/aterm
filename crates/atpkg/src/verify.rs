@@ -123,8 +123,7 @@ fn walked_root(build_dir: &std::path::Path) -> std::io::Result<String> {
     crate::tree::tree_root_declared(build_dir, &modes)
 }
 
-/// The signed root a vendor program's stamp kept for its legacy index `build`, when the
-/// recorded row does not attest that build itself; `None` for every other program.
+/// The signed root a vendor program's stamp kept for its legacy index `build`.
 fn kept_legacy_root(
     layout: &Layout,
     program: &str,
@@ -140,8 +139,7 @@ fn kept_legacy_root(
         .map(str::to_string)
 }
 
-/// A vendor-direct build against its `.vendor` record's root; no record beside a complete
-/// build means no assurance ([`VerifyOutcome::NoSignedRoot`]).
+/// Verify a vendor-direct build against its `.vendor` record's root.
 fn verify_vendor_build(layout: &Layout, program: &str, build: u64) -> VerifyOutcome {
     let build_dir = layout.build_dir(program, build);
     let Some(record) = crate::vendor_direct::complete_record(&build_dir) else {
@@ -182,9 +180,7 @@ mod tests {
         crate::testdir::layout(&format!("atpkg-verify-{label}-"))
     }
 
-    /// The modes a stage would have declared for the one-file build [`install`] lays —
-    /// what the walk folds on a filesystem without permission bits, and what the record
-    /// beside the build says on Windows. Unix never consults it.
+    /// Declared modes for the one-file build [`install`] lays down.
     fn modes_of(program: &str) -> crate::tree::DeclaredModes {
         let mut modes = crate::tree::DeclaredModes::new();
         let mut rel = b"bin/".to_vec();
@@ -193,14 +189,12 @@ mod tests {
         modes
     }
 
-    /// `program`'s executable under `bin/` (`ay`, or `ay.exe` on Windows): the file the
-    /// shim forwards to, without which `active_builds` reports no active build.
+    /// `program`'s executable filename under `bin/`.
     fn exe_name(program: &str) -> String {
         crate::store::ToolName::new(program).unwrap().exe_file()
     }
 
-    /// The root a producer would have signed for the build [`install`] lays: the
-    /// declared-mode walk, which on Unix is the plain walk over the stored bits.
+    /// The declared-mode root for the build [`install`] lays down.
     fn signed_root(dir: &std::path::Path, program: &str) -> String {
         crate::tree::tree_root_declared(dir, &modes_of(program)).unwrap()
     }
@@ -257,10 +251,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A vendor program rolled back to the legacy index build its first vendor install
-    /// replaced: the row names another build (or that build with no root), and the root its
-    /// stamp kept for exactly that build attests it — a match, and drift when the tree moves.
-    /// A root kept for another legacy build attests nothing.
+    /// A vendor program rolled back to its legacy index build is attested by the stamp's kept root.
     #[test]
     fn a_vendor_programs_legacy_build_is_attested_by_its_kept_root() {
         let l = layout("legacy-kept");
@@ -321,9 +312,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A vendor-direct build is attested by the same declared-mode walk as an index build,
-    /// against the root its `.vendor` record holds; a mutated tree drifts, naming the root
-    /// it walked.
+    /// A vendor-direct build is attested by the declared-mode walk against its `.vendor` record.
     #[test]
     fn a_vendor_build_is_attested_by_the_walk_its_stage_folded() {
         let l = layout("vendor-walk");
@@ -412,10 +401,7 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
     }
 
-    /// What the walk meets decides the verdict. A build carrying the retired wiring's
-    /// `toolchain` link is reported as wired, never walked into or called drifted; a plain
-    /// `toolchain` directory is walked like the rest; an entry the walk refuses makes the
-    /// tree unreadable, never a pass.
+    /// Checks wired `toolchain` symlinks, plain directories, and unreadable entries.
     #[cfg(unix)]
     #[test]
     fn the_walk_decides_wired_drifted_or_unreadable() {
@@ -444,8 +430,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The exit decision of `atpkg verify`: only a match, a vendor build matching its
-    /// record, or a wired sysroot passes.
+    /// Only a matching tree, a matching vendor build, or a wired sysroot passes.
     #[test]
     fn only_a_matching_tree_or_a_wired_sysroot_passes() {
         use VerifyOutcome as V;
@@ -496,10 +481,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The declared-mode record is what the walk folds where the inode stores no bits: with
-    /// it a Windows build attests to the root a Unix producer signed; without it the verdict
-    /// is Unreadable (naming the re-stage), never a false Drift. On Unix the record is never
-    /// consulted, so removing it changes nothing.
+    /// A missing declared-mode record is `Unreadable` only where the inode stores no mode bits.
     #[test]
     fn a_missing_declared_mode_record_is_unreadable_only_where_the_inode_has_no_bits() {
         let l = layout("modes-record");

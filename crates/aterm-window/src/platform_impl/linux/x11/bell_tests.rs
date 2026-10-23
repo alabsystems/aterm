@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Added by the aterm project in 2026 to its copy of winit 0.30.13
-// (see the repository NOTICE).
 
 //! A window's bell (`UnownedWindow::ring_bell`, `platform::x11::WindowExtX11::ring_x11_bell`) is an
 //! XKB bell request naming the window, which the X server announces to every client that selected
-//! XKB's `BellNotify`; mutter, one of them, plays the desktop's bell for it.
+//! XKB's `BellNotify`.
 
 use std::ffi::{c_int, c_ulong};
 use std::time::{Duration, Instant};
@@ -20,19 +17,14 @@ use super::Window;
 use crate::platform_impl::{ActiveEventLoop as PlatformActiveEventLoop, EventLoop};
 use crate::window::WindowAttributes;
 
-/// The hang detector: how long a wait for what must happen may take, which it never needs.
 const HANG: Duration = Duration::from_secs(60);
 
-/// `XkbBellNotifyMask` (`X11/extensions/XKB.h`).
 const XKB_BELL_NOTIFY_MASK: c_ulong = 1 << 8;
 
-/// `XCheckIfEvent`'s predicate that takes whatever event is next.
 unsafe extern "C" fn any_event(_: *mut Display, _: *mut XEvent, _: XPointer) -> xlib::Bool {
     xlib::TRUE
 }
 
-/// The windows the `BellNotify` events `listener` has received so far name, the events read off
-/// its queue. `xkb_event_base` is XKB's first event code.
 fn bells(xlib: &xlib::Xlib, listener: *mut Display, xkb_event_base: c_int) -> Vec<c_ulong> {
     let mut rung = Vec::new();
     loop {

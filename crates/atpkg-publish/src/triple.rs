@@ -2,10 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! [`Triple`]: a target the client ships on, and nothing else.
-//!
-//! A `Triple` is an index into `atpkg::manifest::TARGETS`, so the producer cannot name a
-//! target the client does not know; a named constant ([`Triple::named`]) is checked at
-//! compile time.
 
 use std::fmt;
 
@@ -47,11 +43,8 @@ pub enum Arch {
 }
 
 impl Triple {
-    /// The client target spelled `name`; in a `const`, a name the client's `TARGETS` lacks
-    /// fails the build.
-    ///
+    /// The client target spelled `name`.
     /// # Panics
-    ///
     /// When `name` is not in `atpkg::manifest::TARGETS` (at compile time in a `const`).
     #[must_use]
     pub const fn named(name: &str) -> Triple {
@@ -66,9 +59,7 @@ impl Triple {
     }
 
     /// The client target spelled `s`.
-    ///
     /// # Errors
-    ///
     /// A usage error naming the client's targets when `s` is not one of them.
     pub fn parse(s: &str) -> Result<Triple> {
         TARGETS
@@ -117,8 +108,7 @@ impl Triple {
         }
     }
 
-    /// The target this binary was built for — the host it runs on natively. `None` on a
-    /// host the client ships no target for.
+    /// The target this binary was built for — the host it runs on natively.
     #[must_use]
     pub fn host() -> Option<Triple> {
         let name = match (std::env::consts::ARCH, std::env::consts::OS) {

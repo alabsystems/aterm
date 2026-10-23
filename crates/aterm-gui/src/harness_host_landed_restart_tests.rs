@@ -11,20 +11,13 @@ use aterm_agent::supervise::run::{Ctl, CtlReply, Session};
 use super::*;
 use crate::App;
 
-/// The worker's last words: the landing's clean defense.
 const LANDING_REPLY: &str = "Committed and pushed the parser and its tests.\nNothing left: all \
                              of it is merged into the remote main branch.";
-/// Another reply, which no loop watched: a turn someone else ran while
-/// nothing supervised the session.
 const THEIR_REPLY: &str = "Rebased the branch onto main as you asked.";
-/// The landing's note, as the loop that landed journals it.
 const LANDED_NOTE: &str = "DONE seq=104 rule=land@v1 the worker said it is done after the land \
                            instruction (autopilot land): nothing more is typed until a person or \
                            an orchestrator types";
 
-/// Claude Code 2.1.x idle after a turn of 3 minutes whose last words are
-/// `said`, the composer empty, drawn at the terminal's own width `cols`: the
-/// bytes that put it on a cleared screen, the cursor left after the caret.
 fn ended_screen(said: &str, cols: usize) -> Vec<u8> {
     let mut rows: Vec<String> = Vec::new();
     for (n, line) in said.lines().enumerate() {
@@ -48,11 +41,6 @@ fn ended_screen(said: &str, cols: usize) -> Vec<u8> {
     format!("\x1b[2J\x1b[H{}\x1b[{caret};3H", rows.join("\r\n")).into_bytes()
 }
 
-/// The control lane the real loop runs over: `text --json` is the window's
-/// own read of the session's terminal ([`crate::control::cmd_text_json_looked`]);
-/// the claim and every other write is taken, `meta` says Land, `status`
-/// carries the terminal's sequence, and a wait for a change that does not come
-/// times out at once (the screen stands).
 struct Lane {
     term: Arc<Mutex<aterm_core::terminal::Terminal>>,
     ctx: Arc<crate::SessionCtx>,
@@ -108,7 +96,6 @@ impl Ctl for Lane {
     }
 }
 
-/// What the test reads back from one supervised session.
 struct Watched {
     host: HostHandle,
     facts: mpsc::Receiver<crate::HarnessFact>,
@@ -119,8 +106,6 @@ struct Watched {
 }
 
 impl Watched {
-    /// The facts told since the last call, in order (a hang detector: at
-    /// least one is waited for, until `done` says the run has told enough).
     fn told_until(
         &self,
         what: &str,
@@ -138,9 +123,6 @@ impl Watched {
         told
     }
 
-    /// The `DONE … rule=land@v1` notes in the journal, oldest first: the
-    /// landing written before the first loop (index 0), then each loop's
-    /// own note of it (none while the journal is not written yet).
     fn landed_notes(&self) -> Vec<aterm_agent::supervise::journal::JournalRecord> {
         aterm_agent::supervise::journal::read_journal(&self.journal)
             .map(|(records, _)| {
@@ -152,10 +134,6 @@ impl Watched {
             .unwrap_or_default()
     }
 
-    /// THE LOOP'S NOTE OF THE LANDING, the next after the journal's first
-    /// `before`: a must-happen wait for the record itself (a hang
-    /// detector), which is how the test knows the loop that runs now has
-    /// judged its first point and watches.
     fn note_past(
         &self,
         before: usize,
@@ -173,7 +151,6 @@ impl Watched {
         found.unwrap_or_else(|| panic!("not within 60 s: {what}: the notes {notes:?}"))
     }
 
-    /// Every write the loop asked for that types into the session.
     fn typed(&self) -> Vec<String> {
         self.asked
             .lock()
@@ -195,11 +172,6 @@ impl Drop for Watched {
     }
 }
 
-/// The App's session 0 under Land, its screen the landing's defense, its
-/// journal holding that landing (its point, marked with the defense's words,
-/// and its note, nine minutes back), supervised by a host whose worker runs
-/// the real hosted loop over [`Lane`], its ledger and journal under a scratch
-/// directory of the test's own.
 fn watched(app: &mut App, tag: &str) -> (Watched, String, i64) {
     let entry = app.pool.get(0).unwrap();
     let (term, ctx) = (entry.term.clone(), entry.ctx.clone());
@@ -293,15 +265,12 @@ fn watched(app: &mut App, tag: &str) -> (Watched, String, i64) {
     )
 }
 
-/// `told`, every fact applied to `app`'s window in order.
 fn apply(app: &mut App, sid: &str, told: &[crate::HarnessFact]) {
     for fact in told {
         app.apply_harness_fact(sid, *fact);
     }
 }
 
-/// The faces in `told`, "unknown" said once however often it was told in a
-/// row (the host tells it as a run ends and as its worker ends).
 fn faces(told: &[crate::HarnessFact]) -> Vec<Option<TaskFace>> {
     let mut out: Vec<Option<TaskFace>> = Vec::new();
     for fact in told {
@@ -317,8 +286,6 @@ fn faces(told: &[crate::HarnessFact]) -> Vec<Option<TaskFace>> {
     out
 }
 
-/// Whether `told` holds a landing after an unknown: the restarted loop's
-/// face.
 fn landed_after_unknown(told: &[crate::HarnessFact]) -> bool {
     let f = faces(told);
     f.iter()
@@ -326,14 +293,6 @@ fn landed_after_unknown(told: &[crate::HarnessFact]) -> bool {
         .is_some_and(|at| f[at..].contains(&Some(TaskFace::Landed)))
 }
 
-/// THE REAL RESTART KEEPS THE LANDING'S TIME: a Land task whose journal holds
-/// its landing is told the landing restated at the real loop's start (never
-/// `open`) and nothing is typed; then its supervision restarted twice — the
-/// agent's switch in Settings ▸ Harness off and on, and a SUPERVISION setting
-/// saved (`approve`) — is told "unknown" and then `landed` at the restarted
-/// loop's start, never `open`; the window gives the held face back with the
-/// time it first moved there (the chip's, its title's and Settings ▸
-/// Harness's clock), and nothing is typed.
 #[test]
 fn a_real_supervision_restart_keeps_a_landings_first_time() {
     let mut app = App::headless_for_test();
@@ -420,16 +379,6 @@ fn a_real_supervision_restart_keeps_a_landings_first_time() {
     assert_eq!(face_at().map(|(f, _)| f), Some(TaskFace::Open));
 }
 
-/// A RESTARTED LANDING IS TOLD WITH ITS FIRST NOTE'S TIME, AND A WINDOW THAT
-/// HELD NO FACE SHOWS IT (§10.2.7: a seamless update's new window — the
-/// session keeps its id, so its journal, but no face of it crossed into the
-/// new window — stamped the restated end with the update's clock): the real
-/// loop restates the journal's landing with the `t` of its note
-/// (`HarnessFact::TaskNoted`); its supervision restarted twice (the agent's
-/// switch off and on, a SUPERVISION setting saved) tells "unknown", then the
-/// landing restated with that same FIRST note's time — each restarted loop
-/// notes the landing again, carrying that time forward
-/// (`JournalRecord::ended`) — and nothing is typed.
 #[test]
 fn a_restarted_landing_tells_its_first_notes_time_and_a_new_window_shows_it() {
     let mut app = App::headless_for_test();

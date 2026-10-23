@@ -4,28 +4,22 @@
 use super::*;
 use crate::AtermGpuTerminal;
 
-/// The bundled JetBrains Mono — the CPU twin's test face.
 const FONT: &[u8] = include_bytes!("../../aterm-render/assets/bundled/JetBrainsMono-Regular.ttf");
 const FG: u32 = 0x00d8_d8d8;
 const BG: u32 = 0x0018_1818;
 const CURSOR: u32 = 0x00a0_c0ff;
 const SEL: u32 = 0x0040_4050;
 
-/// This crate's host, for the tests `messages_api.rs` shares with aterm-wasm.
 type Host = AtermGpuTerminal;
 
-/// A frame, built headless: the GPU face's frame scratch (there is no surface
-/// to present to here).
 fn draw(t: &mut Host) {
     let _ = t.render_headless().expect("renderable frame");
 }
 
-/// Whether two terminals built the same picture: the GPU face's frame scratch.
 fn same_picture(a: &Host, b: &Host) -> bool {
     a.frame_scratch == b.frame_scratch
 }
 
-/// A terminal whose band's clock starts at `t0`, and `t0`.
 fn clocked(rows: u16, cols: u16) -> (AtermGpuTerminal, Instant) {
     let mut t =
         AtermGpuTerminal::new(rows, cols, FONT, 20.0, FG, BG, CURSOR, SEL).expect("bundled font");
@@ -34,10 +28,6 @@ fn clocked(rows: u16, cols: u16) -> (AtermGpuTerminal, Instant) {
     (t, t0)
 }
 
-/// A warning reserves one row above the grid (the scratch grows, the grid
-/// band moves below it, both faces hold the bleed), the tick reports the
-/// row-count change, and when the row leaves the frame is band-less again.
-/// With no band row the frame build changes nothing.
 #[test]
 fn the_band_composes_into_the_gpu_frame() {
     let (mut plain, _) = clocked(12, 60);
@@ -100,15 +90,6 @@ fn the_band_composes_into_the_gpu_frame() {
     );
 }
 
-/// THE BAND ON BOTH WEB RENDERERS (rulings 340 and 439), drawn through
-/// this module itself: a held warning and a metered bar posted over
-/// `notice`, committed by the tick and composed by the frame build
-/// `render` runs, then drawn by the GPU renderer as `init` assembles it
-/// (a native `GpuContext` in place of the canvas's, `init`'s own face,
-/// `from_parts`) and by the CPU face that holds the band's bleed. The two land within the
-/// grid's CPU/GPU tolerance; the frame is the band's two rows taller than
-/// the band-less one, and those rows carry ink (a band that failed to
-/// draw would compare equal to the grid alone there). No GPU: COULD NOT RUN.
 #[test]
 fn the_band_frame_is_one_picture_on_both_web_renderers() {
     let ctx = match aterm_gpu::GpuContext::new() {
@@ -173,10 +154,6 @@ fn the_band_frame_is_one_picture_on_both_web_renderers() {
     );
 }
 
-/// The GPU module's copy carries the round's exports: a hidden page arms
-/// nothing, the forced colours are the engine's forced inks, and the
-/// log drains as codec lines — the CPU twin's tests, abridged, on this
-/// module's own frame.
 #[test]
 fn the_gpu_band_has_the_twins_exports() {
     let (mut t, t0) = clocked(12, 60);
@@ -212,9 +189,6 @@ fn the_gpu_band_has_the_twins_exports() {
     assert!(words.contains("Details"), "{words}");
 }
 
-/// A held warning left open on the last visit restores as a `stale` record
-/// (no band row, no swapchain growth, no timer); the next post takes the
-/// next id and is on the band; a second restore is refused.
 #[test]
 fn the_gpu_band_restores_the_kept_log() {
     let (mut a, t0) = clocked(12, 60);
@@ -250,9 +224,6 @@ fn the_gpu_band_restores_the_kept_log() {
     assert_eq!(t.band_rows(), 1);
 }
 
-/// Post a record, a held warning and an error (each detail a sentence and
-/// a technical line), tick a second later, and read the page's lines 90 s
-/// after posting on a UTC clock. Both web modules pin the same lines.
 fn post_page_rows(t: &mut AtermGpuTerminal, t0: Instant) -> Vec<String> {
     for (i, line) in [
         "post ci Build finished -- 12 tests\\nall green",
@@ -288,9 +259,6 @@ fn post_page_rows(t: &mut AtermGpuTerminal, t0: Instant) -> Vec<String> {
     ]
 }
 
-/// The `page` line's chrome keys for a filter admitting `all` entries,
-/// `problems` of them warnings or errors, under chip `chip` (`None`: every
-/// tag), worded as the native page paints them.
 fn page_chrome(all: usize, problems: usize, chip: Option<&str>) -> String {
     let on = u8::from(chip.is_none());
     let current = chip.unwrap_or("All");
@@ -299,9 +267,6 @@ fn page_chrome(all: usize, problems: usize, chip: Option<&str>) -> String {
     )
 }
 
-/// Rows posted via `notice` read back from `messages_page` as the same
-/// lines the CPU module pins, framed `OK <n>`; the Problems switch leaves
-/// the record out, and a selected chip is named by the chrome.
 #[test]
 fn the_gpu_page_is_the_twins_page() {
     let (mut t, t0) = clocked(12, 60);
@@ -329,9 +294,6 @@ fn the_gpu_page_is_the_twins_page() {
     );
 }
 
-/// A restored native crash record's `Open log` and `Manual` are listed but
-/// not pressable (`button=` wording, `primary=0`) and no press route
-/// reaches the record; an agent upgrade record offers no action.
 #[test]
 fn the_gpu_page_offers_what_the_twin_offers() {
     let (mut t, t0) = clocked(12, 60);

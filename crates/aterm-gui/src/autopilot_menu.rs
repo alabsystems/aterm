@@ -2,27 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! In-grid popup menu for the Autopilot chip and composer-rule facts (`crate::fact_menu`).
-//!
-//! ```text
-//!  Autopilot · tab 3 “fix the footer”
-//!  set 14:05 over aterm ctl                  only where its own word stands
-//!  ∞  Cruise                              ●
-//!  ⤓  Land now
-//!  ○  Off
-//!  ──────────────────────────────────────
-//!  ∞⤓ Cruise 1 hour, then land
-//!  ∞⤓ Cruise 2 hours, then land
-//!  ∞⤓ Cruise 4 hours, then land
-//!  ∞⤓ Cruise until 18:00, then land          only when [harness] land_at is set
-//!  ✕  Cancel landing at 18:00                only while a timer is armed
-//!  ──────────────────────────────────────
-//!  ⚙  Harness settings…
-//! ```
-//!
-//! [`rows`], [`place`], [`item_at`], [`step`] and [`paint`] are pure functions
-//! over [`MenuRow`]; [`fit_rows`] drops the `set …` row first when space is
-//! tight, and [`keep_places`] holds row positions with [`MenuRow::Gap`] when
-//! rows rebuild under an open menu ([`AutopilotMenu::press_lands`]).
 
 use aterm_agent::supervise::Autopilot;
 use aterm_core::terminal::RenderCell;
@@ -1235,12 +1214,7 @@ impl App {
             (cw, ch),
             (pad, grid_top),
         );
-        // The card's own marks (`BandIcon::glass_mark`: its `○ ● ⤓`, the fact
-        // menus' `◉ ◈ ⌂ ◆ ◐`), drawn as the glass draws its own and after the
-        // scrub, which takes every drawn icon on the card; recorded in the
-        // harness card's record, so every strip of it (the top of a frame, of
-        // a compose, of the footer's splice) takes them back and a closed card
-        // leaves none.
+        // Paint card marks after scrubbing overlay glyphs so closing the card strips them.
         let on_frame = ws.input_scratch.cells.len().saturating_sub(rect.row);
         for (r, row) in painted.iter().enumerate().take(on_frame) {
             ws.claude_card

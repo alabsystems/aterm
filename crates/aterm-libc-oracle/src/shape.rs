@@ -24,8 +24,7 @@ pub enum ShapeRecord {
         name: String,
         has_body: bool,
     },
-    /// The function's whole rustdoc header (const/unsafe/async/ABI), as compact sorted JSON, so a
-    /// field rustdoc adds later is compared too.
+    /// The function's whole rustdoc header (const/unsafe/async/ABI), as compact sorted JSON.
     Header {
         name: String,
         header: String,
@@ -173,7 +172,6 @@ pub fn function_header(name: &str, item: &Value) -> Result<String> {
         .ok_or_else(|| FormatError(format!("rustdoc omitted function.header for {name}")))
 }
 
-/// A rustdoc `Path`'s full path, without its document-local numeric id.
 fn canonical_path(path: &Value, doc: &Doc) -> String {
     let fallback = || {
         path.get("path")
@@ -198,8 +196,6 @@ fn canonical_path(path: &Value, doc: &Doc) -> String {
     segments.join("::")
 }
 
-/// Every `Path` inside `value` canonicalized ([`canonical_path`]); every other
-/// field kept, so a field rustdoc adds is compared rather than dropped.
 fn normalize(value: &Value, doc: &Doc) -> Value {
     match value {
         Value::Object(map)
@@ -435,10 +431,6 @@ mod tests {
         public_shape(&parsed, &public, None).expect("shape")
     }
 
-    /// A struct `timespec` (id 2) with field `tv_sec` (3), a derived `Clone`
-    /// (impl 4, the reference's trait id 90), an auto-trait impl (5), a blanket
-    /// impl (6), an inherent impl (7) holding method `si_pid` (8), and `paths`
-    /// naming `Clone` in core and `timespec` locally.
     fn struct_doc(method_unsafe: bool, with_clone: bool) -> String {
         let impls = if with_clone { "4,5,6,7" } else { "5,6,7" };
         let index = [

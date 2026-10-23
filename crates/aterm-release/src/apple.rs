@@ -43,6 +43,8 @@ pub(crate) struct Observed {
     pub lookup_failed: Option<String>,
     /// Count of our team's Developer ID certificates that are present but not valid.
     pub invalid_present: usize,
+    /// Their SHA-1s, as `security find-identity` prints them.
+    pub invalid: Vec<String>,
     pub key: Option<PathBuf>,
     pub csr: Option<PathBuf>,
 }
@@ -59,10 +61,12 @@ impl Observed {
             None => (None, None),
         };
         let (identities, lookup_failed) = valid_identities();
+        let invalid = invalid_identities();
         Observed {
             identities,
             lookup_failed,
-            invalid_present: invalid_identity_count(),
+            invalid_present: invalid.len(),
+            invalid,
             key,
             csr,
         }
@@ -86,8 +90,9 @@ fn valid_identities() -> (Vec<String>, Option<String>) {
     }
 }
 
-/// How many of our team's Developer ID identities the keychain holds but will not vouch for.
-fn invalid_identity_count() -> usize {
+/// The SHA-1s of our team's Developer ID identities the keychain holds but will not vouch
+/// for: all identities (no `-v`) but the valid ones.
+fn invalid_identities() -> Vec<String> {
     let all = Command::new("/usr/bin/security")
         .args(["find-identity", "-p", "codesigning"])
         .output()
@@ -96,10 +101,10 @@ fn invalid_identity_count() -> usize {
                 &String::from_utf8_lossy(&o.stdout),
                 pins::APPLE_TEAM_ID,
             )
-            .len()
         })
-        .unwrap_or(0);
-    all.saturating_sub(valid_identities().0.len())
+        .unwrap_or_default();
+    let valid = valid_identities().0;
+    all.into_iter().filter(|id| !valid.contains(id)).collect()
 }
 
 /// What the Apple step decided.
@@ -117,6 +122,99 @@ pub(crate) enum Outcome {
     Blocked { what: String, fix: String },
     /// Not a macOS host; the verdict says "skipped".
     Skipped(String),
+}
+
+/// What a watched folder holds for the request key, judged against the keychain
+/// ([`on_disk`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OnDisk {
+    /// No certificate for the key that is still good.
+    Nothing,
+    /// A current one the keychain holds as no identity: provision imports it.
+    Unimported,
+    /// One the keychain holds as an identity it does not trust, without the certificate that
+    /// issued it: provision installs that.
+    Unchained,
+    /// Only ones the keychain holds with their issuer and still does not trust (revoked), the
+    /// first of them at this path: only a new certificate from Apple changes that, and
+    /// provision passes over these while it waits for one.
+    Refused(PathBuf),
+    /// The folders or the request key could not be read (why), which stops a real run too.
+    Unlooked(String),
+}
+
+/// What a read-only run says of this machine's Apple state, given the valid identities, the
+/// request key, the folder the operator named (`cert_dir`), and what the watched folders hold
+/// for that key ([`OnDisk`]). A current certificate for the key there (the secrets vault fills
+/// both on every Mac) that provision can make an identity, by importing it or the certificate
+/// that issued it, is a step for whoever runs provision, not the owner's errand at Apple; one
+/// the keychain already holds with its issuer and still refuses is. A folder or key it could
+/// not read stops it as it stops a real run.
+fn read_only(
+    id: &str,
+    identities: Vec<String>,
+    key: Option<&Path>,
+    cert_dir: Option<&Path>,
+    on_disk: &dyn Fn(&Path) -> OnDisk,
+) -> Outcome {
+    let provision = |which: &str| {
+        format!(
+            "run `{} provision --id {id}{}`, which {which}",
+            crate::publish::SHIP_COMMAND,
+            cert_dir.map_or(String::new(), |dir| format!(
+                " --cert-dir {}",
+                dir.display()
+            ))
+        )
+    };
+    match (identities.is_empty(), key) {
+        (false, _) => verdict(identities),
+        (true, Some(key)) => match on_disk(key) {
+            OnDisk::Unimported => Outcome::Blocked {
+                what: format!(
+                    "'{id}''s Developer ID key and certificate are on disk but not in the keychain"
+                ),
+                fix: provision("imports them"),
+            },
+            OnDisk::Unchained => Outcome::Blocked {
+                what: format!(
+                    "'{id}''s Developer ID certificate is in the keychain without the certificate that issued it"
+                ),
+                fix: provision("installs it"),
+            },
+            OnDisk::Refused(cert) => Outcome::Todo {
+                what: format!(
+                    "'{id}''s Developer ID certificate {} is in the keychain with its issuer, and macOS still does not trust it (revoked?)",
+                    cert.display()
+                ),
+                next: format!(
+                    "a new certificate from Apple: {}; where the secrets vault holds the old \
+                     one, replace that entry with the new certificate (aterm secrets set \
+                     <its name> --file <the new .cer> --if-absent) so the Macs it fills get it",
+                    provision(
+                        "writes the request to upload and passes over the old certificate while it waits for the new one"
+                    )
+                ),
+            },
+            OnDisk::Unlooked(why) => unlooked(why, key),
+            OnDisk::Nothing => Outcome::Todo {
+                what: format!("'{id}' holds a request key and no installed certificate"),
+                next:
+                    "re-run without --check to import the certificate once you have downloaded it"
+                        .into(),
+            },
+        },
+        (true, None) => Outcome::Todo {
+            what: format!(
+                "no Developer ID Application identity for team {}",
+                pins::APPLE_TEAM_ID
+            ),
+            next: format!(
+                "re-run without --check: it will ask before spending one of five permanent \
+                 certificate slots, then generate '{id}'s request"
+            ),
+        },
+    }
 }
 
 /// The driver: it reads the world, and only one branch creates anything.
@@ -142,25 +240,16 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
     }
 
     if !may_change {
-        return match (seen.identities.is_empty(), seen.key.is_some()) {
-            (false, _) => verdict(seen.identities),
-            (true, true) => Outcome::Todo {
-                what: format!("'{id}' holds a request key and no installed certificate"),
-                next: "re-run without --check to import the certificate once you have \
-                       downloaded it"
-                    .into(),
-            },
-            (true, false) => Outcome::Todo {
-                what: format!(
-                    "no Developer ID Application identity for team {}",
-                    pins::APPLE_TEAM_ID
-                ),
-                next: format!(
-                    "re-run without --check: it will ask before spending one of five \
-                     permanent certificate slots, then generate '{id}'s request"
-                ),
-            },
-        };
+        let watch = Watch::new(cert_dir);
+        let Observed {
+            identities,
+            invalid,
+            key,
+            ..
+        } = seen;
+        return read_only(id, identities, key.as_deref(), cert_dir, &|key| {
+            on_disk(key, &watch, &invalid)
+        });
     }
 
     if seen.identities.is_empty()
@@ -183,7 +272,7 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
     }
 
     if let (Some(key), Some(csr)) = (&seen.key, &seen.csr) {
-        return await_then_install(key, csr, id, &dir, seen.invalid_present, cert_dir);
+        return await_then_install(key, csr, id, &seen.invalid, cert_dir);
     }
 
     if seen.key.is_none() && seen.csr.is_some() {
@@ -223,7 +312,7 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
                      — no new key, no new slot"
                     ),
                 );
-                await_then_install(key, &csr, id, &dir, seen.invalid_present, cert_dir)
+                await_then_install(key, &csr, id, &seen.invalid, cert_dir)
             }
             Err(e) => Outcome::Blocked {
                 what: format!("could not rebuild the certificate request: {e}"),
@@ -234,14 +323,7 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
 
     match confirm_slot(id, seen.invalid_present) {
         Ok(true) => match generate(&dir, id) {
-            Ok(csr) => await_then_install(
-                &key_path(&dir, id),
-                &csr,
-                id,
-                &dir,
-                seen.invalid_present,
-                cert_dir,
-            ),
+            Ok(csr) => await_then_install(&key_path(&dir, id), &csr, id, &seen.invalid, cert_dir),
             Err(outcome) => outcome,
         },
         Ok(false) => Outcome::Waiting {
@@ -258,6 +340,33 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
     }
 }
 
+/// What a run says when it could not look for the certificate (`why`, from
+/// [`find_matching_cert`]): the request key is unreadable, or a watched folder is.
+fn unlooked(why: String, key: &Path) -> Outcome {
+    if why.contains("could not read the public half") {
+        Outcome::Blocked {
+            what: format!(
+                "this machine's own certificate request key cannot be read, so nothing \
+                 can be matched against it: {why}",
+            ),
+            fix: format!(
+                "prove it first: openssl rsa -in {} -noout -check\n\
+                 if that fails the key is damaged. A NEW request costs another of team \
+                 {}'s five permanent Developer ID slots, so recover the file before \
+                 minting one — from a backup of ~/.aterm/apple, or from the machine \
+                 that made it.",
+                key.display(),
+                pins::APPLE_TEAM_ID
+            ),
+        }
+    } else {
+        Outcome::Blocked {
+            what: format!("could not look for the issued certificate: {why}"),
+            fix: "make the folder it names readable (ls -ld <it>), then re-run".into(),
+        }
+    }
+}
+
 /// How long the command waits for the browser errand.
 const WAIT_FOR_CERT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
@@ -266,47 +375,21 @@ fn await_then_install(
     key: &Path,
     csr: &Path,
     id: &str,
-    dir: &Path,
-    invalid: usize,
+    invalid: &[String],
     cert_dir: Option<&Path>,
 ) -> Outcome {
     let watch = Watch::new(cert_dir);
-    let blocked = |why: String| {
-        let about_our_key = why.contains("could not read the public half");
-        if about_our_key {
-            Outcome::Blocked {
-                what: format!(
-                    "this machine's own certificate request key cannot be read, so nothing \
-                     can be matched against it: {why}",
-                ),
-                fix: format!(
-                    "prove it first: openssl rsa -in {} -noout -check\n\
-                     if that fails the key is damaged. A NEW request costs another of team \
-                     {}'s five permanent Developer ID slots, so recover the file before \
-                     minting one — from a backup of ~/.aterm/apple, or from the machine \
-                     that made it.",
-                    key.display(),
-                    pins::APPLE_TEAM_ID
-                ),
-            }
-        } else {
-            Outcome::Blocked {
-                what: format!("could not look for the issued certificate: {why}"),
-                fix: format!(
-                    "make the directory readable, then re-run: ls -ld {}",
-                    dir.display()
-                ),
-            }
-        }
-    };
-    let rejected = match find_matching_cert(key, &watch) {
-        Ok((Some(cer), _)) => return install(&cer, key, id),
-        Err(why) => return blocked(why),
-        Ok((None, rejected)) => rejected,
+    let lookup = || look(key, &watch, invalid, 0, &issuer_in_keychain);
+    let rejected = match lookup() {
+        Ok(Look {
+            cert: Some(cer), ..
+        }) => return install(&cer, key, id),
+        Err(why) => return unlooked(why, key),
+        Ok(Look { rejected, .. }) => rejected,
     };
     if !has_terminal() {
         return Outcome::Waiting {
-            what: waiting_text(id, invalid, &rejected, None, &watch),
+            what: waiting_text(id, invalid.len(), &rejected, None, &watch),
             next: errand_lines(csr, false, &watch).join("\n"),
         };
     }
@@ -316,7 +399,7 @@ fn await_then_install(
         .and_then(|named| surface_csr(csr, id, named));
     let upload = visible.as_deref().unwrap_or(csr);
     let waiting = |rejected: &[PathBuf]| Outcome::Waiting {
-        what: waiting_text(id, invalid, rejected, Some(upload), &watch),
+        what: waiting_text(id, invalid.len(), rejected, Some(upload), &watch),
         next: format!(
             "upload {} at https://developer.apple.com/account/resources/certificates and \
              download the certificate THAT produces.\n\
@@ -346,16 +429,18 @@ fn await_then_install(
     let mut rejected = rejected;
     while started.elapsed() < WAIT_FOR_CERT {
         std::thread::sleep(std::time::Duration::from_secs(3));
-        match find_matching_cert(key, &watch) {
-            Ok((Some(cer), _)) => {
+        match lookup() {
+            Ok(Look {
+                cert: Some(cer), ..
+            }) => {
                 step(
                     APPLE_LABEL,
                     &format!("certificate found: {}", cer.path.display()),
                 );
                 return install(&cer, key, id);
             }
-            Err(why) => return blocked(why),
-            Ok((None, seen)) => {
+            Err(why) => return unlooked(why, key),
+            Ok(Look { rejected: seen, .. }) => {
                 let fresh: Vec<PathBuf> = seen
                     .iter()
                     .filter(|p| !rejected.contains(p))
@@ -1007,10 +1092,144 @@ fn surface_csr(csr: &Path, id: &str, named: &Path) -> Option<PathBuf> {
     Some(visible)
 }
 
-/// Find a downloaded certificate that belongs to this key, by comparing public keys.
+/// What the watched folders hold for `key` ([`OnDisk`]), given the SHA-1s of the team's
+/// identities the keychain holds but does not trust (`invalid`): unlooked when a folder or the
+/// key could not be read and no certificate there can be installed.
+fn on_disk(key: &Path, watch: &Watch, invalid: &[String]) -> OnDisk {
+    look(key, watch, invalid, 0, &issuer_in_keychain)
+        .map_or_else(OnDisk::Unlooked, |look| look.judged)
+}
+
+/// What the watched folders hold for the request key, as provision's wait and its read-only
+/// judge both read them.
+struct Look {
+    /// The first certificate for the key that is not [`spent`].
+    cert: Option<MatchedCert>,
+    /// How the keychain takes it, or, with none, the first refused one, else nothing.
+    judged: OnDisk,
+    /// The `.cer` files that are not for the key.
+    rejected: Vec<PathBuf>,
+}
+
+/// [`Look`] at the watched folders, given the SHA-1s of the identities the keychain does not
+/// trust (`invalid`), with a certificate still good `secs` from now and the keychain's copy of
+/// the certificate that issued a PEM leaf read by `issuer`.
+fn look(
+    key: &Path,
+    watch: &Watch,
+    invalid: &[String],
+    secs: u64,
+    issuer: &dyn Fn(&str) -> Option<String>,
+) -> Result<Look, String> {
+    let mut verdict = OnDisk::Nothing;
+    let mut refused = None;
+    let (cert, rejected) = find_matching_cert(key, watch, &mut |cert| {
+        verdict = judged(cert, invalid, secs, issuer);
+        if let OnDisk::Refused(path) = &verdict {
+            refused.get_or_insert_with(|| path.clone());
+        }
+        spent(&verdict)
+    })?;
+    let judged = match cert {
+        Some(_) => verdict,
+        None => refused.map_or(OnDisk::Nothing, OnDisk::Refused),
+    };
+    Ok(Look {
+        cert,
+        judged,
+        rejected,
+    })
+}
+
+/// How the keychain takes `cert`, a certificate for the request key: nothing when it is not
+/// good `secs` from now, and refused when the keychain holds it, with the certificate that
+/// issued it (`issuer`), as one of the identities it does not trust (`invalid`).
+fn judged(
+    cert: &MatchedCert,
+    invalid: &[String],
+    secs: u64,
+    issuer: &dyn Fn(&str) -> Option<String>,
+) -> OnDisk {
+    if !good_for(cert, secs) {
+        return OnDisk::Nothing;
+    }
+    let held =
+        cert_sha1(cert).is_some_and(|sha1| invalid.iter().any(|id| id.eq_ignore_ascii_case(&sha1)));
+    if !held {
+        return OnDisk::Unimported;
+    }
+    match cert_pem(cert).and_then(|pem| issuer(&pem)) {
+        None => OnDisk::Unchained,
+        Some(_) => OnDisk::Refused(cert.path.clone()),
+    }
+}
+
+/// Whether installing a certificate judged so changes nothing.
+fn spent(judged: &OnDisk) -> bool {
+    matches!(judged, OnDisk::Nothing | OnDisk::Refused(_))
+}
+
+/// `cert`'s SHA-1 fingerprint as `security find-identity` prints an identity's: 40
+/// upper-case hex digits.
+fn cert_sha1(cert: &MatchedCert) -> Option<String> {
+    let path = cert.path.to_string_lossy();
+    let args = [
+        "x509",
+        "-inform",
+        cert.form,
+        "-in",
+        &path,
+        "-noout",
+        "-fingerprint",
+        "-sha1",
+    ];
+    let out = capture("/usr/bin/openssl", &args, None)?;
+    let text = String::from_utf8_lossy(&out);
+    let hex: String = text
+        .trim()
+        .split_once('=')?
+        .1
+        .chars()
+        .filter(|c| *c != ':')
+        .collect();
+    aterm_codec::hex::is_hex(&hex, 40).then(|| hex.to_ascii_uppercase())
+}
+
+/// `cert` as PEM text.
+fn cert_pem(cert: &MatchedCert) -> Option<String> {
+    let path = cert.path.to_string_lossy();
+    let out = capture(
+        "/usr/bin/openssl",
+        &["x509", "-inform", cert.form, "-in", &path],
+        None,
+    )?;
+    String::from_utf8(out).ok()
+}
+
+/// Whether `cert` is still good `secs` from now (`openssl x509 -checkend`); one openssl
+/// cannot judge is not.
+fn good_for(cert: &MatchedCert, secs: u64) -> bool {
+    let path = cert.path.to_string_lossy();
+    let secs = secs.to_string();
+    let args = [
+        "x509",
+        "-inform",
+        cert.form,
+        "-in",
+        &path,
+        "-noout",
+        "-checkend",
+        &secs,
+    ];
+    capture("/usr/bin/openssl", &args, None).is_some()
+}
+
+/// Find a downloaded certificate that belongs to this key, by comparing public keys, passing
+/// over one that `passed` names.
 fn find_matching_cert(
     key: &Path,
     watch: &Watch,
+    passed: &mut dyn FnMut(&MatchedCert) -> bool,
 ) -> Result<(Option<MatchedCert>, Vec<PathBuf>), String> {
     let want = key_spki_sha256(key)
         .ok_or_else(|| format!("could not read the public half of {}", key.display()))?;
@@ -1038,7 +1257,12 @@ fn find_matching_cert(
                 .into_iter()
                 .find(|form| cert_spki_sha256(&path, form).as_deref() == Some(want.as_str()))
             {
-                Some(form) => return Ok((Some(MatchedCert { path, form }), rejected)),
+                Some(form) => {
+                    let cert = MatchedCert { path, form };
+                    if !passed(&cert) {
+                        return Ok((Some(cert), rejected));
+                    }
+                }
                 None => rejected.push(path),
             }
         }
@@ -1732,6 +1956,249 @@ fn capture(program: &str, args: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read-only look at a Mac whose request key's certificate is already on disk (the
+    /// secrets vault fills both) names provision as the step, an operator's, with the folder
+    /// the operator named, when provision can make it an identity: by importing it, or the
+    /// certificate that issued it. A certificate the keychain holds with its issuer and still
+    /// refuses, a key with no current certificate, and no key are the owner's errand at Apple,
+    /// and the refused one is named, with provision run on the same folder.
+    #[test]
+    fn a_key_whose_certificate_is_on_disk_is_provisions_step_not_an_errand() {
+        let key = Path::new("/nonexistent/devid-m9.key");
+        let blocked = |found: OnDisk, cert_dir: Option<&Path>| match read_only(
+            "m9",
+            Vec::new(),
+            Some(key),
+            cert_dir,
+            &|_| found.clone(),
+        ) {
+            Outcome::Blocked { what, fix } => {
+                assert!(what.contains("'m9'") && what.contains("keychain"), "{what}");
+                fix
+            }
+            _ => panic!("{found:?} is provision's step, not an errand"),
+        };
+        let fix = blocked(OnDisk::Unimported, None);
+        assert!(
+            fix.contains("provision --id m9`, which imports") && !fix.contains("--cert-dir"),
+            "{fix}"
+        );
+        let fix = blocked(OnDisk::Unchained, Some(Path::new("/x/Downloads")));
+        assert!(
+            fix.contains("provision --id m9 --cert-dir /x/Downloads`, which installs"),
+            "{fix}"
+        );
+        for (key, found) in [
+            (
+                Some(key),
+                OnDisk::Refused(PathBuf::from("/x/Downloads/old.cer")),
+            ),
+            (Some(key), OnDisk::Nothing),
+            (None, OnDisk::Unimported),
+        ] {
+            assert!(
+                matches!(
+                    read_only("m9", Vec::new(), key, None, &|_| found.clone()),
+                    Outcome::Todo { .. }
+                ),
+                "{key:?} {found:?}"
+            );
+        }
+        for (why, fix) in [
+            ("/x/locked: Permission denied (os error 13)", "readable"),
+            ("could not read the public half of /k", "openssl rsa -in"),
+        ] {
+            match read_only("m9", Vec::new(), Some(key), None, &|_| {
+                OnDisk::Unlooked(why.into())
+            }) {
+                Outcome::Blocked { what, fix: said } => {
+                    assert!(what.contains(why) && said.contains(fix), "{what} / {said}");
+                }
+                _ => panic!("what a real run cannot read stops the check too: {why}"),
+            }
+        }
+        let refused = OnDisk::Refused(PathBuf::from("/x/Downloads/old.cer"));
+        match read_only(
+            "m9",
+            Vec::new(),
+            Some(key),
+            Some(Path::new("/x/Downloads")),
+            &|_| refused.clone(),
+        ) {
+            Outcome::Todo { what, next } => {
+                assert!(what.contains("/x/Downloads/old.cer"), "{what}");
+                assert!(
+                    next.contains("provision --id m9 --cert-dir /x/Downloads`"),
+                    "{next}"
+                );
+            }
+            _ => panic!("a refused certificate is an errand at Apple"),
+        }
+    }
+
+    /// A current certificate for the key in a watched folder is unimported while no identity
+    /// the keychain refuses is that certificate, unchained once one is and its issuer is not in
+    /// the keychain (this one's issuer is itself, no Developer ID authority), and refused when
+    /// its issuer is; one past a horizon, or for another key, is nothing. A refused or ended one
+    /// is passed over for another certificate for the key, the one provision's wait installs,
+    /// and the first refused is named when every one is refused.
+    #[test]
+    fn a_certificate_on_disk_is_judged_by_its_key_its_end_and_the_keychain() {
+        let scratch = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = scratch.path();
+        let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let openssl = |args: &[&str]| {
+            assert!(
+                capture("/usr/bin/openssl", args, None).is_some(),
+                "openssl {args:?}"
+            );
+        };
+        for key in ["k.pem", "other.pem"] {
+            openssl(&["genrsa", "-out", &path(key), "2048"]);
+        }
+        let pem = path("c.pem");
+        openssl(&[
+            "req",
+            "-new",
+            "-x509",
+            "-key",
+            &path("k.pem"),
+            "-subj",
+            "/CN=probe",
+            "-days",
+            "30",
+            "-out",
+            &pem,
+        ]);
+        openssl(&[
+            "x509",
+            "-in",
+            &pem,
+            "-outform",
+            "DER",
+            "-out",
+            &path("c.cer"),
+        ]);
+        let watch = Watch::new(Some(dir));
+        let key = dir.join("k.pem");
+        let cert = MatchedCert {
+            path: dir.join("c.cer"),
+            form: "DER",
+        };
+        let sha1 = cert_sha1(&cert).expect("a fingerprint");
+        assert_eq!(
+            [&[][..], &["0".repeat(40)][..]].map(|invalid| on_disk(&key, &watch, invalid)),
+            [OnDisk::Unimported, OnDisk::Unimported]
+        );
+        assert_eq!(
+            on_disk(&key, &watch, &[sha1.to_ascii_lowercase()]),
+            OnDisk::Unchained
+        );
+        let seen =
+            |watch: &Watch, invalid: &[String], secs, issuer: &dyn Fn(&str) -> Option<String>| {
+                let look = look(&key, watch, invalid, secs, issuer).expect("look");
+                (look.cert.map(|cert| cert.path), look.judged)
+            };
+        assert_eq!(
+            seen(&watch, &[], 10 * 365 * 24 * 60 * 60, &issuer_in_keychain),
+            (None, OnDisk::Nothing)
+        );
+        assert_eq!(
+            on_disk(&dir.join("other.pem"), &watch, std::slice::from_ref(&sha1)),
+            OnDisk::Nothing
+        );
+        let found = |_: &str| Some("issuer".to_owned());
+        let refused = OnDisk::Refused(cert.path.clone());
+        assert_eq!(
+            seen(&watch, std::slice::from_ref(&sha1), 0, &found),
+            (None, refused.clone())
+        );
+        assert_eq!(
+            seen(&watch, std::slice::from_ref(&sha1), 0, &|_| None),
+            (Some(cert.path.clone()), OnDisk::Unchained)
+        );
+
+        // The renewal lives in a folder read after the first, so the order is the test's.
+        let later = dir.join("later");
+        std::fs::create_dir(&later).expect("dir");
+        let renewed = path("d.pem");
+        openssl(&[
+            "req",
+            "-new",
+            "-x509",
+            "-key",
+            &path("k.pem"),
+            "-subj",
+            "/CN=renewed",
+            "-days",
+            "400",
+            "-out",
+            &renewed,
+        ]);
+        let renewal = later.join("d.cer");
+        openssl(&[
+            "x509",
+            "-in",
+            &renewed,
+            "-outform",
+            "DER",
+            "-out",
+            &renewal.to_string_lossy(),
+        ]);
+        let renewed_sha1 = cert_sha1(&MatchedCert {
+            path: renewal.clone(),
+            form: "DER",
+        })
+        .expect("a fingerprint");
+        let watch = Watch {
+            named: Some(dir.to_path_buf()),
+            own: Some(later),
+        };
+        let both = [sha1.clone(), renewed_sha1];
+        let sixty_days = 60 * 24 * 60 * 60;
+        assert_eq!(
+            [
+                seen(&watch, std::slice::from_ref(&sha1), 0, &found),
+                seen(&watch, &[], sixty_days, &found),
+                seen(&watch, &both, 0, &found),
+            ],
+            [
+                (Some(renewal.clone()), OnDisk::Unimported),
+                (Some(renewal), OnDisk::Unimported),
+                (None, refused),
+            ],
+            "passed over: refused, ended; every one refused names the first"
+        );
+
+        // A folder that cannot be read, with nothing installable elsewhere, is no answer.
+        let locked = dir.join("locked");
+        let empty = dir.join("empty");
+        std::fs::create_dir(&locked).expect("dir");
+        std::fs::create_dir(&empty).expect("dir");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let blind = Watch {
+            named: Some(locked.clone()),
+            own: Some(empty),
+        };
+        let blind_look = on_disk(&key, &blind, &[]);
+        let missing = dir.join("missing.pem");
+        let unreadable_key = on_disk(&missing, &blind, &[]);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert!(
+            matches!(&blind_look, OnDisk::Unlooked(why) if why.contains("locked")),
+            "{blind_look:?}"
+        );
+        // The key's own error takes the slot-sparing fix, wherever it is reported.
+        let OnDisk::Unlooked(why) = unreadable_key else {
+            panic!("{unreadable_key:?}");
+        };
+        assert!(
+            matches!(unlooked(why, &missing), Outcome::Blocked { fix, .. } if fix.contains("openssl rsa -in")),
+            "a key that cannot be read is proven before a slot is spent"
+        );
+    }
 
     #[test]
     fn the_common_name_parses_in_both_openssl_dialects() {

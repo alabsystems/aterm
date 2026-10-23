@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Host baseline TOML document (`Baseline`), table discovery, `--only` filtering, and `{key}` placeholder substitution.
+//! Host baseline TOML document (`Baseline`), table discovery, and `{key}` substitution.
 
 use crate::items;
 use serde::Deserialize;
@@ -66,7 +66,6 @@ pub struct Baseline {
 }
 
 /// Parse a baseline document.
-///
 /// # Errors
 /// The parser's message, or a schema mismatch.
 pub fn parse(text: &str) -> Result<Baseline, String> {
@@ -81,7 +80,7 @@ pub fn parse(text: &str) -> Result<Baseline, String> {
     Ok(baseline)
 }
 
-/// Baseline table names (`names`, `power`, `app`, …), derived from [`Baseline`] fields excluding `schema` and `users`.
+/// Baseline table names (`names`, `power`, `app`, …) derived from [`Baseline`] fields.
 #[must_use]
 pub fn tables() -> Vec<&'static str> {
     use serde::de::{self, Visitor};
@@ -123,7 +122,6 @@ pub fn tables() -> Vec<&'static str> {
 }
 
 /// Check `--only`'s table names against [`tables`].
-///
 /// # Errors
 /// One line naming the unknown table and every known one.
 pub fn check_only(only: &[String]) -> Result<(), String> {
@@ -143,8 +141,7 @@ pub fn check_only(only: &[String]) -> Result<(), String> {
     }
 }
 
-/// Return `text` keeping only `schema`, `users`, and the tables named in `only` (or unchanged when `only` is empty).
-///
+/// Return `text` keeping only `schema`, `users`, and the tables named in `only`.
 /// # Errors
 /// The parser's message.
 pub fn keep_only(text: &str, only: &[String]) -> Result<String, String> {
@@ -165,8 +162,7 @@ pub fn keep_only(text: &str, only: &[String]) -> Result<String, String> {
     aterm_toml::to_string(&doc).map_err(|e| format!("baseline: {e}"))
 }
 
-/// Substitute `{key}` placeholders in every string of `text` from `vars`, leaving unknown placeholders intact.
-///
+/// Substitute `{key}` placeholders in `text` from `vars`, leaving unknown placeholders intact.
 /// # Errors
 /// The parser's message.
 pub fn fill(text: &str, vars: &[(&str, &str)]) -> Result<String, String> {

@@ -322,6 +322,8 @@ pub(crate) struct GlTailIn<'a> {
     pub(crate) cursor_opaque: bool,
     /// The pass-economy ablation (`FramePlanCtx::ablation`).
     pub(crate) ablation: crate::renderer::UnormAblation,
+    /// Route (1) of the pass economy may store the Exact Under fx in the base pass (`FramePlanCtx::under_opaque`).
+    pub(crate) under_opaque: bool,
     /// The fx engine: its atlas and this frame's palette.
     pub(crate) fx: &'a fx_gpu::FxGpu,
 }
@@ -402,6 +404,7 @@ pub(crate) fn encode_tail(
             has_wallpaper: win.wallpaper_tex.is_some(),
             cursor_opaque: t.cursor_opaque,
             ablation: t.ablation,
+            under_opaque: t.under_opaque,
         },
     );
     let recreate = win

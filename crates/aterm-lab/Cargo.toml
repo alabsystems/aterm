@@ -78,6 +78,15 @@ aterm-durable = { workspace = true }
 # here.
 aterm-link = { path = "../aterm-link" }
 
+# `aos-search` runs Aos M4's evaluator in process: schedule plans, the grid and file
+# proposers, the evaluator and the provenance bundle exist in a release build only
+# under `aos-candidates`. aterm-lab is the one crate that enables it (design §10.8):
+# never aterm-bench or aterm-verify, whose builds unify features with the shipped app.
+aterm-effects = { workspace = true, features = ["aos-candidates"] }
+# `aos-repair --publish` and its `--control` replay a window's exported momentum trace in the
+# lab (`aos_phase`): the replay, the code seam and the wire encoder are the Aos crate's own.
+# Not a new edge in the build graph: aterm-effects above already depends on it.
+aterm-aos = { workspace = true }
 # Private, exclusively created directories for lab runs and counterfeit API fixtures.
 aterm-tempfile = { workspace = true }
 # `abrew-admission` runs abrew's own admission code over Homebrew's indexes

@@ -11,8 +11,7 @@ use crate::supervise::tape::replay::{Options, ReplayCore, panic_message, replay}
 use crate::supervise::tape::report::{Cause, Class, Divergence, Report, Verdict};
 use crate::supervise::tape::testing::{MemoryTape, assert_replays, written};
 
-/// The scripted worker: a read box approved, a question and an idle point
-/// handed over, then the session gone (the transparency suite's script).
+/// Scripted worker with a read box, question, idle point, and vanish.
 fn script() -> Mock {
     let mut m = fenced(vec![
         busy_screen(),
@@ -26,8 +25,7 @@ fn script() -> Mock {
     m
 }
 
-/// A recorded watch of [`script`]: its header's text and its tape's items,
-/// after checking it replays as recorded.
+/// Recorded watch of [`script`]: encoded header and recovered items.
 fn recorded() -> (String, Vec<Item>) {
     let mut m = script();
     let run = record_watch(&mut m, &auto(30), |_| {});
@@ -38,9 +36,7 @@ fn recorded() -> (String, Vec<Item>) {
     (header, read.items)
 }
 
-/// A recorded `supervise` — a read box approved, a write box handed back to
-/// the manager — as `aterm drive supervise --tape` records one: its header's
-/// text, its tape's items and the review the run returned.
+/// Recorded `supervise` run: encoded header, recovered items, and returned review.
 fn recorded_supervise() -> (String, Vec<Item>, String) {
     let mut m = fenced(vec![bash_one_row(), busy_screen(), write_prompt()]);
     let (tape, mut taped) = memory_tape(&mut m);
@@ -123,9 +119,6 @@ fn edit(items: &mut [Item], i: usize, edit: impl FnOnce(&mut EffectRecord)) {
     }
 }
 
-/// A RECORDED WATCH REPLAYS: the run's own tape is REPRODUCED, every effect
-/// consumed, the run's end the recorded one — in its file form and in its
-/// text form alike.
 #[test]
 fn a_recorded_watch_replays_in_either_form() {
     let (header, items) = recorded();
@@ -164,11 +157,6 @@ fn a_recorded_watch_replays_in_either_form() {
     assert_eq!(again, report, "the text form replays as the file form");
 }
 
-/// A RECORDED SUPERVISE REPLAYS, ITS REVIEW COMPARED: a `supervise` returns
-/// the review the manager reads as its value, not as lines through the `out`
-/// door, so its tape's end holds that review under the exit code, and the
-/// replay is REPRODUCED only when the replayed loop returns the very same
-/// text — twice alike.
 #[test]
 fn a_recorded_supervise_replays_and_its_review_is_compared() {
     let (header, items, review) = recorded_supervise();
@@ -210,11 +198,6 @@ fn a_recorded_supervise_replays_and_its_review_is_compared() {
     assert_eq!(report.consumed, report.effects, "every door agreed");
 }
 
-/// ONE REPLY BYTE FLIPPED: the reply's form byte (a control reply's
-/// ok-or-error tag) makes a reply this build cannot read — DIVERGED at that
-/// very door, as drift; a byte flipped in the JUDGED SCREEN (the box's
-/// command) makes the loop decide on another screen — DIVERGED at the
-/// decision, as a decision.
 #[test]
 fn one_reply_byte_flipped_diverges() {
     let (header, items) = recorded();
@@ -258,8 +241,6 @@ fn one_reply_byte_flipped_diverges() {
     assert_eq!(d.class, Class::Decision, "{d:?}");
 }
 
-/// ONE MONO DROPPED: the loop's next monotonic read finds another kind of
-/// record where its read was — astream's kind mismatch, at that place.
 #[test]
 fn one_mono_dropped_is_a_kind_mismatch() {
     let (header, items) = recorded();
@@ -287,8 +268,6 @@ fn one_mono_dropped_is_a_kind_mismatch() {
     assert_eq!(d.class, Class::Drift);
 }
 
-/// TWO REQUESTS SWAPPED: the loop asks the first of them where the tape holds
-/// the second — DIVERGED at the first, its request named on both sides.
 #[test]
 fn two_requests_swapped_diverge_at_the_first() {
     let (header, items) = recorded();
@@ -313,8 +292,6 @@ fn two_requests_swapped_diverge_at_the_first() {
     );
 }
 
-/// A PRINTED LINE CHANGED on the tape: the loop prints the line it prints,
-/// the tape holds another — an OUTPUT divergence at the `out` door.
 #[test]
 fn a_printed_line_changed_is_an_output_divergence() {
     let (header, items) = recorded();
@@ -334,9 +311,6 @@ fn a_printed_line_changed_is_an_output_divergence() {
     assert_eq!(d.class, Class::Output);
 }
 
-/// ONE HEADER KEY CHANGED: the policy that approved the box is replaced by
-/// one that approves nothing — the loop decides otherwise on the very screen
-/// the recorded loop approved: a DECISION divergence, at the decision.
 #[test]
 fn one_header_key_changed_is_a_decision_divergence() {
     let (header, items) = recorded();
@@ -352,10 +326,6 @@ fn one_header_key_changed_is_a_decision_divergence() {
     assert_eq!(d.door.as_deref(), Some(doors::DECIDE_APPROVAL), "{d:?}");
 }
 
-/// A PANIC IN THE POLICY REPRODUCES: a run that panics where it decides a box
-/// (a planted panic, this thread's) leaves a tape that ends unwound; its
-/// replay panics at the same place, every record consumed — PANICKED, the
-/// same message.
 #[test]
 fn a_recorded_panic_replays_to_panicked() {
     let mut m = script();
@@ -404,9 +374,7 @@ fn a_recorded_panic_replays_to_panicked() {
     );
 }
 
-/// The scripted worker's transport, which panics at its `at`-th call
-/// (counting from 0) — inside the control door's live call, as a probe's body
-/// or a real transport could.
+/// Transport wrapper that panics at its `at`-th call (0-indexed).
 struct PanicsAt<'m> {
     inner: &'m mut Mock,
     at: usize,
@@ -424,12 +392,6 @@ impl Ctl for PanicsAt<'_> {
     }
 }
 
-/// A PANIC INSIDE A DOOR REPRODUCES: a run whose transport panics inside the
-/// control door's live call leaves no record of that round trip — there is no
-/// value to tape — but its tape says the door and the request it died at
-/// (`NOTE_UNWOUND_IN`); its replay, every record before it reproduced,
-/// reaches that door asking that very request: PANICKED inside `ctl`, with
-/// the recorded message, exit 4.
 #[test]
 fn a_panic_inside_a_door_replays_to_panicked_at_that_door() {
     use crate::supervise::tape::core::{NOTE_UNWOUND_IN, unwound_in_text};
@@ -497,8 +459,6 @@ fn a_panic_inside_a_door_replays_to_panicked_at_that_door() {
     );
 }
 
-/// `--until door=N` stops the replay once effect `#N` is consumed: REACHED,
-/// everything up to it reproduced, nothing after it served.
 #[test]
 fn until_stops_the_replay_after_its_door() {
     let (header, items) = recorded();
@@ -520,8 +480,6 @@ fn until_stops_the_replay_after_its_door() {
     assert_eq!(report.code(), 0);
 }
 
-/// A TAPE CUT SHORT — a run killed mid-frame — reproduces to its tear: ENDED,
-/// every effect on it consumed, the loop stopped where the tape stops.
 #[test]
 fn a_torn_tape_reproduces_to_its_tear() {
     let (header, items) = recorded();
@@ -537,9 +495,6 @@ fn a_torn_tape_reproduces_to_its_tear() {
     assert!(report.tail.is_some(), "the tear is said");
 }
 
-/// A REPLAY NEVER CALLS ITS TRANSPORT: the recorded tape replayed through the
-/// recording's own wrapper over a transport that panics if it is called —
-/// the replaying door never makes the live call — reproduces every effect.
 #[test]
 fn a_replaying_door_never_calls_the_transport() {
     struct Refuses;
@@ -578,8 +533,6 @@ fn a_replaying_door_never_calls_the_transport() {
     );
 }
 
-/// The tapes no replay can stand on are refused, each named: bytes that are
-/// no tape, and roots that would land on a directory that exists.
 #[test]
 fn a_tape_no_replay_can_stand_on_is_refused() {
     let (header, items) = recorded();
@@ -596,11 +549,6 @@ fn a_tape_no_replay_can_stand_on_is_refused() {
     assert!(err.contains("must not exist"), "{err}");
 }
 
-/// NEGATIVE CONTROL FOR THE HOST'S DOOR: a header edited to say the run had a
-/// window host, over a tape whose run had none, is not refused — a run with
-/// a host replays now — and DIVERGES at the host's first call: the replayed
-/// loop tells its host the task's face as it starts (`host.task_face`),
-/// where the tape holds the claim.
 #[test]
 fn a_host_the_tape_never_answered_diverges_at_its_first_call() {
     let (header, items) = recorded();

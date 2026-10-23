@@ -134,7 +134,7 @@ pub(crate) static FUNCTIONS: &[FuncSpec] = &[
 /// The formats (`@NAME`), each applied to `.`.
 pub(crate) static FORMATS: &[&str] = &["tsv", "csv", "json", "text", "base64", "base64d"];
 
-/// One row of `REFUSED_JQ`: the constructs, as a program spells them, and the rewrite.
+/// One row of `REFUSED_JQ`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RefusedJq {
     /// The refused names and tokens.
@@ -264,9 +264,7 @@ pub struct Program {
 }
 
 /// Compiles a `jq` filter expression.
-///
 /// # Errors
-///
 /// Returns a usage error on syntax errors or refused constructs.
 pub fn compile(src: &str) -> Result<Program> {
     let tokens = lex::lex(src)?;
@@ -276,11 +274,8 @@ pub fn compile(src: &str) -> Result<Program> {
 
 impl Program {
     /// Evaluates the filter against `input` and returns the results in order.
-    ///
     /// # Errors
-    ///
     /// Returns a usage error on any runtime error (a bad type or index, an undefined `$name`, …).
-    /// A `?`, or the left side of `//`, suppresses one.
     pub fn run(&self, input: &aterm_json::Value) -> Result<Vec<aterm_json::Value>> {
         let mut out = Vec::new();
         eval::run(&self.ast, input, &mut out)?;

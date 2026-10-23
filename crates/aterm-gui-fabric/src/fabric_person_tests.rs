@@ -15,13 +15,6 @@ fn bridge(store: &Store, rest: &str) -> String {
     cmd_hold(store, rest, HoldIssuer::Bridge)
 }
 
-/// THE WINDOW SETS ORIGIN `person`, AND NOTHING ON THE WIRE TOUCHES IT. Take
-/// Over fills the person's slot (`reason=taken-over`) and every PTY-reaching
-/// verb answers `ERR halted … origin=person`; an Owner or bridge `hold off`
-/// lifts its own slot and answers `OK hold=1` with the person's standing; a
-/// socket naming `origin=person` is `ERR usage`; Hand Back lifts it.
-/// CONTROL: the same Owner `on`/`off` moves the owner's own slot beside it,
-/// so the refusal is the person slot's, not the verb's.
 #[test]
 fn the_window_sets_origin_person_and_no_socket_names_or_lifts_it() {
     let store = new_store();
@@ -85,9 +78,6 @@ fn the_window_sets_origin_person_and_no_socket_names_or_lifts_it() {
     assert_eq!(owner(&store, &format!("{sid} off")), "OK hold=0\n");
 }
 
-/// The person's Take Over beside a fleet halt: both stand, each in its own
-/// slot; the fleet's lift leaves the person's, and Hand Back leaves the
-/// fleet's. The halt names the person's (`ERR halted … origin=person`).
 #[test]
 fn the_person_slot_stands_beside_the_fleets_and_neither_lift_touches_the_other() {
     let store = new_store();
@@ -112,9 +102,6 @@ fn the_person_slot_stands_beside_the_fleets_and_neither_lift_touches_the_other()
     assert_eq!(ctx.fabric.holds().origins(), "fleet");
 }
 
-/// THE HANDOFF CARRIES THE PERSON'S SLOT: the export rows and their import
-/// round-trip every slot, the person's first, and a seed puts it back on a
-/// fresh session. A malformed person row is still a halt (fail closed).
 #[test]
 fn the_handoff_export_and_import_round_trip_the_person_slot() {
     let store = new_store();
@@ -149,11 +136,6 @@ fn the_handoff_export_and_import_round_trip_the_person_slot() {
     );
 }
 
-/// THE REFUSAL COUNTER MOVES ONLY ON REFUSALS AIMED AT THE TAB: reads, a verb
-/// the halt lets through and a refusal under another origin's hold leave it;
-/// each session verb refused under the person's hold moves it by one; an app
-/// verb the instance-wide halt refuses was aimed at no tab and moves no tab's
-/// count; a fresh Take Over starts it at zero.
 #[test]
 fn the_counter_moves_only_on_refusals_under_the_person_hold() {
     let store = new_store();
@@ -199,9 +181,6 @@ fn the_counter_moves_only_on_refusals_under_the_person_hold() {
     );
 }
 
-/// TAKE OVER NEVER WAITS ON A COMMITTING UPDATE: the Commit's fence is the
-/// main thread's own, so the press is answered at once, nothing moved.
-/// CONTROL: unfenced, the same press holds.
 #[test]
 fn a_take_over_under_a_committing_update_answers_busy_at_once() {
     let store = new_store();
@@ -215,12 +194,6 @@ fn a_take_over_under_a_committing_update_answers_busy_at_once() {
     assert_eq!(person_hold(&ctx, true, &|| {}), PersonHoldOutcome::Moved);
 }
 
-/// A GATEWAY CARD DOES NOT OPEN UNDER A HOLD: while any session is held,
-/// `open menu|palette|tab-menu|overview|connections|autopilot-menu|fact-menu`
-/// (a fact's menu named by its fact too: `open fact-menu path`) answers
-/// `ERR halted` as `invoke` does, since each card is `invoke`'s rows behind a
-/// key; closing one and every other target stay answerable. CONTROL: with no
-/// hold standing, nothing is refused.
 #[test]
 fn a_gateway_card_does_not_open_under_a_hold() {
     let store = new_store();

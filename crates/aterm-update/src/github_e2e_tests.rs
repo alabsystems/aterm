@@ -5,33 +5,23 @@
 
 use super::*;
 
-/// The probe's switch: the parent's scratch directory.
 const PROBE_DIR: &str = "ATERM_TEST_CHECK_E2E_DIR";
-/// The probe's name, as `--exact` wants it.
 const PROBE: &str = "github::tests::e2e::probe_one_check_over_real_curl";
 
-/// The running build, and the release the channel offers above it.
 const RUNNING: u64 = 10;
 const BUILD: u64 = 20;
 const VERSION: &str = "0.20.0";
 const TAG: &str = "v0.20.0";
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// Bytes sent on the first container GET before going silent.
 const HOLD_AT: usize = 64 * 1024;
 
-/// A wait for something that must happen: a hang detector, never a latency budget. The
-/// silent hold costs the quick stall bound once, cut for a fresh attempt to
-/// [`FRESH_STALL_SECS`]; the pre-PKG-8 lane waited 120 s on it.
 const HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Quick stall bound (`--speed-time`) for byte-0 download attempts.
 const QUICK_STALL_SECS: &str = "8";
 
-/// Shortened stall bound substituted by the curl wrapper for byte-0 attempts.
 const FRESH_STALL_SECS: u32 = 2;
 
-/// The scratch updates root under `dir`, laid out as [`Staging::resolve`] lays the real one.
 fn e2e_staging(dir: &std::path::Path) -> Staging {
     let root = dir.join("Updates");
     aterm_update_core::ensure_private_dir(&root.join("download")).expect("scratch updates root");
@@ -46,8 +36,6 @@ fn e2e_staging(dir: &std::path::Path) -> Staging {
     }
 }
 
-/// The child's half: one check in the parent's scratch world, its curl the real one behind
-/// the parent's wrapper. Nothing without the parent's directory.
 #[test]
 fn probe_one_check_over_real_curl() {
     let Some(dir) = std::env::var_os(PROBE_DIR) else {
@@ -72,11 +60,9 @@ fn probe_one_check_over_real_curl() {
     let pending = dir.join("said.pending");
     std::fs::write(&pending, said).unwrap();
     std::fs::rename(pending, dir.join("said")).unwrap();
-    // Stay alive until the parent reads `said` and kills the process group.
     std::thread::sleep(HANG);
 }
 
-/// Builds an ad hoc signed stand-in `aterm.app` with 1 MiB of incompressible payload.
 fn stand_in_app(dir: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let app = dir.join("aterm.app");
@@ -116,8 +102,6 @@ fn stand_in_app(dir: &std::path::Path) -> std::path::PathBuf {
     app
 }
 
-/// The release's updater zip, packed as the cutter packs it (`ditto -c -k`, no metadata,
-/// `--keepParent`).
 fn updater_zip(app: &std::path::Path, zip: &std::path::Path) -> Vec<u8> {
     let out = aterm_uds::deadline::output_until(
         aterm_uds::spawnfd::command("/usr/bin/ditto")
@@ -139,8 +123,6 @@ fn updater_zip(app: &std::path::Path, zip: &std::path::Path) -> Vec<u8> {
     std::fs::read(zip).unwrap()
 }
 
-/// Every asset of the scratch release by name: the appcast (naming the zip and its digest)
-/// signed by m3, and the roster naming m3 signed by the fixture master.
 fn release_assets(zip: &[u8]) -> Vec<(String, Vec<u8>)> {
     use ring::signature::Ed25519KeyPair;
     let master = Ed25519KeyPair::from_seed_unchecked(&MASTER_SEED_FIXTURE).unwrap();
@@ -186,11 +168,8 @@ fn release_assets(zip: &[u8]) -> Vec<(String, Vec<u8>)> {
     ]
 }
 
-/// One request the scratch host answered: method, path, `Range` (or `none`).
 type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
 
-/// Serves the evergreen 302 redirect and tag assets, stalling the first container GET after
-/// [`HOLD_AT`] bytes.
 fn serve(listener: std::net::TcpListener, assets: Vec<(String, Vec<u8>)>, seen: Seen) {
     use std::io::{Read as _, Write as _};
     let assets = std::sync::Arc::new(assets);
@@ -280,13 +259,6 @@ fn serve(listener: std::net::TcpListener, assets: Vec<(String, Vec<u8>)>, seen: 
     });
 }
 
-/// A CHECK OVER REAL CURL FINDS, AUTHORIZES, DOWNLOADS AND STAGES A RELEASE, EVEN WHEN ITS
-/// CONTAINER'S TRANSFER GOES SILENT. The scratch host is a whole channel: the evergreen
-/// pointer, a roster and appcast a scratch master's chain signs, and the updater zip of an ad
-/// hoc signed stand-in, whose first transfer stops dead after 64 KiB. The check must stage
-/// that build — the ready marker and the sealed bundle in place, the ledger saying so — on
-/// exactly one HEAD of the evergreen URL, tag-specific GETs only, and two GETs of the
-/// container, the second resuming where the dead one stopped.
 #[test]
 fn a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -303,7 +275,6 @@ fn a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent(
 
     let world = dir.path().join("world");
     std::fs::create_dir_all(world.join("Applications")).unwrap();
-    // Rewrite github.com URLs to the loopback host and shorten the byte-0 quick stall bound.
     let quick = QUICK_STALL_SECS;
     let wrapper = dir.path().join("curl");
     std::fs::write(

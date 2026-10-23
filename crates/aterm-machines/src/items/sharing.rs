@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Sharing services through launchd: Remote Apple Events (design §5.1).
+//! Sharing services through launchd: Remote Apple Events.
 
 use super::{Ctx, Item};
 use crate::model::{Probe, Read};
@@ -58,8 +58,8 @@ pub struct Table {
     /// Refused whatever its value: Remote Login is a person step (`[person] remote_login`), and
     /// turning it off would cut the Mac off from the controller.
     pub remote_login: Option<bool>,
-    /// Refused whatever its value: only the System Settings switch grants Screen Sharing control
-    /// (design §1.6), so it is a person step (`[person] screen_sharing`).
+    /// Refused whatever its value: only the System Settings switch grants Screen Sharing control,
+    /// so it is a person step (`[person] screen_sharing`).
     pub screen_sharing: Option<bool>,
 }
 
@@ -184,7 +184,6 @@ fn run(sys: &dyn System, cmd: &Cmd) -> Result<Ran, String> {
     sys.run(cmd).map_err(|e| format!("{}: {e}", cmd.display()))
 }
 
-/// The state, rendered: the two settled states by name, the half states by both halves.
 const fn render(enabled: bool, loaded: bool) -> &'static str {
     match (enabled, loaded) {
         (true, true) => "on",
@@ -194,7 +193,6 @@ const fn render(enabled: bool, loaded: bool) -> &'static str {
     }
 }
 
-/// One service turned on or off.
 struct Switch {
     id: &'static str,
     service: Service,
@@ -280,8 +278,6 @@ impl Item for Switch {
     }
 }
 
-/// A launchd read as a value. They never answer `Absent` (a label with no override takes
-/// its plist's default), so one that did is not an answer either.
 fn answered(read: Read<bool>) -> Result<bool, String> {
     match read {
         Read::Value(v) => Ok(v),
@@ -308,7 +304,6 @@ mod tests {
         }
     }
 
-    /// `launchctl print-disabled system` in the macOS 27.0 VM, as root over SSH.
     const VM_PRINT_DISABLED: &str = "
 \tdisabled services = {
 \t\t\"com.apple.screensharing\" => enabled
@@ -319,7 +314,6 @@ mod tests {
 \t}
 ";
 
-    /// `launchctl print system/com.apple.AEServer` while it is not loaded (VM).
     fn not_loaded() -> Ran {
         Ran::exit(
             NOT_LOADED,

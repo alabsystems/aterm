@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! install.sh's glue around the verifier: the pin it carries, held to the release's
-//! receipts; the executable it runs only once it is the pinned file (the seam's, or the
-//! release asset it fetched from the pin's repository); the embedded verifier it keeps
-//! where nothing is pinned; and a whole run on each path. Every test sets the pin it
-//! means, so none depends on what install.sh pins today.
+//! Verifier pin and seam tests for `install.sh`.
 
 use std::path::{Path, PathBuf};
 
@@ -18,27 +14,19 @@ use crate::support::{
 };
 use crate::verifier::under_test;
 
-/// A verifier stand-in: it logs each run to `$STUB_RAN`, admits every store, and refuses
-/// every release.
 const STAND_IN: &str = "#!/bin/sh\necho \"ran: $*\" >>\"${STUB_RAN:?}\"\n\
                         [ \"$1\" = --store-path ] && exit 0\n\
                         echo 'install.sh: Linux verification refused: a stand-in' >&2\nexit 1\n";
 
-/// The repository and release whose verifier the copies below pin: another repository
-/// than the channel's, so a fetch from the channel instead is caught.
 const PINNED_REPO: &str = "pinned-org/aterm";
 const PINNED_TAG: &str = "v0.118.0";
 
-/// A `curl` that fails every request, logging it to `$STUB_CURL`: a library call that
-/// reached the network shows in the log, and reaches nothing.
 const NO_NETWORK: &str = "#!/bin/sh\necho \"$*\" >>\"${STUB_CURL:?}\"\nexit 7\n";
 
-/// A call's status and output, for a message.
 fn said(rec: &crate::support::Rec) -> String {
     format!("rc {} out {:?} err {:?}", rec.rc, rec.out, rec.err)
 }
 
-/// The pin `PINNED_REPO`/`PINNED_TAG` with `digest` for x86_64 and none for aarch64.
 fn pinned(digest: &str) -> Pin {
     Pin {
         repo: PINNED_REPO.into(),
@@ -48,16 +36,10 @@ fn pinned(digest: &str) -> Pin {
     }
 }
 
-/// The bash that sets `pin` in a batch's shell.
 fn set(pin: &Pin) -> String {
     pin.lines().replace('\n', "; ")
 }
 
-/// install.sh carries the pin its committed record names, as `ship pin-verifier` writes
-/// the two: nothing pinned and no record, or exactly the receipts of a release
-/// RELEASES.ledger claims, speaking this tree's interface (`pin::check`, whose own tests
-/// are the negative controls). Bash reads the values the reader does, and downloads no
-/// verifier larger than a release may publish.
 #[test]
 fn install_sh_carries_the_pin_its_record_names() {
     let text = read(&install_sh());
@@ -88,11 +70,6 @@ fn install_sh_carries_the_pin_its_record_names() {
     );
 }
 
-/// The seam's executable runs only when it is a regular file whose SHA-256 is the one
-/// named: a differing, missing or malformed digest, a symbolic link or no file is refused
-/// (status 2, the half's refusal), and the dispatcher then refuses rather than fall back.
-/// A host with no SHA-256 reader skips the half (status 1), as one without Python does.
-/// Only a suite's sourcing reads the seam: a whole run, pinned or not, never does.
 #[test]
 fn the_seam_runs_only_the_file_it_is_held_to() {
     let scratch = Scratch::new();
@@ -260,12 +237,6 @@ fn the_seam_runs_only_the_file_it_is_held_to() {
     );
 }
 
-/// A pinned verifier is the release asset of the pin's own repository, whatever the
-/// channel's: sized, fetched into a private directory of its own, held to the
-/// architecture's digest before it runs, and removed. One that is not the pinned file is
-/// refused (status 2), one the host cannot serve skips the half (status 1), the dispatcher
-/// never falls back to the embedded verifier for a pinned architecture, and an
-/// architecture with no digest keeps it. A dry run sizes the asset and fetches nothing.
 #[test]
 fn a_pinned_verifier_is_fetched_held_to_its_digest_and_removed() {
     let scratch = Scratch::new();
@@ -425,10 +396,6 @@ fn a_pinned_verifier_is_fetched_held_to_its_digest_and_removed() {
     );
 }
 
-/// The download host of a channel (alabsystems/aterm) whose head, `v9.9.9`, publishes no
-/// Linux x86_64 executable unless `$STUB_PUBLISHED` is set (then one of 12 MB, which is
-/// never served), and of the pinned repository's release `v0.118.0`, which carries the
-/// verifier `$STUB_ASSET`. Any other request fails the run.
 const HOST: &str = r#"#!/bin/sh
 head=0 follow=0 fmt="" url=""
 while [ $# -gt 0 ]; do
@@ -461,9 +428,6 @@ case "$head$follow $url" in
 esac
 "#;
 
-/// One `curl … | bash` of `script` on an x86_64 Linux machine (a `uname` stand-in) with
-/// no Python 3.11+: what it said, its status, the requests it made, what the verifier
-/// stand-in was asked, and what it left in TMPDIR.
 struct Piped {
     code: i32,
     out: String,
@@ -527,7 +491,6 @@ fn piped(
     }
 }
 
-/// install.sh at `name` with `pin` in place of whatever it pins.
 fn pinned_copy(scratch: &Scratch, name: &str, pin: &Pin) -> PathBuf {
     let text = pin
         .rewrite(&read(&install_sh()))
@@ -535,12 +498,6 @@ fn pinned_copy(scratch: &Scratch, name: &str, pin: &Pin) -> PathBuf {
     scratch.write(name, text)
 }
 
-/// A whole run on Linux: pinned, the release's verifier is fetched from the pin's
-/// repository, held to its digest, run on the store and removed, and the run goes on to
-/// the head's (absent) executable; pinned to another digest, the app is refused outright
-/// and the fetched file never runs; with nothing pinned the embedded verifier's tools
-/// decide, and the seam is never read. A dry run sizes the verifier, says what a real
-/// install does with it, and fetches and runs nothing.
 #[test]
 fn a_whole_linux_run_holds_the_pinned_verifier_or_keeps_the_embedded_one() {
     let scratch = Scratch::new();
@@ -657,10 +614,6 @@ fn a_whole_linux_run_holds_the_pinned_verifier_or_keeps_the_embedded_one() {
     }
 }
 
-/// A real pinned install reaches `install_linux_app`, whose exit trap replaces the
-/// verifier's own, and still leaves no fetched verifier behind when it stops there (here at
-/// the head's executable, which the host never serves). Negative control: the same run of
-/// an install.sh whose `install_linux_app` cleanup forgets the verifier leaves it.
 #[test]
 fn an_install_removes_the_fetched_verifier_when_it_ends() {
     let scratch = Scratch::new();

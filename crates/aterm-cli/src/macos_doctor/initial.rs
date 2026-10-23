@@ -275,7 +275,6 @@ fn validate_plan(plan: &Plan) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate immutable setup input without reading state or probing the OS.
 pub fn validate_initial_setup_plan(plan: &Plan) -> Result<(), String> {
     validate_plan(plan)
 }
@@ -433,12 +432,10 @@ fn offered_plan(
     }
 }
 
-/// Authorize the exact selected stages and source before any OS probes.
 pub fn authorize_initial_setup(plan: &Plan) -> Result<Option<u64>, String> {
     authorize_initial_setup_observed(plan).result
 }
 
-/// Authorize with a result identity captured before releasing the profile lock.
 pub fn authorize_initial_setup_observed(plan: &Plan) -> InitialSetupObserved<Option<u64>> {
     observe_person_mutation(
         Err("another doctor profile pass is running".into()),
@@ -446,12 +443,10 @@ pub fn authorize_initial_setup_observed(plan: &Plan) -> InitialSetupObserved<Opt
     )
 }
 
-/// Explicitly run the selected plan again, superseding an earlier completion or cancellation.
 pub fn restart_initial_setup(plan: &Plan) -> Result<u64, String> {
     restart_initial_setup_observed(plan).result
 }
 
-/// Restart with a result identity captured before releasing the profile lock.
 pub fn restart_initial_setup_observed(plan: &Plan) -> InitialSetupObserved<u64> {
     observe_person_mutation(
         Err("another doctor profile pass is running".into()),
@@ -475,12 +470,10 @@ struct RestartCommit {
 }
 
 impl InitialSetupRestart {
-    /// Whether the same final admission step can still be confirmed or retried.
     pub const fn pending(&self) -> bool {
         self.final_commit.is_some()
     }
 
-    /// Persist this exact restart.
     pub fn persist_observed(
         &mut self,
         plan: &Plan,
@@ -729,7 +722,6 @@ fn stopped_at(root: &Path) -> Result<Option<Stop>, String> {
     })
 }
 
-/// Whether the person cancelled or restored setup: nothing of it runs by itself again.
 pub(super) fn stopped(root: &Path) -> Result<bool, String> {
     Ok(stopped_at(root)?.is_some())
 }
@@ -747,12 +739,10 @@ fn completed_at(root: &Path) -> Result<bool, String> {
     }
 }
 
-/// Whether every selected setup stage finished, or the person cancelled or restored it.
 pub fn initial_setup_finished() -> Result<bool, String> {
     finished_at(&state_root()?)
 }
 
-/// The durable identity of the current setup run.
 pub fn initial_setup_revision() -> Result<u64, String> {
     revision_at(&state_root()?)
 }
@@ -783,7 +773,6 @@ pub struct InitialSetupAdmission {
     pub completed: bool,
 }
 
-/// Read the admitted run without loading fallback vault configuration or probing the OS.
 pub fn initial_setup_admission() -> Result<Option<InitialSetupAdmission>, String> {
     admission_at(&state_root()?)
 }
@@ -814,15 +803,11 @@ fn admission_at(root: &Path) -> Result<Option<InitialSetupAdmission>, String> {
 /// One observation of the saved plan, its progress and the permission decision.
 #[derive(Debug)]
 pub struct InitialSetupSnapshot {
-    /// Saved plan from [`initial_setup_snapshot`].
     pub plan: Plan,
     pub finished: bool,
     pub rows: Vec<Row>,
-    /// Zero means that no matching modern setup run exists.
     pub revision: u64,
-    /// Whether existing native permission guidance may run.
     pub permissions_allowed: bool,
-    /// Identity of the same coherent records used for these rows and policy.
     pub observation: InitialSetupObservation,
 }
 
@@ -844,12 +829,10 @@ impl std::fmt::Display for InitialSetupSnapshotError {
 
 impl std::error::Error for InitialSetupSnapshotError {}
 
-/// Observe only existing setup records.
 pub fn initial_setup_observation() -> Result<InitialSetupObservation, InitialSetupSnapshotError> {
     observation_at(&state_root().map_err(InitialSetupSnapshotError::Read)?)
 }
 
-/// Injected state root for composition tests; never inspects the live machine.
 #[cfg(any(test, debug_assertions))]
 pub fn initial_setup_observation_at(
     root: &Path,
@@ -915,7 +898,6 @@ pub(super) fn observe_read_only<T>(
     InitialSetupObserved::new(result, observation)
 }
 
-/// Read only aterm's records/configuration, without probing OS grants, accounts or preferences.
 pub fn initial_setup_snapshot() -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
     let root = state_root().map_err(InitialSetupSnapshotError::Read)?;
     snapshot_in_vault(&root, live_configured_vault())
@@ -958,7 +940,6 @@ fn joining_saved_vault(records: &Records, configured: &ConfiguredVault) -> bool 
         })
 }
 
-/// Injected record root and fallback plan for composition tests.
 #[cfg(any(test, debug_assertions))]
 pub fn initial_setup_snapshot_at(
     root: &Path,
@@ -967,7 +948,6 @@ pub fn initial_setup_snapshot_at(
     snapshot_at(root, fallback)
 }
 
-/// The saved plan and recorded stage progress for System State.
 pub fn initial_setup_status() -> Result<(Plan, bool, Vec<Row>), String> {
     let snapshot = initial_setup_snapshot().map_err(|error| error.to_string())?;
     Ok((snapshot.plan, snapshot.finished, snapshot.rows))
@@ -1633,7 +1613,6 @@ fn execute_initial(
     Ok(Some(report))
 }
 
-/// Apply independently selected setup stages after authorization.
 pub fn apply_initial_setup(
     expected_revision: u64,
     password: &mut Option<SecretBytes>,
@@ -1641,7 +1620,6 @@ pub fn apply_initial_setup(
     apply_initial_setup_observed(expected_revision, password).result
 }
 
-/// Apply with an observation captured under the existing profile lock.
 pub fn apply_initial_setup_observed(
     expected_revision: u64,
     password: &mut Option<SecretBytes>,
@@ -4115,18 +4093,12 @@ mod tests {
             "fetching http://alab-secrets.local:7484/v1/alab: No route to host (os error 65)";
 
         pub(super) struct Lan {
-            /// Whether the vault answers this Mac.
             pub(super) answers: Mutex<bool>,
-            /// The network this Mac is on, as the stage's marks read it.
             pub(super) network: Mutex<String>,
             status: Mutex<Status>,
             subscribed: Mutex<bool>,
-            /// How often the stage asked whether the vault answers.
             pub(super) asked: Mutex<u32>,
-            /// Why each join fails (`None`: it queues its request).
             pub(super) refusal: Mutex<Option<String>>,
-            /// Where this aterm runs from when that goes away (a disk image): every
-            /// install is then refused, as `aterm_secrets::service::service_program` does.
             pub(super) fleeting: Mutex<Option<PathBuf>>,
             log: Mutex<Vec<String>>,
         }
@@ -4154,27 +4126,21 @@ mod tests {
                 self.log.lock().unwrap().clone()
             }
 
-            /// An admin approved this Mac, and its subscriber wrote the version that let it
-            /// in.
             pub(super) fn approve(&self, heard: u64) {
                 let mut status = self.status.lock().unwrap();
                 status.membership = Membership::In { seq: 7, heard };
                 status.names = vec!["GH_TOKEN".into()];
             }
 
-            /// This Mac's vault state now.
             pub(super) fn status_now(&self) -> Status {
                 self.status.lock().unwrap().clone()
             }
 
-            /// Set this Mac's vault state, and whether its subscriber runs.
             pub(super) fn set(&self, status: Status, subscribed: bool) {
                 *self.status.lock().unwrap() = status;
                 *self.subscribed.lock().unwrap() = subscribed;
             }
 
-            /// This Mac is in the vault at `source`, as an approved join leaves it, and
-            /// runs no subscriber.
             pub(super) fn in_vault(&self, source: &str, heard: u64) {
                 let mut status = member(source, Membership::In { seq: 7, heard });
                 status.names = vec!["GH_TOKEN".into()];
@@ -4200,8 +4166,6 @@ mod tests {
             }
         }
 
-        /// What paces the stage over `lan`: the production marks ([`secrets_retry::pace`])
-        /// of its network and, with `vault`, its vault state, at `build` and `now`.
         pub(super) struct LanReads {
             pub(super) lan: Arc<Lan>,
             pub(super) vault: bool,
@@ -4319,9 +4283,7 @@ mod tests {
                 self.log.lock().unwrap().push("sync".into());
                 Ok(())
             }
-            fn say(&self, _line: &str) {
-                // The live port of the setup's worker is quiet (`init_secrets::unattended`).
-            }
+            fn say(&self, _line: &str) {}
         }
 
         struct Lines(Arc<Lan>, bool);
@@ -4343,25 +4305,17 @@ mod tests {
             }
         }
 
-        /// The epoch second of the worker's first pass.
         pub(super) const START: u64 = 1_800_000_000;
 
-        /// System State's setup with only the Secrets stage left to run, over `lan`.
         pub(super) struct Vaulted {
             pub(super) lan: Arc<Lan>,
             rest: Fake,
-            /// The journal refuses every line.
             pub(super) refuse: bool,
-            /// The stage is paced ([`InitialHost::secrets_pace`] answers).
             pub(super) paced: bool,
-            /// The marks read this Mac's vault state as well as its network, as the live
-            /// ones do.
             pub(super) marks_vault: bool,
             pub(super) build: String,
             pub(super) now: u64,
             tries: Vec<u64>,
-            /// The vault the person joins from a terminal just after the stage's next read
-            /// of which vault this Mac is in ([`InitialHost::configured_vault`]).
             pub(super) joins_after_read: Option<&'static str>,
         }
 
@@ -4380,12 +4334,10 @@ mod tests {
                 }
             }
 
-            /// The minute of each try, counted from the first pass.
             pub(super) fn minutes(&self) -> Vec<u64> {
                 self.tries.iter().map(|at| (at - START) / 60).collect()
             }
 
-            /// What the live host's pace would read here now (`vault`: its vault state too).
             pub(super) fn reads(&self, vault: bool) -> LanReads {
                 LanReads {
                     lan: Arc::clone(&self.lan),
@@ -4477,7 +4429,6 @@ mod tests {
             }
         }
 
-        /// A run that selects the Secrets stage alone, authorized.
         pub(super) fn authorized() -> (aterm_tempfile::TempDir, u64) {
             let root = aterm_tempfile::tempdir().unwrap();
             let revision = authorize_at(root.path(), &selected(&[Setting::Secrets]))
@@ -4486,9 +4437,6 @@ mod tests {
             (root, revision)
         }
 
-        /// The worker's passes of run `revision`, a minute apart from [`START`], through
-        /// minute `last`, `before(minute, host)` run before each: each pass's Secrets row,
-        /// until the run is done.
         pub(super) fn passes(
             host: &mut Vaulted,
             root: &Path,

@@ -1,9 +1,5 @@
 // Copyright (c) 2018 Yevhenii Reizner and the ttf-parser authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//
-// Derived from ttf-parser 0.25.1 src/tables/cff/cff1.rs and modified by the aterm
-// project in 2026.
-// See ../../../LICENSE-MIT and ../../../LICENSE-APACHE for the upstream licenses.
 
 //! Compact Font Format (CFF) table implementation.
 
@@ -29,7 +25,6 @@ const MAX_ARGUMENTS_STACK_LEN: usize = 48;
 
 const TWO_BYTE_OPERATOR_MARK: u8 = 12;
 
-/// Enumerates some operators defined in the Adobe Technical Note #5177.
 mod operator {
     pub const HORIZONTAL_STEM: u8 = 1;
     pub const VERTICAL_STEM: u8 = 3;
@@ -62,7 +57,6 @@ mod operator {
     pub const FIXED_16_16: u8 = 255;
 }
 
-/// Top DICT operators from Adobe Technical Note #5176, Table 9.
 mod top_dict_operator {
     pub const CHARSET_OFFSET: u16 = 15;
     pub const ENCODING_OFFSET: u16 = 16;
@@ -74,21 +68,18 @@ mod top_dict_operator {
     pub const FD_SELECT: u16 = 1237;
 }
 
-/// Private DICT operators from Adobe Technical Note #5176, Table 23.
 mod private_dict_operator {
     pub const LOCAL_SUBROUTINES_OFFSET: u16 = 19;
     pub const DEFAULT_WIDTH: u16 = 20;
     pub const NOMINAL_WIDTH: u16 = 21;
 }
 
-/// Enumerates Charset IDs defined in the Adobe Technical Note #5176, Table 22.
 mod charset_id {
     pub const ISO_ADOBE: usize = 0;
     pub const EXPERT: usize = 1;
     pub const EXPERT_SUBSET: usize = 2;
 }
 
-/// Enumerates Charset IDs defined in the Adobe Technical Note #5176, Table 16.
 mod encoding_id {
     pub const STANDARD: usize = 0;
     pub const EXPERT: usize = 1;
@@ -306,7 +297,6 @@ fn parse_font_dict(data: &[u8]) -> Option<Range<usize>> {
     None
 }
 
-/// Resolves local subroutines for a glyph in a CID font.
 fn parse_cid_local_subrs<'a>(
     data: &'a [u8],
     glyph_id: GlyphId,

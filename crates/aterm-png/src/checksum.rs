@@ -1,24 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The two checksums PNG carries: CRC-32 (ISO-HDLC) over every chunk, and
-//! Adler-32 over the zlib stream the IDAT chunks concatenate into. A chunk
-//! whose CRC does not match is corruption a decoder must not act on.
+//! CRC-32 (ISO-HDLC) and Adler-32 checksums for PNG chunks and zlib streams.
 
 use astream_wire::hash::crc32_ieee_update;
 
-/// CRC-32/ISO-HDLC (the polynomial PNG specifies, reflected form `0xEDB8_8320`)
-/// as a running value over astream-wire's `hash::crc32_ieee_update`.
-///
-/// astream-wire builds the eight slicing-by-8 tables at compile time from the
-/// polynomial (no first-use init, no probe per chunk), with every table index
-/// proved in bounds by its `u8` type and the result pinned to the `0xCBF4_3926`
-/// check value and a bitwise reference there. It is the CRC astream frames
-/// every record with and `aterm_codec::crc32` wraps for gzip.
-///
-/// astream's running value is the finished CRC of the bytes so far: it starts
-/// at `0` (the CRC of nothing) and inverts in and out on every call, so there
-/// is no seed to apply here and none to strip in [`Crc32::finish`].
+/// Running CRC-32/ISO-HDLC checksum over `astream_wire::hash::crc32_ieee_update`.
 pub(crate) struct Crc32(u32);
 
 impl Crc32 {
@@ -51,21 +38,13 @@ impl Crc32 {
     }
 }
 
-/// Adler-32 (RFC 1950 §9), the zlib stream's trailing checksum, folded as the
-/// stream's input arrives.
-///
-/// `65521` is the largest prime below 2^16, and the running sums are reduced
-/// every `NMAX` bytes — the largest run for which the unreduced `b` accumulator
-/// provably cannot overflow `u32`. Both sums are reduced at the end of every
-/// [`Adler32::update`], so a split anywhere folds to the same value.
+/// Running Adler-32 checksum (RFC 1950 §9).
 pub(crate) struct Adler32 {
     a: u32,
     b: u32,
 }
 
-/// The RFC's own bound on how far the sums may run before reduction.
 const NMAX: usize = 5552;
-/// The Adler-32 modulus.
 const BASE: u32 = 65521;
 
 impl Adler32 {
@@ -109,8 +88,6 @@ pub(crate) fn adler32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    /// Folding in pieces must equal folding in one go — the property the chunk
-    /// writer relies on when it CRCs a type tag and a body separately.
     #[test]
     fn crc32_is_associative_over_splits() {
         let data: Vec<u8> = (0u16..1000).map(|b| (b % 251) as u8).collect();
@@ -121,9 +98,6 @@ mod tests {
         }
     }
 
-    /// astream-wire's slice-by-8 against the bitwise definition at every
-    /// length 0..=64, so at every tail length mod 8, through this wrapper. The
-    /// reference shares nothing with the tables.
     #[test]
     fn slicing_agrees_with_the_byte_at_a_time_definition_at_every_alignment() {
         fn reference(bytes: &[u8]) -> u32 {
@@ -154,13 +128,6 @@ mod tests {
         }
     }
 
-    /// The conformance check on the borrowed fold: the CRC-32 check value, the
-    /// empty CRC, and the CRC every PNG ends with (IEND's, over its type tag
-    /// alone: `AE 42 60 82`). `of` folds through `new`, `update` and `finish`,
-    /// so a wrapper that kept the old register convention (seed `0xFFFF_FFFF`,
-    /// `finish` XORing it back out) fails these. Negative control on the
-    /// assertions themselves: the same wrapper holding the register seed
-    /// finishes to another CRC, so the starting state is something they see.
     #[test]
     fn crc32_known_answers_and_the_seed_convention() {
         assert_eq!(Crc32::of(&[b"123456789"]), 0xCBF4_3926);
@@ -172,14 +139,11 @@ mod tests {
         assert_ne!(register_seeded.finish(), 0xAE42_6082);
     }
 
-    /// RFC 1950's own example plus the empty case (`1`, not `0`).
     #[test]
     fn adler32_check_vectors() {
         assert_eq!(adler32(b""), 1);
         assert_eq!(adler32(b"Wikipedia"), 0x11E6_0398);
-        // Long enough to cross the NMAX reduction boundary more than once.
         let long: Vec<u8> = (0..20_000u32).map(|i| (i % 256) as u8).collect();
-        // Reference value computed by the straightforward per-byte definition.
         let mut a: u64 = 1;
         let mut b: u64 = 0;
         for &byte in &long {
@@ -189,9 +153,6 @@ mod tests {
         assert_eq!(u64::from(adler32(&long)), (b << 16) | a);
     }
 
-    /// Folding in pieces equals folding in one go, at splits on both sides of
-    /// the NMAX reduction boundary — the property the streaming compressor
-    /// relies on when it folds one scanline at a time.
     #[test]
     fn adler32_is_associative_over_splits() {
         let data: Vec<u8> = (0..20_000u32).map(|i| (i * 7 % 256) as u8).collect();

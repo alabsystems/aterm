@@ -25,8 +25,7 @@ fn ticks_in_ms(ms: u64) -> usize {
     (ms * HZ).div_ceil(1000) as usize
 }
 
-/// The family's worst-case fixture (tests/cursor_bench.rs, "2× retina cell
-/// metrics"), the geometry §18's ribbon numbers are stated at.
+/// Worst-case 2× retina cell-metrics fixture (`tests/cursor_bench.rs`).
 fn geometry() -> Geom {
     Geom {
         cw: 18,
@@ -41,8 +40,7 @@ fn geometry() -> Geom {
     }
 }
 
-/// The shipped-default dark rainbow kitty config, as tests/cursor_bench.rs
-/// builds it.
+/// Shipped-default dark rainbow kitty configuration.
 fn glow_config() -> GlowConfig {
     GlowConfig {
         classic_mono: false,
@@ -78,12 +76,9 @@ enum Action {
     Nav(i32),
     /// One Backspace: the caret retreats one cell.
     Backspace,
-    /// A row-band move the host replays before the tick (the band path): screen
-    /// rows `top..=bottom` moved by `delta` (Codex's inline viewport sliding
-    /// down per streamed line, its transcript archiving up).
+    /// Screen rows `top..=bottom` moved by `delta` before the tick.
     BandMove(u16, u16, i16),
-    /// A sing-along bar (§27): `n` stars fanned from the caret, with the
-    /// shockwave ring on every fourth.
+    /// Sing-along bar: `n` stars fanned from the caret, with a shockwave ring when `true`.
     Party(u8, bool),
 }
 
@@ -116,7 +111,7 @@ const PROSE: &str = "The quick brown fox jumps over the lazy dog! And keeps goin
 /// Ticks per key at 12 cps: exactly 10 at 120 Hz.
 const KEY_TICKS: usize = 10;
 
-/// §21: 12 cps prose for 3 s.
+/// 12 cps prose for 3 s.
 fn prose_12cps() -> Scenario {
     let ticks = ticks_in_ms(3_000);
     let steps = PROSE
@@ -138,7 +133,7 @@ fn prose_12cps() -> Scenario {
     }
 }
 
-/// §21: a 12 cps burst with a same-row 40-cell nav meteor every 500 ms.
+/// 12 cps burst with a same-row 40-cell nav meteor every 500 ms.
 fn burst_with_nav_meteor() -> Scenario {
     let ticks = ticks_in_ms(3_000);
     let mut steps = Vec::new();
@@ -171,9 +166,7 @@ fn burst_with_nav_meteor() -> Scenario {
     }
 }
 
-/// §21: an 80-cell Ctrl-A / Ctrl-E ping-pong, a fresh flight every 200 ms, so
-/// each lands (T = 120 ms) with its train still fading when the next retires it
-/// (§6.9).
+/// 80-cell Ctrl-A / Ctrl-E ping-pong every 200 ms.
 fn ctrl_e_ping_pong() -> Scenario {
     let ticks = ticks_in_ms(3_000);
     let every = ticks_in_ms(200);
@@ -194,8 +187,7 @@ fn ctrl_e_ping_pong() -> Scenario {
     }
 }
 
-/// §21: a held Backspace at the macOS repeat rate (30/s) over a 60-cell line
-/// laid at 12 cps first; only the hold is measured.
+/// Held Backspace at 30/s over a 60-cell line laid at 12 cps; only the hold is measured.
 fn held_backspace() -> Scenario {
     let lay_keys = 60usize;
     let lay_ticks = lay_keys * KEY_TICKS;
@@ -227,8 +219,7 @@ fn held_backspace() -> Scenario {
     }
 }
 
-/// §27, Codex: 12 cps prose into the composer while the program streams an
-/// answer.
+/// 12 cps prose into the composer while the viewport slides and then pins.
 fn codex_streaming_12cps() -> Scenario {
     let ticks = ticks_in_ms(3_000);
     let bottom = geometry().rows as u16 - 1;
@@ -269,9 +260,7 @@ fn codex_streaming_12cps() -> Scenario {
     }
 }
 
-/// §27: a held key at key-repeat cadence (which arms the sing-along) with a bar
-/// on every bar boundary, the ring on every fourth, the fan widening as
-/// `kitty_sing::bar_fan` does.
+/// Held key at key-repeat cadence with a sing-along bar on every bar boundary.
 fn sing_along_bars() -> Scenario {
     let ticks = ticks_in_ms(3_000);
     let repeat_ticks = ticks_in_ms(30).max(1);
@@ -373,15 +362,13 @@ trait Driver {
     fn idle_probe(&self, now: Instant) -> IdleProbe;
     /// The streams the last tick wrote: `(under, out, halos)`.
     fn streams(&self) -> (&[GlowQuad], &[GlowQuad], &[RainHalo]);
-    /// Rows handed to the content witness over this driver's life, the
-    /// non-vacuity check for the seam.
+    /// Rows handed to the content witness over this driver's life.
     fn witness_feeds(&self) -> u64 {
         0
     }
     /// The warm-up is over: the passes from here on are the measured ones.
     fn begin_measured_pass(&mut self) {}
-    /// Frames on which the driver withheld a row the witness asked for,
-    /// over its life — the non-vacuity witness for the withheld path.
+    /// Frames on which the driver withheld a row the witness asked for.
     fn withheld_frames(&self) -> u64 {
         0
     }
@@ -416,14 +403,12 @@ fn replica_fingerprint(under: &[GlowQuad], out: &[GlowQuad], halos: &[RainHalo])
     h | 1
 }
 
-/// The v2 engine plus the host scratch it borrows (`Frame` is borrowed host
-/// scratch by contract, which makes the zero-alloc claim testable).
+/// The v2 engine plus borrowed host scratch.
 struct V2 {
     eng: Engine,
     cfg: Config,
     geom: Geom,
-    /// A blank probe row minted once: the host re-probes the caret's rows after
-    /// every band move (the band path drops the sky's probe) without allocating.
+    /// Blank probe row reused across band moves without allocating.
     blank: Vec<bool>,
     under: Vec<GlowQuad>,
     out: Vec<GlowQuad>,
@@ -564,8 +549,7 @@ impl Driver for V2 {
     }
 }
 
-/// `CursorGlow` in the `RainbowKitty` style, v2 through the real seam in `CursorGlow::tick`: the
-/// cost of a typed key to the host.
+/// `CursorGlow` in the `RainbowKitty` style driven through `CursorGlow::tick`.
 struct Host {
     glow: CursorGlow,
     cfg: GlowConfig,
@@ -576,10 +560,7 @@ struct Host {
     /// each tick.
     witness_row: Vec<char>,
     witness_feeds: u64,
-    /// After warm-up, every [`WITHHOLD_EVERY`]th frame withholds one asked-for
-    /// row (the first that is not the caret's, as the composed host drops its
-    /// second read), so the walk scans the records beside it
-    /// (`Witness::find_deferred_runs`).
+    /// Whether every [`WITHHOLD_EVERY`]th frame withholds one non-caret row.
     withhold: bool,
     frames: u64,
     withheld_frames: u64,
@@ -694,17 +675,13 @@ impl Driver for Host {
     }
 }
 
-/// Idle run-out ceiling after the last gesture; every v2 life is shorter
-/// (meteor `T + FLIGHT_OFF_GLASS_MS`, star ≤ 460 ms, the ribbon swoosh
-/// `SWOOSH_TOTAL_S`).
+/// Idle run-out ceiling after the last gesture.
 const IDLE_CEILING_MS: u64 = 2_500;
 
-/// The §18 stream caps, restated because a `tests/` target cannot see the
-/// private `CursorGlow::MAX_QUADS` / `MAX_HALOS`.
+/// Stream caps matching `CursorGlow::MAX_QUADS` and `MAX_HALOS`.
 const MAX_QUADS: usize = 16_384;
 const MAX_HALOS: usize = 512;
-/// The host's polyline scratch: the ring's 49 vertices or the hot edge's
-/// handful, never more than a few hundred.
+/// Host polyline scratch capacity.
 const HOST_BEAM_SCRATCH: usize = 512;
 /// The host's cue sink: a frame mints a handful of cues at most.
 const HOST_CUE_SCRATCH: usize = 64;
@@ -730,8 +707,7 @@ pub(crate) struct Report {
     us: Vec<u64>,
     /// The replica fingerprint fold's own µs per measured tick.
     fp_us: Vec<u64>,
-    /// Device pixels covered by the `out` (over-ink) stream per measured tick,
-    /// which the host's §3.4 ledger prices per pixel.
+    /// Device pixels covered by the `out` (over-ink) stream per measured tick.
     out_px: Vec<u64>,
     quads_max: usize,
     under_max: usize,
@@ -782,8 +758,7 @@ impl Report {
     }
 }
 
-/// One pass of the script through `d` from `t0`. `measured` turns on timers and
-/// the allocation counter.
+/// Run one pass of `sc` through `d` from `t0`, timing and counting allocations when `measured`.
 fn run(d: &mut dyn Driver, sc: &Scenario, t0: Instant, measured: bool) -> (Report, Instant) {
     let mut rep = Report::default();
     let n_measured = sc.ticks.saturating_sub(sc.measure_from);
@@ -902,10 +877,7 @@ fn run(d: &mut dyn Driver, sc: &Scenario, t0: Instant, measured: bool) -> (Repor
     (rep, now)
 }
 
-/// Warm-up passes before the measured one, at most. The cold pass grows every
-/// demand-grown pool and a second can still grow the ribbon, so the gate
-/// measures after a pass that allocated nothing: a failure is a per-frame
-/// allocation, not one-time growth.
+/// Maximum warm-up passes before the measured pass.
 const WARMUP_PASSES_MAX: usize = 3;
 
 /// Warm the driver until a whole pass (script + idle run-out) allocates
@@ -1010,9 +982,7 @@ fn print_allocs(sc: &Scenario, r: &Report) {
     }
 }
 
-/// §18's deterministic laws, every run: zero allocation on every steady and
-/// idle frame, idle → exactly zero within [`IDLE_CEILING_MS`], the stream caps,
-/// and a live fixture.
+/// Verify zero steady/idle allocations, idle-to-zero within [`IDLE_CEILING_MS`], and stream caps.
 #[test]
 fn rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero() {
     assert_counter_is_per_thread();

@@ -117,7 +117,7 @@ impl Git {
         account: &str,
         token: &Secret,
     ) -> Result<(), String> {
-        let mut input = request(host, account)?;
+        let mut input = request(host, Some(account))?;
         input.extend_from_slice(b"password=");
         input.extend_from_slice(token.bytes());
         input.extend_from_slice(b"\n\n");
@@ -152,9 +152,45 @@ impl Git {
         host: &str,
         account: &str,
     ) -> Result<Option<Secret>, String> {
+        self.fill_by(sys, &self.credential(user, "fill"), host, Some(account))
+    }
+
+    /// [`Self::fill`] through every helper the account's configuration names, as git's own
+    /// lookups go, rather than this one's helper alone, and asked as a clone asks, with no
+    /// account (git adds one a `credential.username` names): what a clone of a repository at
+    /// `host` gets when every one is asked alike ([`Self::uniform`]); the secrets vault's helper
+    /// reads the synced token itself. A helper that would ask in a window is told not to
+    /// (`GCM_INTERACTIVE=never`, Git Credential Manager's switch), as git's prompt is.
+    /// # Errors
+    /// As [`Self::fill`].
+    pub(crate) fn fill_as_configured(
+        &self,
+        sys: &dyn System,
+        user: Option<&User>,
+        host: &str,
+    ) -> Result<Option<Secret>, String> {
+        self.fill_by(sys, &self.as_configured(user), host, None)
+    }
+
+    /// The `git credential fill` [`Self::fill_as_configured`] runs.
+    fn as_configured(&self, user: Option<&User>) -> Cmd {
+        self.cmd(user)
+            .env("GCM_INTERACTIVE", "never")
+            .args(["credential", "fill"])
+    }
+
+    /// The token `cmd`, a `git credential fill`, hands back at `host`, for `account` when one
+    /// is named.
+    fn fill_by(
+        &self,
+        sys: &dyn System,
+        cmd: &Cmd,
+        host: &str,
+        account: Option<&str>,
+    ) -> Result<Option<Secret>, String> {
         let mut input = request(host, account)?;
         input.push(b'\n');
-        let result = sys.run_complete_stdout_input(&self.credential(user, "fill"), &input);
+        let result = sys.run_complete_stdout_input(cmd, &input);
         scrub(&mut input);
         let mut ran = result
             .map_err(|_| "git credential fill did not complete (output withheld)".to_owned())?;
@@ -188,6 +224,31 @@ impl Git {
         user: &User,
         account: &str,
     ) -> Result<Lookups, String> {
+        self.judged(sys, user, |every, conditional| {
+            judge(&self.helper, account, every, conditional)
+        })
+    }
+
+    /// Whether git asks alike for every github.com repository a clone names, so that one
+    /// host-wide fill ([`Self::fill_as_configured`]) gets what each clone gets: no credential
+    /// setting that applies to some lookups only (a URL naming a user or a path under the host,
+    /// or a file a conditional include names), and `useHttpPath` not on, which makes each
+    /// clone ask for its own repository.
+    /// # Errors
+    /// As [`Self::configured`].
+    pub(crate) fn uniform(&self, sys: &dyn System, user: &User) -> Result<Lookups, String> {
+        self.judged(sys, user, alike)
+    }
+
+    /// `judge` of the github.com credential settings of every file git reads as `user`, in its
+    /// order, and of each file a conditional include names; an include that cannot be read
+    /// whole is `Not` ready.
+    fn judged(
+        &self,
+        sys: &dyn System,
+        user: &User,
+        judge: impl FnOnce(&[Setting], &[Setting]) -> Lookups,
+    ) -> Result<Lookups, String> {
         let every = self.settings(sys, user, None)?;
         let mut named = BTreeSet::new();
         let mut pending = Vec::new();
@@ -202,7 +263,7 @@ impl Git {
             }
             conditional.extend(read);
         }
-        Ok(judge(&self.helper, account, &every, &conditional))
+        Ok(judge(&every, &conditional))
     }
 
     /// The settings [`SETTINGS`] names, read as `user`, each with the file it is in: from
@@ -384,41 +445,66 @@ fn scope(url: Option<&str>) -> Scope {
     let Some(url) = url else {
         return Scope::Every;
     };
-    let rest = match url.split_once("://") {
-        Some((scheme, _)) if !scheme.is_empty() && !scheme.eq_ignore_ascii_case("https") => {
-            return Scope::Never;
-        }
-        Some((_, rest)) => rest,
-        None => url,
-    };
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
     let (authority, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
     let (user, address) = match authority.rsplit_once('@') {
         Some((user, address)) => (Some(user), address),
         None => (None, authority),
     };
-    let host = match address.rsplit_once(':') {
-        Some((_, port)) if !port.is_empty() && port.trim_start_matches('0') != "443" => {
-            return Scope::Never;
-        }
-        Some((host, _)) => host,
-        None => address,
+    // git normalizes a key with a scheme and a host it can spell (no `%` escape), and
+    // compares any other key as a partial URL. A normalized key's path keeps its slashes and
+    // is matched as a prefix of the lookup's (`//` matches only a lookup with no path); a
+    // partial key's path loses its leading and trailing ones.
+    let normalized = !scheme.is_empty() && !address.is_empty() && !address.contains('%');
+    let (github, whole_host) = if normalized {
+        (normalized_github(scheme, address), matches!(path, "" | "/"))
+    } else {
+        (
+            partial_github(scheme, address),
+            path.trim_matches('/').is_empty(),
+        )
     };
-    let host = percent_decoded(host);
-    let labels = GITHUB.split('.');
-    if !host.is_empty()
-        && (host.split('.').count() != labels.clone().count()
-            || !host
-                .split('.')
-                .zip(labels)
-                .all(|(have, want)| have == "*" || have.eq_ignore_ascii_case(want)))
-    {
-        return Scope::Never;
-    }
-    if user.is_some() || !path.trim_matches('/').is_empty() {
+    if !github {
+        Scope::Never
+    } else if user.is_some() || !whole_host {
         Scope::Part
     } else {
         Scope::Every
     }
+}
+
+/// Whether a key git normalizes names github.com over https: the scheme and host in any
+/// case, a `*` label for any label, the default port, and one trailing dot dropped from the
+/// host unless nothing would be left.
+fn normalized_github(scheme: &str, address: &str) -> bool {
+    if !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let host = match address.rsplit_once(':') {
+        Some((_, port)) if !port.is_empty() && port.trim_start_matches('0') != "443" => {
+            return false;
+        }
+        Some((host, _)) => host,
+        None => address,
+    };
+    let host = match host.strip_suffix('.') {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => host,
+    };
+    let labels = GITHUB.split('.');
+    host.split('.').count() == labels.clone().count()
+        && host
+            .split('.')
+            .zip(labels)
+            .all(|(have, want)| have == "*" || have.eq_ignore_ascii_case(want))
+}
+
+/// Whether a partial key names github.com over https as git compares one, byte for byte: a
+/// scheme, if any, spelled `https`, and a host, if any, that decodes to `github.com` (a port
+/// is part of the host).
+fn partial_github(scheme: &str, address: &str) -> bool {
+    (scheme.is_empty() || scheme == "https")
+        && (address.is_empty() || percent_decoded(address) == GITHUB)
 }
 
 /// `text` with each `%XX` escape decoded (git decodes a URL's host before matching it); an
@@ -539,19 +625,61 @@ fn judge(helper: &str, account: &str, every: &[Setting], conditional: &[Setting]
     Lookups::Ready
 }
 
-/// The fields a credential request names. An account or host that could add a field (a
-/// newline, `=`) is refused before git runs.
-fn request(host: &str, account: &str) -> Result<Vec<u8>, String> {
+/// Whether git asks alike for every github.com lookup ([`Git::uniform`]), given the settings
+/// of every file git reads, in its order (the last `useHttpPath` wins), and of the files
+/// conditional includes name.
+fn alike(every: &[Setting], conditional: &[Setting]) -> Lookups {
+    let mut use_path = None;
+    for setting in every {
+        match relevant(setting) {
+            None | Some((Scope::Never, _)) => {}
+            Some((Scope::Part, _)) => {
+                return Lookups::Not(format!(
+                    "{} applies to some github.com lookups",
+                    setting.named()
+                ));
+            }
+            Some((Scope::Every, "usehttppath")) => use_path = Some(setting),
+            Some((Scope::Every, _)) => {}
+        }
+    }
+    if let Some(setting) = conditional
+        .iter()
+        .find(|setting| relevant(setting).is_some_and(|(scope, _)| scope != Scope::Never))
+    {
+        return Lookups::Not(format!(
+            "{} is in a file a conditional include names",
+            setting.named()
+        ));
+    }
+    match use_path {
+        Some(setting) if setting.value.as_deref().map_or(Some(true), boolean) != Some(false) => {
+            Lookups::Not(format!(
+                "{} asks for a credential per repository",
+                setting.named()
+            ))
+        }
+        _ => Lookups::Ready,
+    }
+}
+
+/// The fields a credential request names, an account among them when one is given. An
+/// account or host that could add a field (a newline, `=`) is refused before git runs.
+fn request(host: &str, account: Option<&str>) -> Result<Vec<u8>, String> {
     let field = |value: &str| {
         !value.is_empty()
             && value
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
     };
-    if !field(host) || !field(account) {
+    if !field(host) || !account.is_none_or(field) {
         return Err("a GitHub credential names a host and a login".into());
     }
-    Ok(format!("protocol=https\nhost={host}\nusername={account}\n").into_bytes())
+    let mut fields = format!("protocol=https\nhost={host}\n");
+    if let Some(account) = account {
+        fields.push_str(&format!("username={account}\n"));
+    }
+    Ok(fields.into_bytes())
 }
 
 fn scrub(bytes: &mut [u8]) {
@@ -660,6 +788,34 @@ pub(crate) mod script {
         );
     }
 
+    /// git's settings as the secrets vault's `~/.config/git/config` leaves them: CLT's own
+    /// helper, reset for github.com, then the vault's helper and the keychain after it, the
+    /// same for every repository ([`Git::uniform`]).
+    pub(crate) fn alike(sys: &Fake, user: &User) {
+        let xdg = format!("{}/.config/git/config", user.home);
+        let helper = HELPER.to_ascii_lowercase();
+        sys.on(
+            &helpers(user),
+            Ran::ok(&printed(&[
+                (CLT_CONFIG, "credential.helper", "osxkeychain"),
+                (&xdg, &helper, ""),
+                (&xdg, &helper, "!f() { :; }; f"),
+                (&xdg, &helper, "osxkeychain"),
+            ])),
+        );
+    }
+
+    /// A `fill` through every helper `user`'s configuration names that hands back `token` for
+    /// `account` at `host` ([`Git::fill_as_configured`]).
+    pub(crate) fn lookups_hold(sys: &Fake, user: &User, host: &str, account: &str, token: &str) {
+        sys.on(
+            &Git::keychain().as_configured(Some(user)).display(),
+            Ran::ok(&format!(
+                "protocol=https\nhost={host}\nusername={account}\npassword={token}\n"
+            )),
+        );
+    }
+
     /// A `fill` the helper has nothing for: git's disabled prompt.
     pub(crate) fn holds_nothing(sys: &Fake, user: Option<&User>) {
         sys.on(
@@ -707,17 +863,37 @@ mod tests {
             (Some("https://github.com:443"), Scope::Every),
             (Some("https://github.com:"), Scope::Every),
             (Some("https://%67ithub.com"), Scope::Every),
+            (Some("https://github.com."), Scope::Every),
+            (Some("https://GITHUB.COM."), Scope::Every),
+            (Some("https://github.com.:443"), Scope::Every),
+            (Some("HTTPS://github.com."), Scope::Every),
+            (Some("https://github.com.:0443"), Scope::Every),
+            (Some("https://github.com.:"), Scope::Every),
+            (Some("https://*.*."), Scope::Every),
+            (Some("https://%67ithub.com/"), Scope::Every),
             (Some("github.com"), Scope::Every),
+            (Some("github.com/"), Scope::Every),
+            (Some("github.com//"), Scope::Every),
+            (Some("https://%67ithub.com//"), Scope::Every),
             (Some("://github.com"), Scope::Every),
             (Some("https://"), Scope::Every),
+            (Some("://"), Scope::Every),
             (Some(""), Scope::Every),
             (Some("https://bot@github.com"), Scope::Part),
             (Some("https://bot:pw@github.com"), Scope::Part),
             (Some("https://github.com/owner"), Scope::Part),
             (Some("https://github.com?x"), Scope::Part),
+            (Some("https://github.com./owner"), Scope::Part),
+            (Some("https://github.com.:443/owner"), Scope::Part),
+            (Some("https://*.com./owner"), Scope::Part),
             (Some("github.com/owner/repo.git"), Scope::Part),
             (Some("bot@github.com"), Scope::Part),
+            (Some("https://bot@%67ithub.com"), Scope::Part),
             (Some("/owner"), Scope::Part),
+            (Some("https:///owner"), Scope::Part),
+            (Some("https://github.com//"), Scope::Part),
+            (Some("HTTPS://GITHUB.COM.:443//"), Scope::Part),
+            (Some("https://github.com///"), Scope::Part),
             (Some("http://github.com"), Scope::Never),
             (Some("ssh://github.com"), Scope::Never),
             (Some("https://github.com:8443"), Scope::Never),
@@ -725,9 +901,31 @@ mod tests {
             (Some("https://gist.github.com"), Scope::Never),
             (Some("https://github.com.example.invalid"), Scope::Never),
             (Some("https://github.co"), Scope::Never),
+            (Some("https://github.com../owner"), Scope::Never),
+            (Some("https://github.com%2E"), Scope::Never),
+            (Some("https://."), Scope::Never),
+            (Some("https://./owner"), Scope::Never),
             (Some("https://*"), Scope::Never),
             (Some("https://[::1]"), Scope::Never),
             (Some("example.invalid"), Scope::Never),
+            (Some("github.com."), Scope::Never),
+            (Some("github.com./owner"), Scope::Never),
+            (Some("bot@github.com."), Scope::Never),
+            (Some("GITHUB.COM"), Scope::Never),
+            (Some("*.com"), Scope::Never),
+            (Some("github.com:443"), Scope::Never),
+            (Some("github.com:"), Scope::Never),
+            (Some("://github.com."), Scope::Never),
+            (Some("://GITHUB.COM"), Scope::Never),
+            (Some("https://%47ITHUB.COM"), Scope::Never),
+            (Some("HTTPS://%67ithub.com"), Scope::Never),
+            (Some("https://%67ithub.com:443"), Scope::Never),
+            (Some("https://%67ithub.com."), Scope::Never),
+            (Some("https://*.%63om"), Scope::Never),
+            (Some("https://%2a.com"), Scope::Never),
+            (Some("https://github.com:443."), Scope::Never),
+            (Some("HTTPS://"), Scope::Never),
+            (Some("http://"), Scope::Never),
         ] {
             assert_eq!(scope(url), want, "{url:?}");
         }
@@ -1185,6 +1383,18 @@ mod tests {
             ("the default port", section(" \"https://github.com:443\""), None),
             ("a user", section(" \"https://bot@github.com\""), None),
             ("a path", section(" \"https://github.com/owner\""), None),
+            ("a trailing-dot host", section(" \"https://github.com.\""), None),
+            ("a %-escaped host", section(" \"https://%67ithub.com\""), None),
+            (
+                "a path under a trailing-dot host",
+                section(" \"https://github.com./owner\""),
+                None,
+            ),
+            (
+                "control: two trailing dots",
+                section(" \"https://github.com../owner\""),
+                None,
+            ),
             (
                 "a later account",
                 "[credential]\n\tusername = other\n".to_owned(),
@@ -1204,6 +1414,31 @@ mod tests {
             ("control: another scheme", section(" \"http://github.com\""), None),
             ("control: another port", section(" \"https://github.com:8443\""), None),
             ("control: another host", section(" \"https://gist.github.com\""), None),
+            (
+                "control: a partial URL with a trailing dot",
+                section(" \"github.com.\""),
+                None,
+            ),
+            (
+                "control: a partial URL in another case",
+                section(" \"GITHUB.COM\""),
+                None,
+            ),
+            (
+                "control: a partial URL with the default port",
+                section(" \"github.com:443\""),
+                None,
+            ),
+            (
+                "control: a %-escaped host with a trailing dot",
+                section(" \"https://%67ithub.com.\""),
+                None,
+            ),
+            (
+                "control: a %-escaped host under another case of scheme",
+                section(" \"HTTPS://%67ithub.com\""),
+                None,
+            ),
             (
                 "control: an include holding no credential setting",
                 "[includeIf \"hasconfig:remote.*.url:https://github.com/**\"]\n\tpath = github.inc\n"
@@ -1260,5 +1495,159 @@ mod tests {
         let sys = Fake::default();
         sys.on(&cmd.display(), Ran::ok("username=alice\npassword=one\n"));
         assert_eq!(fill(&sys).unwrap().unwrap().bytes(), b"one");
+    }
+
+    /// A fill as configured runs no helper of this one's: git asks the account's own, and a
+    /// helper that would ask in a window is told not to.
+    #[test]
+    fn lookups_as_configured_name_no_helper_of_their_own() {
+        assert_eq!(
+            Git::keychain().as_configured(Some(&alice())).display(),
+            "alice$ GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= GCM_INTERACTIVE=never /Library/Developer/CommandLineTools/usr/bin/git credential fill"
+        );
+    }
+
+    /// The settings that make some github.com lookups ask otherwise than one host-wide fill:
+    /// a setting for a user or a path under the host, one in a file a conditional include
+    /// names, and `useHttpPath` on (the last wins; no value is on). Helpers, accounts and
+    /// other hosts do not.
+    #[test]
+    fn lookups_are_alike_unless_a_setting_asks_for_some_repositories_otherwise() {
+        type Listed<'a> = &'a [(&'a str, Option<&'a str>)];
+        let vault: Listed = &[
+            ("credential.helper", Some("osxkeychain")),
+            ("credential.https://github.com.helper", Some("")),
+            (
+                "credential.https://github.com.helper",
+                Some("!f() { :; }; f"),
+            ),
+            ("credential.https://github.com.helper", Some("osxkeychain")),
+            ("credential.https://github.com.username", Some("bot")),
+            (
+                "credential.https://example.invalid/owner.helper",
+                Some("store"),
+            ),
+            ("credential.usehttppath", Some("true")),
+            ("credential.https://github.com.usehttppath", Some("false")),
+        ];
+        assert_eq!(alike(&listed(vault), &[]), Lookups::Ready);
+        let cases: [(Listed, Listed, &str); 7] = [
+            (
+                &[("credential.https://github.com/owner.helper", Some("store"))],
+                &[],
+                "credential.https://github.com/owner.helper in /f applies to some github.com lookups",
+            ),
+            (
+                &[("credential.https://bot@github.com.username", Some("bot"))],
+                &[],
+                "credential.https://<user>@github.com.username in /f applies to some github.com lookups",
+            ),
+            (
+                &[("credential.usehttppath", Some("true"))],
+                &[],
+                "credential.usehttppath in /f asks for a credential per repository",
+            ),
+            (
+                &[("credential.https://github.com.usehttppath", None)],
+                &[],
+                "credential.https://github.com.usehttppath in /f asks for a credential per repository",
+            ),
+            (
+                &[
+                    ("credential.usehttppath", Some("true")),
+                    ("credential.github.com..usehttppath", Some("false")),
+                ],
+                &[],
+                "credential.usehttppath in /f asks for a credential per repository",
+            ),
+            (
+                &[("credential.https://github.com//.helper", Some("store"))],
+                &[],
+                "credential.https://github.com//.helper in /f applies to some github.com lookups",
+            ),
+            (
+                &[],
+                &[("credential.helper", Some("store"))],
+                "credential.helper in /f is in a file a conditional include names",
+            ),
+        ];
+        for (every, conditional, reason) in cases {
+            let mut with = vault.to_vec();
+            with.extend_from_slice(every);
+            assert_eq!(
+                alike(&listed(&with), &listed(conditional)),
+                Lookups::Not(reason.into())
+            );
+        }
+    }
+
+    /// The real CLT git, in a scratch HOME with no system configuration, answers a fill as
+    /// configured from the helper the account's XDG file names (the secrets vault's: a reset,
+    /// then a helper that answers only a request naming no account, as a clone's names none),
+    /// which is what a clone's own request gets; a setting for a path under the host makes the
+    /// lookups not alike.
+    #[test]
+    fn lookups_as_configured_reach_the_accounts_own_helpers_as_a_clone_does() {
+        crate::items::github::need_clt_git();
+        let live = Live::new();
+        let mut scratch = Scratch::new(&live, "git-lookups-test").unwrap();
+        let home = scratch.path().to_owned();
+        let mut who = user("fixture", live.euid());
+        who.home = home.to_string_lossy().into_owned();
+        let xdg = home.join(".config/git");
+        std::fs::create_dir_all(&xdg).unwrap();
+        let helper = "!f() { test \"$1\" = get || return 0; u=; while IFS= read -r l && test -n \"$l\"; do case \"$l\" in username=*) u=${l#username=};; esac; done; test -z \"$u\" || return 0; echo username=bot; echo password=dummy_vault_value; }; f";
+        let config = format!(
+            "[credential \"https://github.com\"]\n\thelper =\n\thelper = \"{}\"\n",
+            helper.replace('"', "\\\"")
+        );
+        live.write_file(&xdg.join("config"), config.as_bytes(), 0o600)
+            .unwrap();
+        let git = Git::isolated("store --file=/dev/null");
+        let filled = git.fill_as_configured(&live, Some(&who), GITHUB).unwrap();
+        assert!(
+            filled.is_some_and(|token| token.bytes() == b"dummy_vault_value"),
+            "the account's own helper answers (value withheld: a regression could reach a real one)"
+        );
+        assert_eq!(git.uniform(&live, &who).unwrap(), Lookups::Ready);
+        let clone = live
+            .run_complete_stdout_input(
+                &git.cmd(Some(&who)).args(["credential", "fill"]),
+                b"url=https://github.com/owner/repo.git\n\n",
+            )
+            .unwrap();
+        assert!(
+            clone.success() && clone.out().contains("password=dummy_vault_value"),
+            "a clone's request gets the same"
+        );
+        for url in ["https://github.com/owner", "https://github.com./owner"] {
+            let scoped = format!("{config}[credential \"{url}\"]\n\tusername = other\n");
+            live.write_file(&xdg.join("config"), scoped.as_bytes(), 0o600)
+                .unwrap();
+            assert!(!git.uniform(&live, &who).unwrap().ready(), "{url}");
+        }
+        // A helper under `//` answers git's host-wide lookup and not a clone's.
+        let doubled = format!(
+            "{config}[credential \"https://github.com//\"]\n\thelper =\n\thelper = \"!f() {{ echo username=bot; echo password=dummy_other_value; }}; f\"\n"
+        );
+        live.write_file(&xdg.join("config"), doubled.as_bytes(), 0o600)
+            .unwrap();
+        let probe = git.fill_as_configured(&live, Some(&who), GITHUB).unwrap();
+        assert!(
+            probe.is_some_and(|token| token.bytes() == b"dummy_other_value"),
+            "the doubled-slash helper answers the host-wide lookup"
+        );
+        let clone = live
+            .run_complete_stdout_input(
+                &git.cmd(Some(&who)).args(["credential", "fill"]),
+                b"url=https://github.com/owner/repo.git\n\n",
+            )
+            .unwrap();
+        assert!(
+            clone.success() && clone.out().contains("password=dummy_vault_value"),
+            "a clone's request still reaches the account's helper"
+        );
+        assert!(!git.uniform(&live, &who).unwrap().ready());
+        scratch.close().unwrap();
     }
 }

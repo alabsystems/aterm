@@ -539,6 +539,19 @@ pub(crate) fn crown_glow_present(input: &RenderInput) -> bool {
         || input.fx_layers.iter().any(|l| l.bloom)
 }
 
+/// Whether every Exact Under layer of a frame draws only opaque pixels
+/// ([`FxContent::draws_opaque`]): such light stores the same byte through
+/// the sRGB view as the Unorm `over` law does (an alpha-255 `over` is a
+/// store), so route (1) of the pass economy may draw it in the base pass.
+#[inline]
+pub(crate) fn under_draws_opaque(input: &RenderInput) -> bool {
+    input
+        .fx_layers
+        .iter()
+        .filter(|l| FxStream::of(l.slot, l.blend) == Some(FxStream::Under))
+        .all(|l| l.content.draws_opaque())
+}
+
 /// The item a [`FxBuild`] is slicing.
 #[derive(Clone, Copy)]
 struct FxCur {

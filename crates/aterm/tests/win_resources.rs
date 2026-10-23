@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Static guards on the Win32 resources `build.rs` links into the shipped exe.
-//!
-//! They run on every platform: the inputs are two committed files (`assets/aterm.manifest`
-//! and aterm-gui's `.ico`), a macOS-only contributor can break them as easily as a Windows
-//! one, and the failure is invisible until someone launches the built binary on Windows.
-//!
-//! They cannot check that a resource compiler was present and the `.rsrc` section landed:
-//! that is a property of the built PE, which `build.rs` covers with a loud banner and the
-//! opt-in `ATERM_REQUIRE_WIN_RESOURCES=1` hard failure.
+//! Static guards on the Win32 resources `build.rs` links into the shipped executable.
 
 use std::path::PathBuf;
 
@@ -22,9 +14,6 @@ fn manifest_text() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
-/// The manifest with every `<!-- … -->` removed: the file's own comments discuss elements
-/// some assertions require to be absent (`<dpiAware>` above all), so raw text could satisfy,
-/// or falsely fail, a check about real markup.
 fn manifest_markup() -> String {
     let raw = manifest_text();
     let mut out = String::with_capacity(raw.len());
@@ -33,7 +22,6 @@ fn manifest_markup() -> String {
         out.push_str(&rest[..open]);
         match rest[open..].find("-->") {
             Some(close) => rest = &rest[open + close + 3..],
-            // Unterminated comment: the SxS parser would reject the whole manifest at load.
             None => panic!("aterm.manifest has an unterminated XML comment"),
         }
     }
@@ -41,10 +29,6 @@ fn manifest_markup() -> String {
     out
 }
 
-/// Common-Controls v6 is the entry with consequences beyond looks: without it the
-/// process binds comctl32 v5, every `MessageBoxW` draws classic grey 3D buttons,
-/// and `TaskDialogIndirect` (aterm's task-modal confirm) does not exist in the
-/// loaded DLL at all.
 #[test]
 fn manifest_binds_common_controls_v6() {
     let m = manifest_markup();
@@ -62,9 +46,6 @@ fn manifest_binds_common_controls_v6() {
     );
 }
 
-/// `longPathAware` and `activeCodePage` are the two process-wide settings a
-/// terminal actually feels: MAX_PATH on every cwd/OSC-7/drag-drop path, and the
-/// ANSI codepage under a UTF-8 application.
 #[test]
 fn manifest_declares_windows_settings() {
     let m = manifest_markup();
@@ -86,8 +67,6 @@ fn manifest_declares_windows_settings() {
     );
 }
 
-/// The Windows 10/11 GUID is the load-bearing one: without it the OS applies
-/// pre-Win10 compatibility shims and, in particular, ignores `activeCodePage`.
 #[test]
 fn manifest_declares_supported_os() {
     let m = manifest_markup();
@@ -102,8 +81,6 @@ fn manifest_declares_supported_os() {
     );
 }
 
-/// A terminal must never ask to elevate, and the loader's installer-detection
-/// heuristic is opt-out, not opt-in.
 #[test]
 fn manifest_requests_as_invoker() {
     assert!(
@@ -112,11 +89,6 @@ fn manifest_requests_as_invoker() {
     );
 }
 
-/// winit calls `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` itself at event-loop
-/// bring-up. A manifest DPI declaration is applied by the loader before any Rust runs, so it
-/// wins: winit's call then fails with `ERROR_ACCESS_DENIED`, which winit ignores silently.
-/// A `<dpiAware>`/`<dpiAwareness>` line here would hand the DPI mode to a file nobody checks
-/// when per-monitor DPI regresses.
 #[test]
 fn manifest_leaves_dpi_awareness_to_winit() {
     let m = manifest_markup();
@@ -128,8 +100,6 @@ fn manifest_leaves_dpi_awareness_to_winit() {
     );
 }
 
-/// `build.rs` reaches into aterm-gui for the icon rather than keeping a second copy, and a
-/// directory move breaks that quietly: the build only warns, and the exe ships blank.
 #[test]
 fn icon_the_build_script_embeds_exists_and_is_an_ico() {
     let icon = crate_dir().join("../aterm-gui/assets/aterm.ico");
@@ -139,7 +109,6 @@ fn icon_the_build_script_embeds_exists_and_is_an_ico() {
             icon.display()
         )
     });
-    // ICONDIR: reserved=0, type=1 (icon), count>=1 — all little-endian u16.
     assert!(bytes.len() > 6, "icon file is truncated");
     assert_eq!(
         &bytes[0..4],

@@ -301,8 +301,6 @@ from_number!(u8 => u64, u16 => u64, u32 => u64, u64 => u64,
              i8 => i64, i16 => i64, i32 => i64, i64 => i64,
              f32 => f64, f64 => f64);
 
-/// `Display` is compact JSON, so `format!("{value}")` is a document — the
-/// behaviour every `{data}` interpolation in this tree already relies on.
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match crate::to_string(self) {
@@ -397,8 +395,6 @@ impl<'de> Visitor<'de> for ValueVisitor {
     }
 }
 
-/// A JSON Pointer array index: decimal, no sign, and no leading zero unless the
-/// token IS `"0"`.
 fn array_index(token: &str) -> Option<usize> {
     if token.starts_with('+') || (token.starts_with('0') && token.len() != 1) {
         return None;
@@ -406,7 +402,6 @@ fn array_index(token: &str) -> Option<usize> {
     token.parse::<usize>().ok()
 }
 
-/// The immutable `value["key"]` / `value[0]` sugar.
 static NULL: Value = Value::Null;
 
 impl std::ops::Index<&str> for Value {

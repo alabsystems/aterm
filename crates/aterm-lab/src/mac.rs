@@ -30,16 +30,12 @@ pub const BENCHES: [(&str, &str); 4] = [
     ("aterm-update", "update-dmg"),
 ];
 
-/// A boot until the guest agent answers.
 const BOOT: Duration = Duration::from_secs(300);
-/// One bench in the guest: a hang detector.
 const ROW: Duration = Duration::from_secs(300);
-/// One short guest command (a copy, a status read).
 const STEP: Duration = Duration::from_secs(120);
 /// Timeout before a `~/Desktop` control read counts as parked on a consent prompt.
 const CONTROL: Duration = Duration::from_secs(15);
 
-/// The guest's view of the share.
 const GUEST_SHARE: &str = "/Volumes/My Shared Files/lane";
 const GUEST_DIR: &str = "/tmp/aterm-mac-lane";
 
@@ -78,7 +74,6 @@ pub fn cmd_mac(args: &[String]) -> Res {
     }
 }
 
-/// A lane that cannot run here: `aterm-lab: NOT RUN: <why>`, exit 3.
 fn not_run(why: impl std::fmt::Display) -> Fail {
     Fail::exit(NOT_RUN, format!("NOT RUN: {why}"))
 }
@@ -141,10 +136,9 @@ pub enum Verdict {
     NotRun,
 }
 
-/// The words a row's panic opens with when the host refused it (`aterm_uds::host::could_not_run`).
 const REFUSED_PANIC: &str = "measurement panicked: aterm-gate: COULD NOT RUN";
 
-/// A bench's report read ([`Verdict`]).
+/// Parse a bench's output into displayed lines and a [`Verdict`].
 #[must_use]
 pub fn read_report(out: &str) -> (Vec<&str>, Verdict) {
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -212,7 +206,6 @@ pub fn ended_lane_candidates(names: &str, me: i32, alive: impl Fn(i32) -> bool) 
         .collect()
 }
 
-/// The name every lane clone is made under, before its lane's pid.
 const LANE_VM: &str = "aterm-mac-dmg-";
 
 /// What tccd's log says, from its `Handling access request to <service>, from Sub:{…}` lines.
@@ -245,7 +238,7 @@ pub fn tcc_seen(log: &str) -> TccSeen {
     seen
 }
 
-/// The control's verdict.
+/// Evaluates whether the `~/Desktop` control read confirms TCC enforcement.
 pub const fn control_verdict(
     fda: bool,
     desktop_read_passed: bool,
@@ -266,7 +259,6 @@ pub const fn control_verdict(
     }
 }
 
-/// One guest, from clone to delete.
 struct Vm {
     tart: String,
     name: String,
@@ -298,7 +290,6 @@ impl Vm {
         })
     }
 
-    /// Boot it with no window, the share read-only, and wait for the guest agent.
     fn boot(&mut self) -> Result<(), Fail> {
         let log = std::fs::OpenOptions::new()
             .create(true)
@@ -335,7 +326,6 @@ impl Vm {
         )))
     }
 
-    /// Run `script` with `/bin/sh -c` in the guest, as its console user, until `limit`.
     fn exec(&self, script: &str, limit: Duration) -> Result<std::process::Output, String> {
         aterm_uds::deadline::output_until(
             aterm_uds::spawnfd::command(&self.tart)
@@ -345,7 +335,6 @@ impl Vm {
         .map_err(|e| format!("tart exec: {e}"))
     }
 
-    /// [`Vm::exec`], its stdout on success, else the failure with what it said.
     fn sh(&self, script: &str, limit: Duration) -> Result<String, Fail> {
         let out = self.exec(script, limit)?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -360,7 +349,6 @@ impl Vm {
         }
     }
 
-    /// `tart stop`, and the `tart run` it ends reaped.
     fn stop(&mut self) {
         if let Some(mut child) = self.run.take() {
             let _ = aterm_uds::spawnfd::command(&self.tart)
@@ -414,12 +402,10 @@ fn report_ended_lanes(tart: &str) {
     }
 }
 
-/// Whether `csrutil status` reports SIP enabled.
 fn sip_on(status: &str) -> bool {
     status.contains("status: enabled") && !status.contains("disabled")
 }
 
-/// Reap `child` within `limit`, killing it when it has not ended by then.
 fn reap_within(child: &mut Child, limit: Duration) {
     let start = Instant::now();
     while start.elapsed() < limit {
@@ -432,11 +418,9 @@ fn reap_within(child: &mut Child, limit: Duration) {
     let _ = child.wait();
 }
 
-/// Enable SIP via `csrutil clear` in the guest before rebooting.
 const SIP_ON: &str = "/usr/bin/expect -c 'set timeout 30; spawn sudo -n csrutil clear; \
                       expect \"user:\"; send \"admin\\r\"; expect \"assword\"; send \"admin\\r\"; expect eof'";
 
-/// Grant Full Disk Access to the guest agent in the system TCC database while SIP is off.
 fn fda_grant() -> String {
     format!(
         "set -e; a=$(readlink -f {GUEST_AGENT}); \
@@ -622,7 +606,6 @@ pub fn cmd_dmg(args: &[String]) -> Res {
     }
 }
 
-/// The last lines of `text`, for a row that ended without its verdict.
 fn tail(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(8)..].join("\n")

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! An artifact's handoff rides its connection's outbox (`control_lanes.rs`): the parker delivers a
-//! guarded answer and its challenge, awaits the one line that acknowledges it, and fails the
-//! handoff closed at its deadline however the connection ends.
+//! An artifact's handoff rides its connection's outbox (`control_lanes.rs`).
 
 use std::io::{BufReader, Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,17 +17,13 @@ use super::{
     Scope, ServeDisposition, WireRetention, read_request_line,
 };
 
-/// The hang detector.
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 
-/// The size of a big answer: far past what a socket pair buffers.
 const BIG: usize = 4 << 20;
 
-/// The write-only permits `bytes-big` holds: this file's own budgets.
 static PERMITS: std::sync::LazyLock<ArtifactBudgets> =
     std::sync::LazyLock::new(ArtifactBudgets::shipping);
 
-/// A guard whose life the test reads: alive until released.
 struct Probe(Arc<AtomicBool>);
 
 impl WireRetention for Probe {
@@ -75,10 +69,6 @@ impl Gate {
     }
 }
 
-/// The stub. `AUTH ok` authenticates. `guarded` answers `OK guarded` with a
-/// guard ([`Self::guard_alive`]), `guarded-big` a [`BIG`] one; `bytes-big` a
-/// [`BIG`] in-memory body holding a write-only permit of [`PERMITS`]; `latched`
-/// a [`BIG`] plain body whose last byte releases a latch ([`Self::wire`]).
 struct Captures {
     timeout: Duration,
     lane_acks: bool,
@@ -107,12 +97,10 @@ impl Captures {
         ControlReply::guarded(body, Some(ReplyRetention::new(Probe(alive))))
     }
 
-    /// Whether the `index`th guard handed out is still held.
     fn guard_alive(&self, index: usize) -> bool {
         self.guards.lock().unwrap_or_else(PoisonError::into_inner)[index].load(Ordering::SeqCst)
     }
 
-    /// How many latches were handed out.
     fn wires_handed(&self) -> usize {
         self.wires
             .lock()
@@ -120,7 +108,6 @@ impl Captures {
             .len()
     }
 
-    /// The `index`th latch handed out.
     fn wire(&self, index: usize) -> ReplyWire {
         self.wires.lock().unwrap_or_else(PoisonError::into_inner)[index].clone()
     }
@@ -201,7 +188,6 @@ impl LaneService for Captures {
     }
 }
 
-/// Lanes with `limits`, serving with `stub`.
 fn lanes(limits: LaneLimits, stub: &Arc<Captures>) -> Arc<Lanes> {
     let lanes = Lanes::new(limits);
     assert_eq!(lanes.start().rpc, limits.rpc, "every request lane started");
@@ -209,9 +195,6 @@ fn lanes(limits: LaneLimits, stub: &Arc<Captures>) -> Arc<Lanes> {
     lanes
 }
 
-/// A parker, and more request lanes than a test has connections: a client
-/// dialled as the last one's lane lets go of it is admitted, never handed
-/// back to a lane not yet free.
 fn parked_lanes(stub: &Arc<Captures>) -> Arc<Lanes> {
     lanes(
         LaneLimits {
@@ -225,8 +208,6 @@ fn parked_lanes(stub: &Arc<Captures>) -> Arc<Lanes> {
     )
 }
 
-/// The client end of an admitted connection, or `None` when the lanes handed
-/// it back (the listener's busy reply).
 fn dial(lanes: &Lanes) -> Option<CtlStream> {
     let (client, server) = CtlStream::pair().expect("socket pair");
     client
@@ -253,7 +234,6 @@ fn settle(lanes: &Lanes, what: &str, want: impl Fn(Census) -> bool) {
     }
 }
 
-/// One line the server sent, without its newline.
 fn line_of(reader: &mut impl std::io::BufRead) -> String {
     let mut line = String::new();
     match reader.read_line(&mut line) {
@@ -264,8 +244,6 @@ fn line_of(reader: &mut impl std::io::BufRead) -> String {
     }
 }
 
-/// Send `requests` (the handshake first) and read a guarded answer: its
-/// `OK guarded` line, then its challenge. Returns the reader and the nonce.
 fn read_guarded<'a>(client: &'a CtlStream, requests: &[u8]) -> (BufReader<&'a CtlStream>, String) {
     let mut writer = client;
     writer.write_all(requests).expect("requests");
@@ -279,9 +257,6 @@ fn read_guarded<'a>(client: &'a CtlStream, requests: &[u8]) -> (BufReader<&'a Ct
     (reader, nonce)
 }
 
-/// Four guarded captures whose clients read the challenge and never answer
-/// it, then four waits served on request lanes (no wait lane takes them), on
-/// eight lanes; then a fresh client. Its answer, or `None` when it was refused.
 fn unacked_captures_then_waits(lane_acks: bool) -> Option<String> {
     const CAPTURES: usize = 4;
     const WAITS: usize = 4;
@@ -334,11 +309,6 @@ fn unacked_captures_then_waits(lane_acks: bool) -> Option<String> {
     fresh
 }
 
-/// FOUR CAPTURES NOBODY ACKNOWLEDGES, beside the waits the request lanes
-/// serve. A guarded artifact's acknowledgement was read on its request lane
-/// for up to `ARTIFACT_HANDOFF_TIMEOUT`: four captures whose clients read the
-/// challenge and never answered held four lanes, four waits served there
-/// (every wait lane taken) held the rest, and every other client was refused.
 #[test]
 fn eight_unacked_captures_leave_lanes_free() {
     assert_eq!(
@@ -353,10 +323,6 @@ fn eight_unacked_captures_leave_lanes_free() {
     );
 }
 
-/// THE CHALLENGE IS ONE-SHOT. A guess pipelined behind the request, before
-/// the nonce exists, fails the handoff; so does a wrong line after the
-/// challenge, though the right one follows it: one line decides, and the
-/// connection closes. Each guard goes to quarantine, never released.
 #[test]
 fn a_pipelined_ack_cannot_be_guessed() {
     let stub = Arc::new(Captures::new(HANG));
@@ -396,11 +362,6 @@ fn a_pipelined_ack_cannot_be_guessed() {
     });
 }
 
-/// A HANDOFF ITS PEER DOES NOT FINISH fails closed at its deadline, where the
-/// parker holds it: a guarded answer nobody reads, and one read but never
-/// acknowledged, each close with their guard in quarantine; an in-memory body
-/// nobody reads closes and gives its permit back. Before, a write-only answer
-/// parked unread held its permit for as long as its peer stayed.
 #[test]
 fn an_unfinished_handoff_fails_closed_at_its_deadline() {
     let stub = Arc::new(Captures::new(Duration::from_millis(300)));
@@ -430,16 +391,12 @@ fn an_unfinished_handoff_fails_closed_at_its_deadline() {
     drop((unread, unanswered, unread_bytes));
 }
 
-/// A reply's latch (what a seamless update's Commit waits on) holds while the
-/// peer has not taken the reply's last byte, and is released once it has.
 #[test]
 fn a_latch_is_released_once_its_last_byte_is_taken() {
     let stub = Arc::new(Captures::new(HANG));
     let lanes = parked_lanes(&stub);
     let client = dial(&lanes).expect("admitted");
     (&client).write_all(b"AUTH ok\nlatched\n").expect("request");
-    // A connection whose handshake has not arrived parks too, so the census
-    // alone does not say the request was served; the latch handed out does.
     settle(&lanes, "the unread answer parked", |census| {
         census.parked == 1 && census.rpc == 0 && stub.wires_handed() == 1
     });
@@ -456,9 +413,6 @@ fn a_latch_is_released_once_its_last_byte_is_taken() {
     );
 }
 
-/// A PARKER THAT STOPS while a guarded answer awaits its acknowledgement
-/// closes the connection, and the guard goes to quarantine: the right echo,
-/// sent as it stopped and never read, proves nothing.
 #[test]
 fn a_stopped_parker_quarantines_the_guard_it_held() {
     let stub = Arc::new(Captures::new(HANG));
@@ -488,9 +442,6 @@ fn a_stopped_parker_quarantines_the_guard_it_held() {
     );
 }
 
-/// Without a parker the lane sees a guarded answer through itself, waiting:
-/// its challenge is answered and the guard released, and a wrong line
-/// quarantines it, the connection closing either way.
 #[test]
 fn without_a_parker_the_lane_awaits_the_acknowledgement() {
     let stub = Arc::new(Captures::new(HANG));

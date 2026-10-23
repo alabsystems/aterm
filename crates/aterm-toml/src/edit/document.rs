@@ -7,8 +7,7 @@ use core::ops::{Index, IndexMut};
 
 use super::{Item, RawString, Table};
 
-/// A whole TOML document, editable in place, printing back byte-for-byte what
-/// was parsed until something is changed.
+/// Editable TOML document preserving formatting and comments.
 #[derive(Debug, Clone)]
 pub struct DocumentMut {
     pub(crate) root: Item,
@@ -81,34 +80,15 @@ impl DocumentMut {
         self.as_table().get(key)
     }
 
-    /// Delete a top-level entry: [`DocumentMut::remove_path`] with a
-    /// one-segment path, so a key-value line leaves the comment lines written
-    /// above it, and a table takes its own along.
+    /// Remove a top-level entry while preserving leading comments above key-value lines.
     pub fn remove(&mut self, key: &str) -> Option<Item> {
         self.remove_path(&[key])
     }
 
-    /// Delete the entry at a key path (`["net", "listen"]` for `net.listen`) through either
-    /// table spelling. `None`, with nothing changed, when a step is missing or is not a
-    /// table; the tables along the path stay, even emptied.
-    ///
-    /// A removed key-value line goes with its own text, its same-line comment
-    /// included, and nothing else. The comment and blank lines written ABOVE it
-    /// are the person's, but the parser files them in the line's head, so
-    /// [`Table::remove`] takes them along: resetting a `theme` took the list of
-    /// commented-out themes above it. Here they stay where they were written:
-    /// above the next line of the table that printed the removed one, or after
-    /// that table's last line when it was the last. For a dotted key that is
-    /// the table its LINE sits in, not the one its key does.
-    ///
-    /// That is for a key-value line. A TABLE goes whole, `[header]`-spelled or
-    /// dotted: every line it printed, with the comment lines above, among and
-    /// directly under them ([`super::Table`]'s trailing lines).
+    /// Remove the entry at `path`, preserving leading comments above key-value lines.
     pub fn remove_path(&mut self, path: &[&str]) -> Option<Item> {
         let (leaf, parents) = path.split_last()?;
         let Some(depth) = line_owner_depth(self.as_table(), parents) else {
-            // Past `{ … }` there are no lines, only entries on one line, so
-            // nothing is written above an entry.
             let mut node = self.as_item_mut();
             for part in parents {
                 node = node.as_table_like_mut()?.get_mut(part)?;
@@ -123,13 +103,7 @@ impl DocumentMut {
         Some(item)
     }
 
-    /// [`DocumentMut::remove_path`], then each table on the path that the
-    /// removal left bare, deepest first: no entries, and no comment of its own
-    /// — above or on its header line, or kept under it from a removed line. A
-    /// table that still holds either stops the walk, so a reset leaves no
-    /// empty `[header]` behind and nothing the person wrote goes with one. A
-    /// table left holding only sub-tables, and no comment, stops printing its
-    /// own header, as if a deeper header had implied it.
+    /// Remove the entry at `path` and prune any ancestor tables left empty and uncommented.
     pub fn remove_path_pruning(&mut self, path: &[&str]) -> Option<Item> {
         let removed = self.remove_path(path)?;
         for depth in (1..path.len()).rev() {
@@ -157,7 +131,6 @@ impl DocumentMut {
     }
 }
 
-/// A table with no entries and no comment of its own.
 fn is_bare_table(item: &Item) -> bool {
     match item {
         Item::Table(table) => table.items.len() == 0 && !table_has_comment(table),
@@ -168,8 +141,6 @@ fn is_bare_table(item: &Item) -> bool {
     }
 }
 
-/// A `[header]` with no lines of its own under it, only sub-tables, and no
-/// comment.
 fn is_bare_header(table: &Table) -> bool {
     !table.implicit && !table.dotted && table.get_values().is_empty() && !table_has_comment(table)
 }
@@ -184,10 +155,6 @@ fn commented(raw: Option<&RawString>) -> bool {
     raw.is_some_and(|raw| raw.as_str().contains('#'))
 }
 
-/// How many of `path`'s steps lead to the table that prints the lines of the
-/// table `path` names: the last non-dotted one (or the root), since a dotted
-/// table's lines print among its parent's. `None` when a step is not a table
-/// at all — an inline table, an array of tables, a plain value — or is missing.
 fn line_owner_depth(root: &Table, path: &[&str]) -> Option<usize> {
     let mut depth = 0;
     let mut table = root;
@@ -217,8 +184,6 @@ impl Index<&str> for DocumentMut {
 }
 
 impl IndexMut<&str> for DocumentMut {
-    /// Indexing for write inserts a missing key, so `doc["font_px"] = item` works on a key
-    /// the file never had.
     fn index_mut(&mut self, key: &str) -> &mut Item {
         let table = self.as_table_mut();
         if !table.contains_key(key) {

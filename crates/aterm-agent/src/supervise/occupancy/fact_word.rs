@@ -1,21 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE MANAGER'S DOOR'S WORD (`docs/DESIGN-harness-occupancy-2026-10-20.md` §8 row 2): the closed
-//! fact word a managed worker's task record carries (`fact=<rule>@v<n>#<ordinal>`, for example
-//! `fact=hold-room@v1#1`), where its manager reads that a line would have gone but for them, and
-//! the host's answer to the loop's write of it ([`NoteOutcome`], `IdleHost::task_fact`).
-//!
-//! Nothing is posted and nothing is typed: the word names a built-in rule and an ordinal, and no
-//! text of the agent's, so a task title or label can never reach it. Slice 2.0 lays the type and
-//! the door alone; nothing writes the word yet.
+//! Closed fact word (`<rule>@v<n>#<ordinal>`) on a managed worker's task record ([`NoteOutcome`]).
 
 use std::num::NonZeroU16;
 
 use super::rules::RuleId;
 
-/// THE FACT WORD (`<rule>@v<n>#<ordinal>`): a built-in rule ([`RuleId::name`]) and the episode's
-/// ordinal, 1 to 65535. Its `Debug` holds the rule's variant and a number, nothing else.
+/// THE FACT WORD (`<rule>@v<n>#<ordinal>`) ([`RuleId::name`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FactWord {
     /// The rule whose line would have gone.
@@ -25,22 +17,20 @@ pub struct FactWord {
 }
 
 impl FactWord {
-    /// The word of `rule`'s episode `ordinal`; `None` for ordinal 0 or one past 65535.
+    /// The word of `rule`'s episode `ordinal`.
     #[must_use]
     pub fn new(rule: RuleId, ordinal: usize) -> Option<Self> {
         let ordinal = NonZeroU16::new(u16::try_from(ordinal).ok()?)?;
         Some(Self { rule, ordinal })
     }
 
-    /// The word as the record spells it: `hold-room@v1#1`.
+    /// The word as the record spells it.
     #[must_use]
     pub fn word(self) -> String {
         format!("{}#{}", self.rule.name(), self.ordinal)
     }
 
-    /// THE WORD `text` SPELLS, and only one [`Self::word`] writes: a rule of the closed list
-    /// ([`RuleId::of_name`]), `#`, and an ordinal of 1 to 65535 in plain decimal digits with no
-    /// sign and no leading zero. Anything else, of any length, is `None`.
+    /// THE WORD `text` SPELLS, and only one [`Self::word`] writes ([`RuleId::of_name`]).
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         let (rule, ordinal) = text.split_once('#')?;

@@ -127,7 +127,6 @@ pub fn parse_session(out: &str) -> (Vec<Answer>, String) {
     (answers, stderr.unwrap_or_default())
 }
 
-/// A verb's name and what its answer must satisfy.
 type Want<'a> = (&'a str, &'a dyn Fn(&str) -> bool);
 
 /// Verifies a session's answers and stderr against the smoke expectations.
@@ -188,7 +187,6 @@ pub fn judge(answers: &[Answer], stderr: &str) -> Result<(String, Option<String>
     ))
 }
 
-/// What `smoke` was asked.
 fn parse_args(args: &[String]) -> Result<Vec<Arch>, Fail> {
     let mut arches = Vec::new();
     let mut i = 0;
@@ -214,14 +212,12 @@ fn parse_args(args: &[String]) -> Result<Vec<Arch>, Fail> {
     Ok(arches)
 }
 
-/// `$LAB_STATE/windows`, made when missing.
 fn state_dir() -> Result<PathBuf, Fail> {
     let dir = paths().need_state()?.join("windows");
     std::fs::create_dir_all(&dir).map_err(|e| Fail::die(format!("{}: {e}", dir.display())))?;
     Ok(dir)
 }
 
-/// One row: its name, and a pass's detail or a failure's.
 type Row = (String, Result<String, String>);
 
 fn arch_rows(up: &Up, arch: Arch, repo: &Path, results: &Path) -> Vec<Row> {
@@ -290,7 +286,6 @@ fn arch_rows(up: &Up, arch: Arch, repo: &Path, results: &Path) -> Vec<Row> {
     rows
 }
 
-/// A frame is required evidence, not an optional warning on a passing row.
 fn copied_frame(detail: &str, local: &Path, copied: &Out) -> Result<String, String> {
     if copied.ok() {
         Ok(format!("{detail}; frame {}", local.display()))
@@ -302,8 +297,7 @@ fn copied_frame(detail: &str, local: &Path, copied: &Out) -> Result<String, Stri
     }
 }
 
-/// `aterm --version`'s verdict: its identity line, and the `build:` line this
-/// checkout's build number names (`SOURCE_DATE_EPOCH`, HEAD's committer time).
+/// Verifies `aterm --version` output matches `SOURCE_DATE_EPOCH`.
 fn version_names_build(text: &str, ok: bool, epoch: &str) -> Result<String, String> {
     let identity = text.lines().next().unwrap_or("").trim();
     let want = format!("build: {epoch}");

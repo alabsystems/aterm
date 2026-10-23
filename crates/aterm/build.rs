@@ -299,7 +299,7 @@ mod build_stamp {
         println!("cargo:rustc-env=ATERM_BUILD_TIME={build_time}");
 
         if !git_is_pinned {
-            for path in git_watch_paths() {
+            for path in git_watch_paths().into_iter().chain(tracked_files()) {
                 println!("cargo:rerun-if-changed={}", path.display());
             }
         }
@@ -354,6 +354,30 @@ mod build_stamp {
         paths.sort();
         paths.dedup();
         paths
+    }
+
+    /// Every file git tracks in this checkout and its submodules that exists as a file and has no newline in its name, absolute, so an edit to any of them reruns the script and no build after an edit keeps the clean stamp of the build before it.
+    fn tracked_files() -> Vec<PathBuf> {
+        let Some(top) = run(GIT, &["rev-parse", "--show-toplevel"]).map(PathBuf::from) else {
+            return Vec::new();
+        };
+        let Ok(out) = std::process::Command::new(GIT)
+            .arg("-C")
+            .arg(&top)
+            .args(["ls-files", "-z", "--recurse-submodules"])
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !out.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|name| !name.is_empty() && !name.contains('\n'))
+            .map(|name| top.join(name))
+            .filter(|path| path.is_file())
+            .collect()
     }
 }
 

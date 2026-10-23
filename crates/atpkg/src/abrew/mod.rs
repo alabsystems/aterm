@@ -69,9 +69,6 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     run(&argv, false)
 }
 
-/// Whether the raw argv asks for real brew: a leading `--real` (the only
-/// position either layer strips), `ABREW_REAL`, or a `--no-reroute`
-/// session (`__ATERM_REROUTE_PASSTHROUGH`).
 fn escape_requested_os(args: &[OsString]) -> bool {
     let first = args
         .first()
@@ -99,7 +96,7 @@ pub fn rerouted_entry(args: &[String]) -> ExitCode {
     run(args, true)
 }
 
-/// The engine.
+/// Runs `abrew` on `args`.
 pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
     if cfg!(windows) {
         eprintln!("abrew: Homebrew is macOS/Linux software; abrew does nothing on Windows");
@@ -137,7 +134,6 @@ pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
     dispatch(&prefix, args, via_reroute)
 }
 
-/// Run the real brew (bundled first) with `args`, stdio inherited.
 fn passthrough(prefix: &Prefix, args: &[String], notice: Option<&str>) -> ExitCode {
     let Some(brew) = stub::resolve_real_brew(prefix) else {
         eprintln!(
@@ -154,7 +150,6 @@ fn passthrough(prefix: &Prefix, args: &[String], notice: Option<&str>) -> ExitCo
     run_real_brew(&brew, &refs)
 }
 
-/// Run an already-resolved real brew with byte-faithful argv.
 fn run_real_brew(brew: &std::path::Path, args: &[&OsString]) -> ExitCode {
     let status = aterm_uds::spawnfd::command(brew)
         .args(args.iter().copied())
@@ -169,7 +164,6 @@ fn run_real_brew(brew: &std::path::Path, args: &[&OsString]) -> ExitCode {
     }
 }
 
-/// [`passthrough`] for raw OS argv (the argv0 escape path).
 fn passthrough_os(prefix: &Prefix, args: &[&OsString], notice: Option<&str>) -> ExitCode {
     let Some(brew) = stub::resolve_real_brew(prefix) else {
         eprintln!(
@@ -184,7 +178,6 @@ fn passthrough_os(prefix: &Prefix, args: &[&OsString], notice: Option<&str>) -> 
     run_real_brew(&brew, args)
 }
 
-/// A command abrew does not implement natively (decision 3A).
 fn not_native(prefix: &Prefix, args: &[String], cmd: &str) -> ExitCode {
     passthrough(prefix, args, Some(&format!("'{cmd}' is not native yet")))
 }
@@ -199,8 +192,6 @@ pub(super) fn env_set(name: &str) -> bool {
     std::env::var_os(name).is_some()
 }
 
-/// The success badge brew prints after an install: suppressed by
-/// `HOMEBREW_NO_EMOJI`, overridable via `HOMEBREW_INSTALL_BADGE`.
 fn badge_from(no_emoji: bool, badge: Option<String>) -> Option<String> {
     if no_emoji {
         None
@@ -239,7 +230,6 @@ fn from_install(prefix: &Prefix, args: &[String], r: Result<(), InstallError>) -
     }
 }
 
-/// A later fallback must not replay possibly retained native work in another prefix.
 fn after_native_progress(error: InstallError, completed: bool) -> InstallError {
     match error {
         InstallError::PassThrough(reason) if completed => InstallError::Failed(format!(
@@ -249,13 +239,10 @@ fn after_native_progress(error: InstallError, completed: bool) -> InstallError {
     }
 }
 
-/// A failed native attempt may already have retained an upgraded dependency.
 const fn native_attempt_may_have_progress<T>(result: &Result<T, InstallError>) -> bool {
     !matches!(result, Err(InstallError::PassThrough(_)))
 }
 
-/// Carry one actual native attempt through a dependency walk. A failed
-/// attempt can retain work too; a later fallback must honor that boundary.
 fn after_native_attempt<T>(
     possible_progress: &mut bool,
     result: Result<T, InstallError>,
@@ -264,7 +251,6 @@ fn after_native_attempt<T>(
     result.map_err(|error| after_native_progress(error, *possible_progress))
 }
 
-/// True for commands that mutate the prefix (they take the lock).
 fn mutates(cmd: &str) -> bool {
     matches!(
         cmd,
@@ -292,13 +278,6 @@ fn mutates(cmd: &str) -> bool {
     )
 }
 
-/// brew spells the kind switches two ways (`--formula`/`--formulae`,
-/// `--cask`/`--casks`) on every kind-taking command. Admission and
-/// handlers read only the singular tokens, so plural spellings are
-/// canonicalized in the `rest` copy they see. The original `args`
-/// keep the user's spelling for passthrough to real brew. Exact
-/// tokens only: these switches take no `=value`, and a leading-dash
-/// token was never an operand.
 fn canonical_kind_switches(rest: &[String]) -> Vec<String> {
     rest.iter()
         .map(|s| match s.as_str() {
@@ -309,8 +288,6 @@ fn canonical_kind_switches(rest: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Admit only argument forms whose meaning is implemented. Unsupported forms
-/// reach real brew unchanged before locking or creating anything in the prefix.
 fn native_args(
     cmd: &str,
     rest: &[String],
@@ -763,9 +740,6 @@ fn bundle_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, In
     }
 }
 
-/// Pre-lock recipe delegation for install-shaped commands: resolve the
-/// plan read-only; a PassThrough delegates now, lock-free. Returns the
-/// exit code to use, or None to proceed natively under the lock.
 fn prelock_delegation(
     prefix: &Prefix,
     api: &api::Api,
@@ -1071,7 +1045,6 @@ fn each_name(rest: &[String], f: impl Fn(&str) -> Result<(), String>) -> ExitCod
     ExitCode::SUCCESS
 }
 
-/// Operands (non-flag args) of a command.
 fn operands(rest: &[String]) -> Vec<String> {
     rest.iter()
         .filter(|s| !s.starts_with('-'))
@@ -1084,8 +1057,6 @@ fn has_flag(rest: &[String], long: &str, short: &str) -> bool {
         .any(|s| s == long || (!short.is_empty() && s == short))
 }
 
-/// Shell completion scripts generated from the one command roster:
-/// `abrew completions bash|zsh|fish` (brew's `completions` shape).
 fn completions(shell: &str) -> String {
     let words = COMMANDS
         .iter()
@@ -1156,9 +1127,6 @@ const COMMANDS: &[&str] = &[
     "uses",
 ];
 
-/// Alternate spellings dispatch accepts for a roster command, as
-/// brew's `commands --include-aliases` lists them: merged into the
-/// same sorted listing, never in the plain one.
 const COMMAND_ALIASES: &[&str] = &[
     "--repo",
     "-S",
@@ -1172,8 +1140,6 @@ const COMMAND_ALIASES: &[&str] = &[
     "rm",
 ];
 
-/// The `commands` listing: the roster, with aliases merged and the
-/// whole set sorted when asked (brew's shape in both forms).
 fn command_names(include_aliases: bool) -> Vec<&'static str> {
     let mut names: Vec<&'static str> = COMMANDS.to_vec();
     if include_aliases {

@@ -1,24 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The unmetered asset lane: a release asset's browser download URL, and telling that host
-//! apart from the API host.
-//!
-//! Anonymous `api.github.com` is metered (~60 requests/hour per IP, shared behind a NAT; even
-//! a 304 counts). `https://github.com/{owner}/{repo}/releases/download/{tag}/{name}` is not:
-//! for a public repo it answers 200 via a 302 to `release-assets.githubusercontent.com` with no
-//! `x-ratelimit-*` headers, and 404 for a missing asset or a private repo (no credential is
-//! accepted there). With the tag from the evergreen pointer on the same host
-//! ([`crate::pointer`]), the credential-less check makes no API request at all.
-//!
-//! The URL is a pure function of `(owner, repo, tag, name)`, never read from a server
-//! response: `tag` comes from the pointer's strictly parsed `Location` or from signed data the
-//! caller holds, and `name` is a publisher-convention asset name. `aterm-update` and `atpkg`
-//! both build it here, so the two cannot drift onto a 404.
+//! Browser release-asset download URLs and API-host detection, paired with
+//! [`crate::pointer`] so credential-less update checks avoid metered `api.github.com` calls.
 
-/// Whether `segment` may be spliced into a synthesized URL path as-is: non-empty, not
-/// `.`/`..`, and only `[A-Za-z0-9._-]`, so no extra segment, query, fragment, `%` escape,
-/// whitespace or control byte.
+/// Whether `segment` is a non-empty `[A-Za-z0-9._-]` path segment other than `.` or `..`.
 #[inline]
 #[must_use]
 pub fn path_segment_safe(segment: &str) -> bool {
@@ -30,9 +16,8 @@ pub fn path_segment_safe(segment: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
-/// The browser download URL for asset `name` of release `tag` in `owner/repo`, or `None`
-/// (a refusal: there is no listing to fall back to) when any of the four is not a safe path
-/// segment. Every asset name and tag either publisher emits passes.
+/// Returns the browser download URL for asset `name` of release `tag` in `owner/repo`, or
+/// `None` when any component fails [`path_segment_safe`].
 #[must_use]
 pub fn release_download_url(owner: &str, repo: &str, tag: &str, name: &str) -> Option<String> {
     if !(path_segment_safe(owner)
@@ -63,9 +48,7 @@ pub fn release_download_url(owner: &str, repo: &str, tag: &str, name: &str) -> O
     Some(url)
 }
 
-/// The metered host. A 403 means rate limit only here; from `github.com` it is a blocked host
-/// or proxy (a private or unpublished asset answers 404 there), and GitHub's web-host throttle
-/// is a 429.
+/// Whether `url` targets `https://api.github.com/` (where HTTP 403 indicates rate limiting).
 #[inline]
 #[must_use]
 pub fn is_api_host(url: &str) -> bool {
@@ -76,8 +59,6 @@ pub fn is_api_host(url: &str) -> bool {
 mod tests {
     use super::{is_api_host, path_segment_safe, release_download_url};
 
-    /// The exact strings are the contract with the publisher's convention (the DMG URL
-    /// `aterm-release` writes into the appcast in `manifest_out.rs`, and the roster URL).
     #[test]
     fn derived_url_matches_the_publisher_convention() {
         assert_eq!(
@@ -91,7 +72,6 @@ mod tests {
                 "https://github.com/alabsystems/aterm/releases/download/v0.73.0/aterm-machines.toml"
             )
         );
-        // Every asset name the two publishers emit passes the predicate.
         for name in [
             "aterm-appcast.toml",
             "aterm-appcast.toml.sig",
@@ -109,7 +89,6 @@ mod tests {
         }
     }
 
-    /// Anything that could splice the URL onto another host, path, query or fragment declines.
     #[test]
     fn derived_url_refuses_unsafe_owner_repo_tag_and_name() {
         let ok = ("alabsystems", "aterm", "v0.1.0", "aterm-appcast.toml");
@@ -158,7 +137,6 @@ mod tests {
         assert!(!is_api_host(
             "https://release-assets.githubusercontent.com/github-production-release-asset/x"
         ));
-        // A look-alike host is not the API host.
         assert!(!is_api_host("https://api.github.com.evil.com/x"));
         assert!(!is_api_host("http://api.github.com/x"));
     }

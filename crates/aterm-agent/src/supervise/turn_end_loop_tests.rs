@@ -10321,6 +10321,84 @@ fn a_background_call_that_makes_no_progress_is_named_at_stalled_and_in_the_excep
 }
 
 #[test]
+fn a_call_named_after_an_unnamed_rung_is_told_at_once_not_a_pace_later() {
+    use super::super::wall_memory::StuckRung;
+    use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
+    use crate::supervise::fx::{ClockSource, Fx, VirtualClock};
+    let hung = BackgroundEvidence::NoProgress {
+        worst: BackgroundCall {
+            pid: 27098,
+            pgid: 27090,
+            birth: None,
+            exe: "aterm_gui-e0964a".to_string(),
+            task: None,
+            quiet_ms: 31 * 60_000,
+            wait: None,
+        },
+    };
+    let scrolled = Screen {
+        rows: memory_scrolled(),
+        ..Screen::default()
+    };
+    let climb = |rung: StuckRung, told: Option<Option<u32>>, evidence: BackgroundEvidence| {
+        let host = Arc::new(LadderHost {
+            evidence,
+            ..LadderHost::default()
+        });
+        let mut m = Mock::new(vec![busy_screen()]);
+        m.title = Some("✳ Claude Code".to_string());
+        let mut s = session(&mut m, None);
+        s.set_fx(Fx::over(ClockSource::Virtual(Arc::new(VirtualClock::new(
+            Instant::now(),
+            0,
+        )))));
+        s.setup.stuck_after = Duration::from_secs(120);
+        s.setup.background_settle = Duration::ZERO;
+        s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+        s.stuck_rung = rung;
+        // The screen has stood ten minutes, past every rung's wait: only the pace holds a rung.
+        let since = s.fx.mono();
+        s.fx.sleep(Duration::from_secs(600));
+        let now = s.fx.mono();
+        s.stuck_asked = Some(now);
+        s.stuck_told = told.map(|pgid| (since, pgid));
+        let mut heard = Heard::default();
+        s.stuck_busy_note(&scrolled, Some(since), &mut heard);
+        let rung = s.stuck_rung;
+        drop(s);
+        (rung, heard.noted, host.told.lock().unwrap().clone())
+    };
+    for (name, rung, told) in [
+        ("a STUCK", StuckRung::Said, None),
+        ("a STALLED that named no call", StuckRung::Told, Some(None)),
+    ] {
+        let (now, noted, host) = climb(rung, told, hung.clone());
+        assert_eq!(now, StuckRung::Told, "after {name}: {noted:#?}");
+        assert!(
+            noted.len() == 1 && noted[0].starts_with("STALLED") && noted[0].contains("pid 27098"),
+            "after {name}: {noted:#?}"
+        );
+        assert_eq!(host, ["no-progress:27098:31"], "after {name}");
+    }
+    for (name, rung, told, evidence) in [
+        (
+            "an unnamed rung, no call",
+            StuckRung::Said,
+            None,
+            BackgroundEvidence::Unknown,
+        ),
+        ("a named STALLED", StuckRung::Told, Some(Some(27090)), hung),
+    ] {
+        let (now, noted, host) = climb(rung, told, evidence);
+        assert_eq!(now, rung, "{name} keeps the pace: {noted:#?}");
+        assert!(
+            noted.is_empty() && host.is_empty(),
+            "{name}: {noted:#?} {host:#?}"
+        );
+    }
+}
+
+#[test]
 fn agy_or_muse_background_work_that_never_ends_climbs_the_canary() {
     use aterm_phase::agy::fixtures::lab as a;
     use aterm_phase::muse::fixtures as u;

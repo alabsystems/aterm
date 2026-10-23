@@ -33,8 +33,6 @@ fn run_the_test() {
     unreachable!("the test exists only on macOS, so nothing selects it here");
 }
 
-/// libtest's command line and output, for the one test this binary holds —
-/// only as much as a one-test binary needs, and an ERROR for the rest.
 mod libtest {
     use std::sync::{Mutex, OnceLock};
     use std::time::Instant;
@@ -133,7 +131,6 @@ mod libtest {
             }
         }
 
-        /// libtest's `filter_tests`, for the one test.
         fn selects(&self, exists: bool) -> bool {
             exists
                 && (self.filters.is_empty() || self.filters.iter().any(|f| self.matches(f)))
@@ -164,7 +161,6 @@ mod libtest {
     }
 
     static STARTED: OnceLock<Instant> = OnceLock::new();
-    /// Held by the one thread that prints the verdict, until the process ends.
     static VERDICT: Mutex<()> = Mutex::new(());
 
     fn seconds() -> f64 {
@@ -258,8 +254,6 @@ mod macos {
 
     #[link(name = "AppKit", kind = "framework")]
     unsafe extern "C" {
-        /// AppKit's `NSApp`: nil until `+[NSApplication sharedApplication]`
-        /// runs. Reading it creates nothing.
         static NSApp: *mut std::ffi::c_void;
     }
 
@@ -269,18 +263,10 @@ mod macos {
         unsafe { !std::ptr::read_volatile(&raw const NSApp).is_null() }
     }
 
-    /// Clones of one proxy, each posting once. Eight is enough to have every
-    /// clone past the first; the lost-wake class lost ALL of them.
     const CLONES: usize = 8;
     const SEND_GAP: Duration = Duration::from_millis(40);
-    /// A hang detector for each thing that must happen (AGENTS.md: a minute,
-    /// never a latency budget). A lost wake never arrives, so no bound on how
-    /// LATE an event may be is needed to catch one.
     const HANG: Duration = Duration::from_secs(60);
     const DEADLINE: Duration = Duration::from_millis(120);
-    /// The whole run's backstop — it also covers the main-queue round trip and
-    /// the `WaitUntil` deadline, which no per-clone wait does. Twice [`HANG`], so
-    /// a lost clone wake is reported by the clone that lost it, not by this.
     const WATCHDOG: Duration = Duration::from_secs(2 * HANG.as_secs());
 
     enum Ev {

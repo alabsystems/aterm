@@ -596,7 +596,14 @@ impl<C: Ctl> Session<'_, C> {
         let Some((next, times)) = self.stuck_rung.next() else {
             return;
         };
-        if self.stuck_asked.is_some_and(|t| self.fx.since(t) < after) {
+        let paced = self.stuck_asked.is_some_and(|t| self.fx.since(t) < after);
+        // A rung said with no call named (`STUCK`, or a `STALLED` in today's words) does not
+        // hold back a call the reading names since: it is told at once (the hung-call design's
+        // R1), not one status pace after that rung's read. Every other rung keeps the pace.
+        let unnamed = self.stuck_rung == StuckRung::Said
+            || (self.stuck_rung == StuckRung::Told
+                && self.stuck_told.is_some_and(|(_, pgid)| pgid.is_none()));
+        if paced && !unnamed {
             return;
         }
         let dialog = kind == ExceptionKind::Dialog;
@@ -605,6 +612,9 @@ impl<C: Ctl> Session<'_, C> {
         } else {
             self.no_progress_call()
         };
+        if paced && call.is_none() {
+            return;
+        }
         let (next, due) = match &call {
             Some(_) if next <= StuckRung::Told => (StuckRung::Told, true),
             Some(c) if self.stuck_told.is_some_and(|(_, g)| g != Some(c.pgid)) => {

@@ -110,6 +110,15 @@ pub struct CursorPhaser {
 }
 
 impl CursorPhaser {
+    /// Reset animation state while preserving the light-fill memo.
+    #[inline]
+    pub fn reset(&mut self) {
+        *self = Self {
+            light_fill_memo: self.light_fill_memo,
+            ..Self::default()
+        };
+    }
+
     /// Whether the host must keep arming the animation tick: only while the emitter is charged (typing or cooling).
     #[inline]
     #[must_use]

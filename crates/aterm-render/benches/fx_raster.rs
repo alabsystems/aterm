@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the fx layers cost on the CPU (`docs/DESIGN-card-engine-2026-10-19.md` §5 "Run-list CPU
-//! stamping", §4.9 "zero cost at rest").
+//! CPU rasterization benchmarks for fx layers.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -33,7 +32,6 @@ const ROWS: usize = 12;
 const COLS: usize = 60;
 const ITERS: usize = 400;
 
-/// A text frame of `ROWS × COLS`, the cursor hidden.
 fn text_frame(t: &mut Terminal) -> RenderInput {
     t.process(b"\x1b[?25l");
     let line = "the quick brown fox jumps over the lazy dog 0123456789 ".repeat(2);
@@ -43,8 +41,6 @@ fn text_frame(t: &mut Terminal) -> RenderInput {
     t.cell_frame(ROWS, COLS)
 }
 
-/// Full-frame renders of each input, alternating so drift hits every side:
-/// the median of each.
 fn full_medians(rend: &mut Renderer, inputs: &[&RenderInput]) -> Vec<Duration> {
     for input in inputs {
         for _ in 0..4 {
@@ -79,8 +75,6 @@ enum Scale {
     Between,
 }
 
-/// A 16 × 11 dithered art: an ellipse of indices 1..=3 in a checker-ish
-/// dither, index 0 outside (the kitty's shape class).
 fn dithered_art() -> Arc<FxArt> {
     let (w, h) = (16i32, 11i32);
     let mut data = Vec::new();
@@ -98,8 +92,6 @@ fn dithered_art() -> Arc<FxArt> {
     Arc::new(FxArt::new(w as u16, h as u16, FxTexels::Index8, data).expect("sized"))
 }
 
-/// The sprite's pixels as flat rects: per art row, per texel run, the
-/// destination columns and rows law F maps onto it (`⌈t·d / n⌉` edges).
 fn as_rects(sp: &FxSprite) -> Vec<FxItem> {
     let art = &sp.art;
     let (aw, ah) = (u32::from(art.w()), u32::from(art.h()));
@@ -131,10 +123,6 @@ fn as_rects(sp: &FxSprite) -> Vec<FxItem> {
     out
 }
 
-/// The flat rects of a Window layer at offset 0 (over `as_rects`' doubled
-/// palette, entry `2k` and `2k + 1` both `ink[k]`) as today's `glow_under`
-/// quads: window pixels, one row band per quad (each rect cut at the band
-/// edges), drawn by `draw_flat_add`.
 fn as_glow_quads(rend: &Renderer, h: usize, rects: &[FxItem], ink: &[FxInk]) -> Vec<GlowQuad> {
     let mut out = Vec::new();
     for item in rects {
@@ -160,9 +148,6 @@ fn as_glow_quads(rend: &Renderer, h: usize, rects: &[FxItem], ink: &[FxInk]) -> 
     out
 }
 
-/// RUN LISTS AGAINST RECTS AND QUADS: eight dithered sprites over the frame,
-/// as sprite items, as their flat fx rects, and as today's band-cut
-/// `glow_under` quads, all asserted byte-equal, then timed.
 fn sprite_vs_rects(rend: &mut Renderer, scale: Scale) {
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
     let bare = text_frame(&mut t);
@@ -242,8 +227,6 @@ fn sprite_vs_rects(rend: &mut Renderer, scale: Scale) {
     );
 }
 
-/// Cached-path medians of `inputs` drawn alternately, each frame checked to
-/// take the damage path `want`.
 fn cached_median(rend: &mut Renderer, inputs: &[RenderInput], want: DamageOutcome) -> Duration {
     let mut wc = WindowCpu::new();
     for input in inputs.iter().cycle().take(8) {
@@ -259,11 +242,6 @@ fn cached_median(rend: &mut Renderer, inputs: &[RenderInput], want: DamageOutcom
     median(times)
 }
 
-/// COST AT REST: the cached path with no layers against settled layers (the
-/// same `Arc`s every frame): unchanged frames (gate hits: the identity
-/// compare), and one-row text frames whose row the card spans (the row's
-/// slices are restamped over the rebuilt band) or lies outside of (the
-/// slicer skips every band).
 fn settled_at_rest(rend: &mut Renderer) {
     let (cw, ch) = rend.cell_size();
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
@@ -352,9 +330,6 @@ fn settled_at_rest(rend: &mut Renderer) {
     }
 }
 
-/// THE SHARED GLOW LOOP: a full frame with a `glow_under` stream of 24 quads
-/// per row (a quarter each flat additive, flat translucent, flat opaque and
-/// gradient), against the bare frame.
 fn glow_stream(rend: &mut Renderer) {
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
     let bare = text_frame(&mut t);
@@ -393,14 +368,6 @@ fn glow_stream(rend: &mut Renderer) {
     );
 }
 
-/// THE BLIT UNDER A SETTLED CARD (§4.4): a Claude-sized frame streaming one
-/// line a frame on the cached path, with no layer (the blit alone) and under
-/// a settled card layer (the blit plus the card's bands, re-rastered over the
-/// slid pixels), each frame checked to take the blit; and the same frames
-/// repainted in full, which is what every frame paid while a layer refused
-/// the blit (B1a). Two cards: the card's own shape (a 2 px ring round an
-/// 8-row box, with the dithered kitty in it) and a worst case that fills the
-/// box with light. Frame building is outside the timed span.
 fn scroll_under_card(rend: &mut Renderer) {
     const SROWS: usize = 40;
     const SCOLS: usize = 100;

@@ -52,7 +52,6 @@ pub(crate) fn merge_shell_args_in(
     }
 }
 
-/// Whether integrated bash reads login startup files ([`crate::BASH_LOGIN_START`]).
 const LOGIN_STYLE_LOADER: bool = !cfg!(all(unix, not(target_os = "macos")));
 
 /// One argument of a bash argv, after the long options.
@@ -77,7 +76,6 @@ struct BashArgs {
     rcfile: Option<String>,
 }
 
-/// bash's long options (`shell.c`'s `long_args`).
 const BASH_LONG_OPTIONS: [&str; 18] = [
     "debug",
     "debugger",
@@ -99,7 +97,6 @@ const BASH_LONG_OPTIONS: [&str; 18] = [
     "wordexp",
 ];
 
-/// Sort `args` as bash parses them, or say why no integrated interactive bash can run them.
 fn parse_bash_args(args: &[String]) -> Result<BashArgs, String> {
     let mut out = BashArgs::default();
     let mut leading = true;
@@ -199,7 +196,6 @@ fn parse_bash_args(args: &[String]) -> Result<BashArgs, String> {
     Ok(out)
 }
 
-/// [`merge_shell_args`] for bash ([`crate::prepare`]).
 fn merge_bash(
     injection: &mut InjectionEnv,
     args: &[String],
@@ -278,7 +274,6 @@ pub(crate) fn posix_start_env(
     }
 }
 
-/// [`merge_shell_args`] for PowerShell.
 fn merge_powershell(injection: &mut InjectionEnv, args: &[String]) -> ArgsMerge {
     let Some(ours) = injection.argv_override.as_deref() else {
         return ArgsMerge::Integrated;
@@ -304,7 +299,6 @@ fn merge_powershell(injection: &mut InjectionEnv, args: &[String]) -> ArgsMerge 
     ArgsMerge::Integrated
 }
 
-/// A PowerShell parameter the merge cannot pass beside the integration's own.
 enum PwshParameter {
     /// `-NoExit`: the integration passes it already.
     Ours,
@@ -312,7 +306,6 @@ enum PwshParameter {
     Foreign,
 }
 
-/// Classify `arg` as a [`PwshParameter`].
 fn pwsh_parameter(arg: &str) -> Option<PwshParameter> {
     let name = arg.strip_prefix('-')?;
     let name = name.strip_prefix('-').unwrap_or(name);
@@ -378,8 +371,6 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
-    /// Plain options keep integration: longs before the loader, shorts (and an
-    /// option's value) after it — the order bash accepts.
     #[test]
     fn bash_options_go_where_bash_accepts_them() {
         let (merge, injection) = merged(&["-o", "vi", "--verbose", "-O", "extglob", "-i"], &no_env);
@@ -417,8 +408,6 @@ mod tests {
         );
     }
 
-    /// What no integrated interactive bash can run stands integration aside, and
-    /// says which argument.
     #[test]
     fn bash_args_that_are_no_interactive_shell_stand_integration_aside() {
         for (args, names) in [
@@ -567,8 +556,6 @@ mod tests {
         }
     }
 
-    /// PowerShell takes the person's parameters first (`-Login` must be), drops a
-    /// `-NoExit` of theirs, and stands aside for a command, a file or a policy.
     #[test]
     fn powershell_parameters_go_first_unless_they_run_something_else() {
         let mut injection = pwsh();
@@ -620,8 +607,6 @@ mod tests {
         }
     }
 
-    /// The config check says what the spawn would: a sentence for args that stand
-    /// integration aside, nothing for args it carries or a shell it never touches.
     #[test]
     fn the_config_check_answers_as_the_merge_does() {
         assert!(
@@ -642,8 +627,6 @@ mod tests {
         );
     }
 
-    /// zsh, fish and WSL are integrated without touching argv: the spawn (or the
-    /// Windows seam) hands them their arguments itself.
     #[test]
     fn shells_integrated_through_env_keep_their_argv_untouched() {
         for shell in [

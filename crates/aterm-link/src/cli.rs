@@ -12,40 +12,44 @@ use crate::bridge::{Bridge, Config};
 use crate::transport;
 
 const USAGE: &str = "\
-aterm-link — the aterm fabric bridge
+aterm link — the fabric bridge (also runs as `aterm-link`)
 
-  aterm-link serve  --fleet <F> --broker <socket> --cap-file <path>... [options]
-  aterm-link ls     --fleet <F> --broker <socket> --cap-file <path>... [--attention]
-  aterm-link notify --on <attention|ask:<person>|halt>,... --exec <cmd>
-  aterm-link broker <socket> [log] [--secret-file <path>] [--durability strict|ordered|relaxed]
-  aterm-link broker --repair <log>
-  aterm-link mint   <grant> --secret-file <path>
-  aterm-link fabric ...  (same as `aterm fabric`; see `aterm fabric --help`)
+  aterm link serve  --fleet <F> --broker <socket> --cap-file <path>... [options]
+  aterm link ls     [--fleet <F> --broker <socket> --cap-file <path>...] [--attention]
+  aterm link notify --fleet <F> --broker <socket> --cap-file <path>... --on <sel>,...
+                    --exec <cmd> [options]        (alone, it lists its options)
+  aterm link broker <socket> [log] [options]      (`aterm link broker --help`)
+  aterm link broker --repair <log>
+  aterm link mint   <grant> --secret-file <path>
+  aterm link fabric ...                           (`aterm fabric --help`)
 
-`ls` defaults --fleet and --broker from the rendezvous file (`fabric.toml`) written by
-`aterm fabric on`, and with a defaulted --broker also defaults --cap-file and --state.
-Command-line flags override defaults.
+`ls` takes --fleet and --broker from the rendezvous file `fabric.toml` that `aterm fabric
+on` writes, and --cap-file and --state too when --broker is not given; a flag given wins.
+`serve` reads `[fabric] presence`, `receipts` and `log` in aterm.toml for a flag not
+given.
 
-  --fleet <F>            fleet name (`/f/<F>/` subtree)
-  --broker <socket>      broker Unix socket path
+  --fleet <F>            fleet name (the `/f/<F>/` subtree)
+  --broker <socket>      the broker's Unix socket
   --cap-file <path>      minted capability file (`<grant> <tag-hex>` lines); repeatable
-  --state <dir>          state dir (node id, incarnation, sequence, watermarks)
-  --accept-from <p>,...  principals whose task/control arrive undemoted
-  --sock <path>          observer mode against an instance control socket
-  --token-file <path>    instance token for --sock
-  --presence <mode>      `serve` only (`[fabric] presence` in aterm.toml): `meta` (default:
-                         role=, detail=, phase=, title= beside attention=; no screen text)
-                         or `minimal` (attention= only)
-  --receipts             `serve` only, on by default (`[fabric] receipts` in aterm.toml):
-                         send `kind=ack` when `inbox seen <id> handled|refused|deferred`
-                         marks an ask or task (`--no-receipts` disables for one run)
-  --log <auto|off|turns> `serve` only, `auto` by default (`[fabric] log` in aterm.toml):
-                         mirror session-log turns, runs, needs and steps onto the session's
-                         `ev` face while the broker retains them (`turns` mirrors over any
-                         broker; `off` disables)
+  --state <dir>          state dir: node id, incarnation, sequences, watermarks (default
+                         `$XDG_STATE_HOME/aterm-link`, else `~/.local/state/aterm-link`)
+  --accept-from <p>,...  principals whose task/control arrive undemoted (an `h-` human's
+                         always do)
+  --sock <path>          `serve` only: attach to an instance's control socket as a
+                         read/presence observer
+  --token-file <path>    the instance token --sock needs
+  --presence <mode>      `serve` only: `meta` (default: role=, detail=, phase=, title=
+                         beside attention=; no screen text) or `minimal` (attention= only)
+  --receipts             `serve` only, on by default: send `kind=ack` when `inbox seen
+                         <id> handled|refused|deferred` marks an ask or task
+                         (`--no-receipts` turns it off for one run)
+  --log <auto|off|turns> `serve` only, default `auto`: mirror session-log turns, runs,
+                         needs and steps onto the session's `ev` face while the broker
+                         retains them; `turns` mirrors over any broker, `off` not at all
   --attention            `ls` only: keep only rows carrying `attention=`
 
-`ls` prints one pct-encoded token per column:
+`ls` prints each presence row's latest record, one pct-encoded token per column (<sid>
+is `node` on a node's own row):
   <node> <host> <sid> state= inc= role= detail= driving= holder= hold= fabric=
   attention= gen= observer= epoch= phase= context= title= proto= aterm=
 ";
@@ -377,38 +381,38 @@ usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <ti
                          [--lifeline-fd <n>]
        aterm link broker --repair <log>
 
-  <socket>             Unix socket path the bridge's `--broker` names (place in a 0700 dir)
-  [log]                durable record log (default: <socket>.log)
-  --secret-file <path> 32+ raw bytes, mode 0600: the mint secret (`aterm link mint`,
-                       `aterm fabric mint-for h-<name>`). Without the flag, `mint.secret`
-                       beside <socket> is used when present; without either, the broker
-                       runs `(unguarded)`
-  --durability <tier>  what an ack promises: `strict`, `ordered` (default with
-                       --secret-file) or `relaxed` (default without --secret-file is
-                       `strict`).
+  <socket>             the Unix socket the bridges' `--broker` names (in a 0700 dir)
+  [log]                the durable record log (default `<socket>.log`)
+  --secret-file <path> the mint secret (32+ raw bytes, 0600, in a 0700 dir) that
+                       `aterm link mint` and `aterm fabric mint-for` mint under. Without
+                       the flag a `mint.secret` beside <socket> is used; with neither, the
+                       broker is unguarded and checks no capability
+  --durability <tier>  what an ack promises; default `ordered` with --secret-file, else
+                       `strict`:
                        - `strict`: acks after a full drive-cache flush (`F_FULLFSYNC`).
                        - `ordered`: acks after a disk barrier (`F_BARRIERFSYNC`) and
                          flushes in full within 100 ms (served `strict` where the disk
-                         cannot promise ordering).
+                         cannot keep the order).
                        - `relaxed`: acks after the page-cache write; survives a broker
                          restart, not a power loss or panic.
-                       Halts, a person's words, mail to a person and read marks always
-                       flush in full before ack. Non-strict brokers flush and mark the
-                       log closed on SIGTERM/SIGINT/SIGHUP; an unclean stop across a
-                       reboot advances the log's generation.
-  --lifeline-fd <n>    descriptor <n> is the read end of a pipe or FIFO its launcher
-                       holds and never writes: the broker stops cleanly within seconds
-                       of its end-of-file (the launcher is gone, however it ended). For
-                       a test's or tool's throwaway broker; a supervised one takes none
-  --repair <log>       truncate <log> at its first corrupt record and exit (`nothing to
-                       repair` if clean; refuses if held by a running broker or written
-                       by a newer aterm release)
+                       Halts, a human's words, mail to a person and a person's read marks
+                       always flush in full before their ack. A non-strict broker flushes
+                       and marks its log closed on SIGTERM, SIGINT or SIGHUP; an unclean
+                       stop across a reboot advances the log's generation.
+  --lifeline-fd <n>    descriptor <n> is the read end of a pipe or FIFO its launcher holds
+                       and never writes: the broker exits cleanly within seconds of its
+                       end-of-file. For a test's or tool's throwaway broker; a supervised
+                       one takes none
+  --repair <log>       cut <log> at its first corrupt record and exit (`nothing to repair`
+                       when clean; refused while a running broker holds it, or for a log a
+                       newer aterm wrote)
 
-Prints `listening <socket>` when bound, keeps `<log>.health` (0600) beside the log,
-exits 0 when its executable is replaced or its socket file is removed or taken by
-another socket, and exits 75 when its log is poisoned so its supervisor can restart it.
-Retains `ev` records up to 7 days / 256 MiB, unread mail up to 7 days / 64 MiB, latest
-presence, and other records up to 7 days / 32 MiB (`<log>.held`).
+Prints `listening <socket>` once bound and keeps `<log>.health` (0600) beside the log.
+Exits 0 when its executable is replaced, its lifeline ends, or its socket path is removed
+or taken by another socket; exits 75 when its log is poisoned, so its supervisor restarts
+it. Retains `ev` records up to 7 days / 256 MiB, unread mail up to 7 days / 64 MiB, each
+presence row's latest value, and other records up to 7 days / 32 MiB (`<log>.held` keeps
+what compaction must not drop).
 ";
     let parsed = match crate::broker_args::BrokerArgs::parse(args) {
         Ok(parsed) => parsed,
@@ -989,11 +993,11 @@ fn mint(args: &[String]) -> ExitCode {
     const USAGE: &str = "\
 usage: aterm link mint <grant> --secret-file <path>
 
-  <grant>          e.g. `rw,p=<node>:/f/<fleet>/pub/<node>/>` or `ro:/f/<fleet>/pub/>`
-  --secret-file    32+ raw bytes, 0600: the mint key, used byte for byte (a file
-                   any other user can read, or a shorter one, is refused)
+  <grant>              e.g. `rw,p=<node>:/f/<fleet>/pub/<node>/>` or `ro:/f/<fleet>/pub/>`
+  --secret-file <path> the mint key, used byte for byte: 32+ raw bytes, 0600, in a 0700
+                       dir of yours (a looser mode, a symlink or fewer bytes is refused)
 
-Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file` reads.
+Prints one `<grant> <tag-hex>` line: append it to the file `serve --cap-file` reads.
 ";
     let mut grant: Option<&str> = None;
     let mut secret: Option<&str> = None;

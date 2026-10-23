@@ -2,7 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Headless recording replay engine ([`ReplayEngine::fork`]).
-//! Configures [`ReplayEngine::with_resize_law`] and [`ReplayEngine::with_host_resyncs_alt_screen`].
 
 use aterm_core::grid::{ResizeLaw, ResizePolicy};
 use aterm_core::terminal::{Terminal, TerminalCheckpoint};
@@ -113,7 +112,6 @@ mod tests {
     use crate::wire::visible_row;
     use aterm_core::terminal::AltArchiveQuery;
 
-    /// Whether `term`'s alt-screen archive records, as the `archive` verb reads it.
     fn archiving(term: &Terminal) -> bool {
         term.alt_archive_read(AltArchiveQuery::oldest(0, 0)).enabled
     }
@@ -124,7 +122,6 @@ mod tests {
             .collect()
     }
 
-    /// Whether `term` is set up as a replay of a session resizing under `policy`.
     fn replays(term: &Terminal, policy: ResizePolicy) -> bool {
         let console_host = policy == ResizePolicy::ConPty;
         let modes = term.modes();
@@ -133,12 +130,6 @@ mod tests {
             && modes.kitty_keyboard_enabled != console_host
     }
 
-    /// Both constructors, under both policies, give the engine of the
-    /// session: archive off, the policy's posture even when the checkpoint
-    /// carried the other host's, and a 6 -> 10 grow over seven history lines
-    /// laid out as the live engine laid it (Native reveals four of them,
-    /// ConPTY appends four blank rows). Negative control: a bare engine has
-    /// the archive on and no ConPTY posture, and its resize is Native's.
     #[test]
     fn every_replay_sets_archive_posture_and_policy() {
         let lines: Vec<u8> = (0..12)

@@ -2,6 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! Pure state and deadline model for caffeine wake assertions.
+//!
+//! A timed mode's deadline is on the boot clock ([`Clocks::since_boot`]), which counts time
+//! asleep and which no change of the date or time moves, so a span lasts what it was set for
+//! whatever the wall clock does; only what the person reads is on the wall clock
+//! ([`Clocks::wall_at`]).
 
 /// Seconds in an hour.
 pub const HOUR: u64 = 60 * 60;
@@ -76,6 +81,40 @@ impl Choice {
     }
 }
 
+/// One reading of the two clocks a mode is kept and shown against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Clocks {
+    /// Whole seconds since this Mac booted, time asleep included (`mach_continuous_time`): no
+    /// change of the date or time moves it, and every deadline is on it.
+    pub since_boot: u64,
+    /// Whole seconds since the Unix epoch, as the wall clock reads.
+    pub wall: u64,
+}
+
+impl Clocks {
+    /// What the wall clock reads at `deadline` on the boot clock, if the date is not changed
+    /// before it: the wall clock now plus the time to it (now, for a deadline gone).
+    #[inline]
+    #[must_use]
+    pub const fn wall_at(self, deadline: u64) -> u64 {
+        self.wall
+            .saturating_add(deadline.saturating_sub(self.since_boot))
+    }
+}
+
+/// These clocks `secs` later, with no change of the date in between.
+#[cfg(test)]
+impl core::ops::Add<u64> for Clocks {
+    type Output = Self;
+
+    fn add(self, secs: u64) -> Self {
+        Self {
+            since_boot: self.since_boot + secs,
+            wall: self.wall + secs,
+        }
+    }
+}
+
 /// Whether, and until when, this Mac is kept awake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -85,7 +124,7 @@ pub enum Mode {
     Forever,
     /// Keeping it awake until `deadline`.
     Until {
-        /// When it turns off.
+        /// When it turns off, on the boot clock ([`Clocks::since_boot`]).
         deadline: u64,
         /// The span it was set for.
         span: u64,
@@ -96,12 +135,12 @@ impl Mode {
     /// On for `span` seconds from `now`, or [`Mode::Forever`] for `None`.
     #[inline]
     #[must_use]
-    pub const fn activate(span: Option<u64>, now: u64) -> Self {
+    pub const fn activate(span: Option<u64>, now: Clocks) -> Self {
         match span {
             None => Self::Forever,
             Some(0) => Self::Off,
             Some(span) => Self::Until {
-                deadline: now.saturating_add(span),
+                deadline: now.since_boot.saturating_add(span),
                 span,
             },
         }
@@ -110,14 +149,14 @@ impl Mode {
     /// What a menu choice made at `now` turns the mug to.
     #[inline]
     #[must_use]
-    pub const fn chosen(choice: Choice, now: u64) -> Self {
+    pub const fn chosen(choice: Choice, now: Clocks) -> Self {
         Self::activate(choice.span(), now)
     }
 
     /// What a click at `now` turns the mug to: off when it is on, forever when it is off.
     #[inline]
     #[must_use]
-    pub const fn toggled(self, now: u64) -> Self {
+    pub const fn toggled(self, now: Clocks) -> Self {
         if self.is_on(now) {
             Self::Off
         } else {
@@ -125,12 +164,19 @@ impl Mode {
         }
     }
 
-    /// This mode as it stands at `now`.
+    /// This mode as it stands at `now`: off past its deadline, and with no more than its span
+    /// left (a deadline further off, which no choice sets, such as a hand-edited file's, comes
+    /// in to its span).
     #[inline]
     #[must_use]
-    pub const fn settled(self, now: u64) -> Self {
+    pub const fn settled(self, now: Clocks) -> Self {
+        let now = now.since_boot;
         match self {
             Self::Until { deadline, .. } if deadline <= now => Self::Off,
+            Self::Until { deadline, span } if deadline - now > span => Self::Until {
+                deadline: now + span,
+                span,
+            },
             other => other,
         }
     }
@@ -138,20 +184,20 @@ impl Mode {
     /// Whether the Mac is kept awake at `now`.
     #[inline]
     #[must_use]
-    pub const fn is_on(self, now: u64) -> bool {
+    pub const fn is_on(self, now: Clocks) -> bool {
         match self {
             Self::Off => false,
             Self::Forever => true,
-            Self::Until { deadline, .. } => deadline > now,
+            Self::Until { deadline, .. } => deadline > now.since_boot,
         }
     }
 
-    /// Seconds left at `now` of a timed mode.
+    /// Seconds left at `now` of a timed mode, at most its span.
     #[inline]
     #[must_use]
-    pub const fn remaining(self, now: u64) -> Option<u64> {
+    pub const fn remaining(self, now: Clocks) -> Option<u64> {
         match self.settled(now) {
-            Self::Until { deadline, .. } => Some(deadline - now),
+            Self::Until { deadline, .. } => Some(deadline - now.since_boot),
             Self::Off | Self::Forever => None,
         }
     }
@@ -159,7 +205,7 @@ impl Mode {
     /// The menu choice this mode was set by at `now`.
     #[inline]
     #[must_use]
-    pub const fn choice(self, now: u64) -> Option<Choice> {
+    pub const fn choice(self, now: Clocks) -> Option<Choice> {
         match self.settled(now) {
             Self::Off => None,
             Self::Forever => Some(Choice::Forever),
@@ -210,7 +256,12 @@ pub fn describe_left(secs: u64) -> String {
 mod tests {
     use super::*;
 
-    const NOW: u64 = 1_790_000_000;
+    const NOW: Clocks = Clocks {
+        since_boot: 300_000,
+        wall: 1_790_000_000,
+    };
+    const DAY: u64 = 24 * HOUR;
+    const TIMED: [Choice; 3] = [Choice::Hours1, Choice::Hours8, Choice::Hours24];
 
     #[test]
     fn a_click_turns_it_on_forever_and_the_next_one_off() {
@@ -234,12 +285,12 @@ mod tests {
                     assert_eq!(
                         mode,
                         Mode::Until {
-                            deadline: NOW + span,
+                            deadline: NOW.since_boot + span,
                             span
                         }
                     );
                     assert_eq!(mode.remaining(NOW), Some(span));
-                    assert!(mode.is_on(NOW + span - 1));
+                    assert!(mode.is_on(NOW + (span - 1)));
                     assert!(!mode.is_on(NOW + span));
                     assert_eq!(mode.settled(NOW + span), Mode::Off);
                     assert_eq!(mode.choice(NOW + span), None);
@@ -252,14 +303,102 @@ mod tests {
     fn off_and_forever_have_no_time_left() {
         assert_eq!(Mode::Off.remaining(NOW), None);
         assert_eq!(Mode::Forever.remaining(NOW), None);
-        assert_eq!(Mode::Forever.settled(u64::MAX), Mode::Forever);
+        let end = Clocks {
+            since_boot: u64::MAX,
+            wall: u64::MAX,
+        };
+        assert_eq!(Mode::Forever.settled(end), Mode::Forever);
         assert_eq!(Mode::activate(Some(0), NOW), Mode::Off);
         assert_eq!(
-            Mode::activate(Some(HOUR), u64::MAX),
+            Mode::activate(Some(HOUR), end),
             Mode::Until {
                 deadline: u64::MAX,
                 span: HOUR
             }
+        );
+    }
+
+    /// The wall clock set back a day ten minutes into a span (by the person, or by the Mac
+    /// correcting a clock that ran fast) leaves the span the time it had: it keeps the Mac awake
+    /// no longer than it was set for, and its end on the wall clock moves back with the date.
+    #[test]
+    fn a_wall_clock_set_back_keeps_no_span_longer_than_it_was_set_for() {
+        for choice in TIMED {
+            let span = choice.span().expect("timed");
+            let mode = Mode::chosen(choice, NOW);
+            let back = Clocks {
+                since_boot: NOW.since_boot + 600,
+                wall: NOW.wall - DAY + 600,
+            };
+            assert_eq!(mode.remaining(back), Some(span - 600), "{choice:?}");
+            assert_eq!(mode.choice(back), Some(choice), "{choice:?}");
+            assert_eq!(
+                back.wall_at(NOW.since_boot + span),
+                NOW.wall - DAY + span,
+                "{choice:?}"
+            );
+            assert!(mode.is_on(back + (span - 601)), "{choice:?}");
+            assert!(
+                !mode.is_on(back + (span - 600)),
+                "{choice:?}: ended on time"
+            );
+            assert_eq!(mode.settled(back + (span - 600)), Mode::Off, "{choice:?}");
+        }
+    }
+
+    /// The wall clock set forward a day ten minutes into a span ends nothing early.
+    #[test]
+    fn a_wall_clock_set_forward_ends_no_span_early() {
+        for choice in TIMED {
+            let span = choice.span().expect("timed");
+            let mode = Mode::chosen(choice, NOW);
+            let ahead = Clocks {
+                since_boot: NOW.since_boot + 600,
+                wall: NOW.wall + DAY + 600,
+            };
+            assert!(mode.is_on(ahead), "{choice:?}");
+            assert_eq!(mode.remaining(ahead), Some(span - 600), "{choice:?}");
+            assert_eq!(mode.choice(ahead), Some(choice), "{choice:?}");
+            assert_eq!(
+                mode.toggled(ahead),
+                Mode::Off,
+                "{choice:?}: a click turns it off"
+            );
+        }
+    }
+
+    /// Time asleep counts, as the boot clock counts it: a span a sleep outlasts has ended at the
+    /// wake, and one that outlasts the sleep has that much less left.
+    #[test]
+    fn time_asleep_counts_toward_a_span() {
+        let woke = NOW + 2 * HOUR;
+        assert_eq!(Mode::chosen(Choice::Hours1, NOW).settled(woke), Mode::Off);
+        assert!(!Mode::chosen(Choice::Hours1, NOW).is_on(woke));
+        assert_eq!(
+            Mode::chosen(Choice::Hours8, NOW).remaining(woke),
+            Some(6 * HOUR)
+        );
+    }
+
+    /// However its deadline came to be, a timed mode never has more than its span left, and
+    /// settles to that; settled, it ends a span later.
+    #[test]
+    fn no_timed_mode_has_more_than_its_span_left() {
+        let far = Mode::Until {
+            deadline: NOW.since_boot + DAY,
+            span: HOUR,
+        };
+        assert!(far.is_on(NOW));
+        assert_eq!(far.remaining(NOW), Some(HOUR));
+        assert_eq!(far.choice(NOW), Some(Choice::Hours1));
+        let settled = far.settled(NOW);
+        assert_eq!(settled, Mode::chosen(Choice::Hours1, NOW));
+        assert_eq!(settled.settled(NOW + HOUR), Mode::Off);
+        let near = Mode::chosen(Choice::Hours8, NOW);
+        assert_eq!(
+            near.settled(NOW + 60),
+            near,
+            "a deadline its span away is kept"
         );
     }
 

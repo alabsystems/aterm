@@ -93,7 +93,7 @@ impl Log {
 pub struct Scratch(aterm_tempfile::TempDir);
 
 impl Scratch {
-    /// `<tmp>/atpkg-publish-<label>-<pid>_<random>_<n>`, fresh.
+    /// Creates a fresh `<tmp>/atpkg-publish-<label>-<pid>_<random>_<n>` directory.
     ///
     /// # Errors
     ///
@@ -106,7 +106,7 @@ impl Scratch {
             .map_err(|e| Error::io("create a private scratch directory", &e))
     }
 
-    /// Its path.
+    /// Returns the scratch directory path.
     #[must_use]
     pub fn path(&self) -> &Path {
         self.0.path()

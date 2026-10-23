@@ -21,8 +21,6 @@ pub const STALLED_AFTER_SECS: i64 = 12 * 3600;
 /// Attempt counters and notification stamps older than this are swept.
 pub const PRUNE_AFTER_SECS: i64 = 30 * 86_400;
 
-/// The first line of a pins record: the targets it was resolved for. A build number is
-/// comparable only to one resolved the same way.
 const STAMP: &str = "# pins-resolved-for ";
 
 /// Where one lane keeps its state.

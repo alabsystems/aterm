@@ -236,12 +236,72 @@ pub fn decode_quoted_printable(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+pub(super) fn is_quoted_printable_email(raw_email: &str) -> bool {
+    let lower = raw_email.to_ascii_lowercase();
+    lower.contains("quoted-printable")
+        || raw_email.contains("=3D")
+        || raw_email.contains("=3d")
+        || raw_email.contains("=\r\n")
+}
+
 pub(super) fn decode_html_amp(input: &str) -> String {
     input
         .replace("&amp;", "&")
         .replace("&#38;", "&")
         .replace("&#x26;", "&")
+        .replace("&#X26;", "&")
         .replace("&#61;", "=")
+        .replace("&#x3d;", "=")
+        .replace("&#x3D;", "=")
+        .replace("&nbsp;", " ")
+        .replace("&#160;", " ")
+        .replace("&#xa0;", " ")
+        .replace("&#xA0;", " ")
+        .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#x22;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+}
+
+pub(super) fn extract_iframe_srcdoc_fragments(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let mut fragments = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = lower[search_from..].find("srcdoc") {
+        let after_name = search_from + rel + "srcdoc".len();
+        let rest = &input[after_name..];
+        let trimmed = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        let Some(after_eq) = trimmed.strip_prefix('=') else {
+            search_from = after_name;
+            continue;
+        };
+        let after_eq = after_eq.trim_start_matches([' ', '\t', '\r', '\n']);
+        let Some(quote) = after_eq.chars().next().filter(|&c| c == '"' || c == '\'') else {
+            search_from = after_name;
+            continue;
+        };
+        let value_start = &after_eq[quote.len_utf8()..];
+        let Some(end_idx) = value_start.find(quote) else {
+            break;
+        };
+        let raw_srcdoc = &value_start[..end_idx];
+        let unescaped = decode_html_amp(&decode_html_amp(raw_srcdoc))
+            .replace("&lt;", "<")
+            .replace("&#60;", "<")
+            .replace("&#x3c;", "<")
+            .replace("&#x3C;", "<")
+            .replace("&gt;", ">")
+            .replace("&#62;", ">")
+            .replace("&#x3e;", ">")
+            .replace("&#x3E;", ">");
+        fragments.push(unescaped);
+        let consumed = input.len() - value_start.len() + end_idx + quote.len_utf8();
+        search_from = consumed;
+    }
+    fragments.reverse();
+    fragments.join("\n")
 }
 
 fn decode_base64_block(input: &str) -> Option<String> {
@@ -370,12 +430,139 @@ fn json_value_matches_email(val: &Value, target: &str) -> bool {
         Value::Array(items) => items
             .iter()
             .any(|item| json_value_matches_email(item, target)),
-        Value::Object(map) => map.iter().any(|(k, v)| {
-            matches!(k.to_ascii_lowercase().as_str(), "email" | "address")
-                && json_value_matches_email(v, target)
-        }),
+        Value::Object(map) => {
+            let mut mailbox_part: Option<&str> = None;
+            let mut domain_part: Option<&str> = None;
+            for (k, v) in map {
+                if let Some(s) = v.as_str() {
+                    match k.to_ascii_lowercase().as_str() {
+                        "mailbox" | "local" | "localpart" | "local_part" | "user" => {
+                            mailbox_part = Some(s.trim());
+                        }
+                        "domain" | "host" => {
+                            domain_part = Some(s.trim());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let (Some(mb), Some(dom)) = (mailbox_part, domain_part)
+                && !mb.is_empty()
+                && !dom.is_empty()
+                && contains_matching_email(&format!("{mb}@{dom}"), target)
+            {
+                return true;
+            }
+            map.iter().any(|(k, v)| {
+                matches!(
+                    k.to_ascii_lowercase().as_str(),
+                    "email"
+                        | "address"
+                        | "emailaddress"
+                        | "email_address"
+                        | "to"
+                        | "tofull"
+                        | "to_full"
+                        | "torecipients"
+                        | "to_recipients"
+                        | "recipients"
+                        | "recipient"
+                        | "delivered_to"
+                        | "delivered-to"
+                        | "x-original-to"
+                        | "envelope-to"
+                        | "targets"
+                        | "value"
+                ) && json_value_matches_email(v, target)
+            })
+        }
         _ => false,
     }
+}
+
+fn is_json_recipient_key(key_lower: &str) -> bool {
+    matches!(
+        key_lower,
+        "to" | "tofull"
+            | "to_full"
+            | "torecipients"
+            | "to_recipients"
+            | "recipients"
+            | "recipient"
+            | "delivered_to"
+            | "delivered-to"
+            | "x-original-to"
+            | "envelope-to"
+            | "rcpt_to"
+            | "rcpt-to"
+    )
+}
+
+fn json_value_is_nonempty(val: &Value) -> bool {
+    match val {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty(),
+        Value::Array(arr) => !arr.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        _ => true,
+    }
+}
+
+fn check_json_recipients(obj: &aterm_json::Map, target: &str, depth: usize) -> (bool, bool) {
+    if depth > 6 {
+        return (false, false);
+    }
+    let mut saw_recipient = false;
+    let mut matched = false;
+    for (k, val) in obj {
+        let key = k.to_ascii_lowercase();
+        if is_json_recipient_key(&key) && json_value_is_nonempty(val) {
+            saw_recipient = true;
+            if json_value_matches_email(val, target) {
+                matched = true;
+            }
+        } else if matches!(key.as_str(), "headers" | "header") {
+            if let Some(hdr_map) = val.as_object() {
+                let (s, m) = check_json_recipients(hdr_map, target, depth + 1);
+                saw_recipient |= s;
+                matched |= m;
+            } else if let Some(hdr_arr) = val.as_array() {
+                for item in hdr_arr {
+                    let Some(item_obj) = item.as_object() else {
+                        continue;
+                    };
+                    let hdr_name = item_obj
+                        .iter()
+                        .find_map(|(hk, hv)| {
+                            matches!(hk.to_ascii_lowercase().as_str(), "name" | "key" | "header")
+                                .then(|| hv.as_str())
+                                .flatten()
+                        })
+                        .unwrap_or("");
+                    if is_json_recipient_key(&hdr_name.trim().to_ascii_lowercase())
+                        && let Some((_, hv)) = item_obj.iter().find(|(hk, _)| {
+                            matches!(hk.to_ascii_lowercase().as_str(), "value" | "values" | "val")
+                        })
+                        && json_value_is_nonempty(hv)
+                    {
+                        saw_recipient = true;
+                        if json_value_matches_email(hv, target) {
+                            matched = true;
+                        }
+                    }
+                }
+            }
+        } else if matches!(
+            key.as_str(),
+            "envelope" | "content" | "payload" | "data" | "message" | "mail"
+        ) && let Some(sub_obj) = val.as_object()
+        {
+            let (s, m) = check_json_recipients(sub_obj, target, depth + 1);
+            saw_recipient |= s;
+            matched |= m;
+        }
+    }
+    (saw_recipient, matched)
 }
 
 pub(super) fn email_matches_target(raw_email: &str, target: &str) -> bool {
@@ -386,17 +573,9 @@ pub(super) fn email_matches_target(raw_email: &str, target: &str) -> bool {
     if let Ok(doc) = aterm_json::from_str::<Value>(raw_email)
         && let Some(obj) = doc.as_object()
     {
-        let mut saw_json_recipient = false;
-        for (k, val) in obj {
-            if matches!(
-                k.to_ascii_lowercase().as_str(),
-                "to" | "recipients" | "recipient" | "delivered_to"
-            ) {
-                saw_json_recipient = true;
-                if json_value_matches_email(val, target_trimmed) {
-                    return true;
-                }
-            }
+        let (saw_json_recipient, matched) = check_json_recipients(obj, target_trimmed, 0);
+        if matched {
+            return true;
         }
         if saw_json_recipient {
             return false;
@@ -443,6 +622,288 @@ fn is_non_auth_link(url: &str) -> bool {
         || path.ends_with(".js")
 }
 
+fn json_headers_transfer_encoding(obj: &aterm_json::Map) -> (bool, bool) {
+    let mut is_b64 = false;
+    let mut is_qp = false;
+    let mut inspect_str = |s: &str| {
+        let lower = s.trim().to_ascii_lowercase();
+        if lower.starts_with("base64") {
+            is_b64 = true;
+        } else if lower.contains("quoted-printable") {
+            is_qp = true;
+        }
+    };
+    let mut inspect_val = |v: &Value| match v {
+        Value::String(s) => inspect_str(s),
+        Value::Array(arr) => {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    inspect_str(s);
+                }
+            }
+        }
+        _ => {}
+    };
+    for (k, v) in obj {
+        let key = k.to_ascii_lowercase();
+        if matches!(
+            key.as_str(),
+            "content-transfer-encoding" | "content_transfer_encoding" | "encoding"
+        ) {
+            inspect_val(v);
+        } else if matches!(key.as_str(), "headers" | "header") {
+            if let Some(hdr_map) = v.as_object() {
+                for (hk, hv) in hdr_map {
+                    if hk.eq_ignore_ascii_case("content-transfer-encoding") {
+                        inspect_val(hv);
+                    }
+                }
+            } else if let Some(hdr_arr) = v.as_array() {
+                for item in hdr_arr {
+                    if let Some(item_obj) = item.as_object() {
+                        let is_cte = item_obj.iter().any(|(hk, hv)| {
+                            matches!(hk.to_ascii_lowercase().as_str(), "name" | "key")
+                                && hv.as_str().is_some_and(|s| {
+                                    s.trim().eq_ignore_ascii_case("content-transfer-encoding")
+                                })
+                        });
+                        if is_cte {
+                            for (hk, hv) in item_obj {
+                                if matches!(hk.to_ascii_lowercase().as_str(), "value" | "values") {
+                                    inspect_val(hv);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (is_b64, is_qp)
+}
+
+fn append_decoded_json_body_str(s: &str, is_b64: bool, is_qp: bool, extra_text: &mut String) {
+    if is_b64 && let Some(decoded) = decode_base64_block(s) {
+        extra_text.push('\n');
+        if is_quoted_printable_email(&decoded) {
+            extra_text.push_str(&decode_quoted_printable(&decoded));
+        } else {
+            extra_text.push_str(&decoded);
+        }
+        return;
+    }
+    extra_text.push('\n');
+    if is_qp || is_quoted_printable_email(s) {
+        let decoded = decode_quoted_printable(s);
+        extra_text.push_str(&decoded);
+        extra_text.push_str(&decode_mime_base64_parts(&decoded));
+    } else {
+        extra_text.push_str(s);
+        extra_text.push_str(&decode_mime_base64_parts(s));
+    }
+}
+
+pub(super) fn extract_json_email_fields(
+    doc: &Value,
+    explicit_urls: &mut Vec<String>,
+    explicit_otps: &mut Vec<String>,
+    extra_text: &mut String,
+) {
+    extract_json_email_fields_inner(doc, explicit_urls, explicit_otps, extra_text, 0);
+}
+
+fn extract_json_email_fields_inner(
+    val: &Value,
+    explicit_urls: &mut Vec<String>,
+    explicit_otps: &mut Vec<String>,
+    extra_text: &mut String,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    match val {
+        Value::Array(items) => {
+            for item in items {
+                extract_json_email_fields_inner(
+                    item,
+                    explicit_urls,
+                    explicit_otps,
+                    extra_text,
+                    depth + 1,
+                );
+            }
+        }
+        Value::Object(obj) => {
+            let (is_b64, is_qp) = json_headers_transfer_encoding(obj);
+            for (k, v) in obj {
+                let key = k.to_ascii_lowercase();
+                if matches!(
+                    key.as_str(),
+                    "magic_url"
+                        | "verify_url"
+                        | "login_url"
+                        | "url"
+                        | "confirmation_url"
+                        | "action_url"
+                ) && let Some(u) = v.as_str()
+                    && is_supported_auth_url(u)
+                    && !is_non_auth_link(u)
+                    && !explicit_urls.iter().any(|existing| existing == u)
+                {
+                    explicit_urls.push(u.to_owned());
+                }
+                if matches!(
+                    key.as_str(),
+                    "otp" | "code" | "verification_code" | "login_code"
+                ) && let Some(c) = v.as_str()
+                {
+                    let trimmed = c.trim();
+                    if trimmed.len() == 6
+                        && trimmed.bytes().all(|b| b.is_ascii_digit())
+                        && !explicit_otps.iter().any(|existing| existing == trimmed)
+                    {
+                        explicit_otps.push(trimmed.to_owned());
+                    }
+                }
+                if matches!(
+                    key.as_str(),
+                    "body"
+                        | "html"
+                        | "text"
+                        | "plain"
+                        | "textbody"
+                        | "htmlbody"
+                        | "text_body"
+                        | "html_body"
+                        | "raw"
+                        | "snippet"
+                        | "bodypreview"
+                        | "body_preview"
+                        | "subject"
+                        | "content"
+                ) {
+                    if let Some(s) = v.as_str() {
+                        append_decoded_json_body_str(s, is_b64, is_qp, extra_text);
+                    } else if key == "subject"
+                        && let Some(arr) = v.as_array()
+                    {
+                        for item in arr {
+                            if let Some(s) = item.as_str() {
+                                append_decoded_json_body_str(s, is_b64, is_qp, extra_text);
+                            }
+                        }
+                    } else if v.is_object() || v.is_array() {
+                        extract_json_email_fields_inner(
+                            v,
+                            explicit_urls,
+                            explicit_otps,
+                            extra_text,
+                            depth + 1,
+                        );
+                    }
+                } else if matches!(key.as_str(), "headers" | "header") {
+                    if let Some(hdr_map) = v.as_object() {
+                        for (hk, hv) in hdr_map {
+                            if hk.eq_ignore_ascii_case("subject") {
+                                if let Some(s) = hv.as_str() {
+                                    append_decoded_json_body_str(s, false, false, extra_text);
+                                } else if let Some(arr) = hv.as_array() {
+                                    for item in arr {
+                                        if let Some(s) = item.as_str() {
+                                            append_decoded_json_body_str(
+                                                s, false, false, extra_text,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(hdr_arr) = v.as_array() {
+                        for item in hdr_arr {
+                            if let Some(item_obj) = item.as_object() {
+                                let is_subj = item_obj.iter().any(|(hk, hv)| {
+                                    matches!(
+                                        hk.to_ascii_lowercase().as_str(),
+                                        "name" | "key" | "header"
+                                    ) && hv
+                                        .as_str()
+                                        .is_some_and(|s| s.trim().eq_ignore_ascii_case("subject"))
+                                });
+                                if is_subj {
+                                    for (hk, hv) in item_obj {
+                                        if matches!(
+                                            hk.to_ascii_lowercase().as_str(),
+                                            "value" | "values" | "val"
+                                        ) && let Some(s) = hv.as_str()
+                                        {
+                                            append_decoded_json_body_str(
+                                                s, false, false, extra_text,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if key == "data" {
+                    if let Some(s) = v.as_str() {
+                        if s.contains("://") || s.contains('<') || s.contains(' ') {
+                            append_decoded_json_body_str(s, is_b64, is_qp, extra_text);
+                        } else if s.len() >= 8
+                            && let Some(decoded) = decode_base64_block(s)
+                            && decoded.bytes().all(|b| {
+                                !b.is_ascii_control() || matches!(b, b'\r' | b'\n' | b'\t')
+                            })
+                        {
+                            append_decoded_json_body_str(&decoded, false, is_qp, extra_text);
+                        }
+                    } else if v.is_object() || v.is_array() {
+                        extract_json_email_fields_inner(
+                            v,
+                            explicit_urls,
+                            explicit_otps,
+                            extra_text,
+                            depth + 1,
+                        );
+                    }
+                } else if matches!(key.as_str(), "bodyvalues" | "body_values")
+                    && let Some(bv_map) = v.as_object()
+                {
+                    for part in bv_map.values() {
+                        if let Some(part_obj) = part.as_object() {
+                            for (pk, pv) in part_obj {
+                                if matches!(
+                                    pk.to_ascii_lowercase().as_str(),
+                                    "value" | "body" | "text" | "html"
+                                ) && let Some(s) = pv.as_str()
+                                {
+                                    append_decoded_json_body_str(s, is_b64, is_qp, extra_text);
+                                }
+                            }
+                        } else if let Some(s) = part.as_str() {
+                            append_decoded_json_body_str(s, is_b64, is_qp, extra_text);
+                        }
+                    }
+                } else if matches!(
+                    key.as_str(),
+                    "message" | "mail" | "payload" | "mime" | "parts" | "attributes"
+                ) && (v.is_object() || v.is_array())
+                {
+                    extract_json_email_fields_inner(
+                        v,
+                        explicit_urls,
+                        explicit_otps,
+                        extra_text,
+                        depth + 1,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Extracts all candidate verification or magic-link URLs from `raw_email` addressed to
 /// `target_email` in priority order.
 #[must_use]
@@ -454,40 +915,27 @@ pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str
     }
     let mut extra_text = decode_mime_base64_parts(raw_email);
     let mut explicit_urls = Vec::new();
-    if let Ok(doc) = aterm_json::from_str::<Value>(raw_email)
-        && let Some(obj) = doc.as_object()
-    {
-        for (k, v) in obj {
-            if matches!(
-                k.to_ascii_lowercase().as_str(),
-                "magic_url" | "verify_url" | "login_url" | "url"
-            ) && let Some(u) = v.as_str()
-                && is_supported_auth_url(u)
-                && !is_non_auth_link(u)
-                && !explicit_urls.iter().any(|existing| existing == u)
-            {
-                explicit_urls.push(u.to_owned());
-            }
-            if matches!(
-                k.to_ascii_lowercase().as_str(),
-                "body" | "html" | "text" | "raw" | "snippet" | "subject"
-            ) && let Some(s) = v.as_str()
-            {
-                extra_text.push('\n');
-                extra_text.push_str(s);
-                extra_text.push_str(&decode_mime_base64_parts(s));
-            }
+    let mut ignored_otps = Vec::new();
+    let mut is_json_with_body = false;
+    if let Ok(doc) = aterm_json::from_str::<Value>(raw_email) {
+        let before_len = extra_text.len();
+        extract_json_email_fields(&doc, &mut explicit_urls, &mut ignored_otps, &mut extra_text);
+        if doc.is_object() && !extra_text[before_len..].trim().is_empty() {
+            is_json_with_body = true;
         }
     }
     if !explicit_urls.is_empty() {
         return explicit_urls;
     }
-    let qp_decoded = decode_quoted_printable(raw_email);
-    let combined = if extra_text.is_empty() {
-        qp_decoded
+    let qp_decoded = if is_json_with_body {
+        String::new()
+    } else if is_quoted_printable_email(raw_email) {
+        decode_quoted_printable(raw_email)
     } else {
-        format!("{qp_decoded}\n{extra_text}")
+        raw_email.to_owned()
     };
+    let srcdoc_extra = extract_iframe_srcdoc_fragments(&format!("{qp_decoded}\n{extra_text}"));
+    let combined = format!("{srcdoc_extra}\n{extra_text}\n{qp_decoded}");
     let decoded = decode_html_amp(&combined);
     let mut urls = Vec::new();
     for scheme in ["https://", "http://127.0.0.1:", "http://localhost:"] {

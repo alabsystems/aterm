@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 OF `FabricExactlyOnce` (`aterm-models-session`, exactly once across the bridge's round at
-//! one inbox offset): the simulated world, projected onto the model after every step, one inbox
-//! OFFSET at a time.
+//! Conformance tap projecting the simulated link world onto `FabricExactlyOnce`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 
-/// The most model actions one step of the world may take, from a bridge pass that
-/// tells the endpoint, delivers and commits in one go to a broker restart.
 const DEPTH: usize = 8;
 
 /// What one session looks like to the tap.
@@ -57,10 +53,8 @@ struct Slot {
     done: bool,
 }
 
-/// A projection: `(occ, lost, g, past, pend, alive, told, dd, nr, nr2)`.
 type Key = [i64; 10];
 
-/// The model state's projection.
 fn key_of(s: &State, offset: i64) -> Key {
     [
         s["occ"],
@@ -115,10 +109,6 @@ impl Tap {
         }
     }
 
-    /// The projection of `slot` in `view`, or `None` once it is out of the model's
-    /// domain: its session gone, the log moved more than the model's bound, or the bus
-    /// holding what the model has no name for (a third message, or anything but the
-    /// session's mail, at the offset; the slot's message at another offset).
     fn project(&self, slot: &mut Slot, view: &View, markers: &BTreeSet<String>) -> Option<Key> {
         let session = view.sessions.get(&slot.sid)?;
         let at = usize::try_from(slot.off).ok()?;
@@ -187,8 +177,6 @@ impl Tap {
         ])
     }
 
-    /// Every model state reachable from `from` in at most [`DEPTH`] actions whose
-    /// projection is `want`, with the actions that reach it.
     fn reach(&self, from: &[State], want: Key) -> Option<(Vec<State>, Vec<&'static str>)> {
         let mut frontier: Vec<(State, Vec<&'static str>)> =
             from.iter().map(|s| (s.clone(), Vec::new())).collect();
@@ -287,11 +275,6 @@ impl Tap {
     }
 }
 
-/// The states a slot opens in: the model's own, and the same with a move the
-/// endpoint is still to be told of — a record can land on a moved log before the
-/// bridge reattaches. If that move took what sat at the offset before, the
-/// endpoint may still remember the offset (`dd`) until the tell forgets it (`mv =
-/// 1`); if it took nothing there, it remembers nothing of it (`mv = 2`).
 fn initial(model: &Model) -> Vec<State> {
     let init = model.init_state();
     let untold = |mv: i64, dd: i64| {

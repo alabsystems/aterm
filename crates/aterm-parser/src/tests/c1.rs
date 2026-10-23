@@ -198,8 +198,6 @@ fn parse_c1_osc_with_c1_st() {
     assert_eq!(parser.state(), State::Ground);
 }
 
-/// With C1 controls off, a C1 introducer mid-sequence is dropped: 0x9B in
-/// `CsiParam` must not inject a new CSI from inside one.
 #[test]
 fn c1_disabled_blocks_injection_in_csi_param_state() {
     let mut parser = Parser::new();
@@ -214,7 +212,6 @@ fn c1_disabled_blocks_injection_in_csi_param_state() {
     );
 }
 
-/// With C1 controls off, 0x9B in `Escape` is dropped.
 #[test]
 fn c1_disabled_blocks_injection_in_escape_state() {
     let mut parser = Parser::new();
@@ -229,7 +226,6 @@ fn c1_disabled_blocks_injection_in_escape_state() {
     );
 }
 
-/// With C1 controls off, 0x90 (DCS) and 0x9D (OSC) are dropped mid-CSI too.
 #[test]
 fn c1_disabled_blocks_dcs_osc_injection_mid_sequence() {
     let mut parser = Parser::new();
@@ -250,14 +246,6 @@ fn c1_disabled_blocks_dcs_osc_injection_mid_sequence() {
     );
 }
 
-/// AN IGNORED DCS STRING READS EVERY BYTE AS A HOOKED ONE DOES. `DcsIgnore`
-/// (a DCS whose header is malformed: a `:` parameter, a private marker after a
-/// parameter, a parameter byte after an intermediate) is a control string like
-/// `DcsPassthrough`; the DEC parser ignores everything in it up to ST, with
-/// GR bytes (`0xA0..=0xFF`, every UTF-8 lead and most continuations) read as
-/// their GL equivalents. A UTF-8 byte in the payload must not leave the string
-/// (`ESC P 1 : h é llo ❯ ls ESC \ after` must print only `after`), and with C1
-/// controls off `0x9C` must still end it as it ends a hooked DCS.
 #[test]
 fn an_ignored_dcs_reads_every_byte_as_a_hooked_one() {
     for byte in 0..=u8::MAX {
@@ -336,18 +324,6 @@ fn an_ignored_dcs_reads_every_byte_as_a_hooked_one() {
     assert_eq!(sink.prints.iter().collect::<String>(), "afterafter");
 }
 
-/// A `0x9C` INSIDE A UTF-8 CHARACTER DOES NOT END THE STRING. With C1 controls
-/// off, a DCS (hooked or ignored) and an SOS, PM or APC string end at the 8-bit
-/// ST `0x9C` — but `0x9C` is also a UTF-8 continuation byte, about one in 64 of
-/// them: U+672C 本 is `E6 9C AC`. A payload carrying such a character ended
-/// inside it, and the rest of the payload printed and ran as terminal input:
-/// `ESC P 1 : 本 x ESC \ after` printed `\u{fffd}xafter`, and a tmux
-/// control-mode or passthrough line, a kitty command's JSON or an APC payload
-/// did the same. A `0x9C` that extends the well-formed UTF-8 prefix the payload
-/// ends in (Unicode Table 3-7, the Ground decoder's own predicate) is that
-/// character's byte; anywhere else it is ST — after ASCII, after a whole
-/// character, after a lead it cannot follow (`E0`, `F4`), after a broken
-/// prefix. With C1 controls on, a raw `0x9C` is the 8-bit ST wherever it falls.
 #[test]
 fn a_0x9c_inside_a_utf8_character_does_not_end_the_string() {
     let payload = "\u{71c}\u{672c}\u{d71c}\u{1f71c}\u{1c71c} x \u{672c}\u{672c}";
@@ -427,11 +403,6 @@ fn a_0x9c_inside_a_utf8_character_does_not_end_the_string() {
     }
 }
 
-/// A GR BYTE IN A DCS HEADER KEEPS THE STRING (round fifteen, R15-PARSER-P2).
-/// A GR byte (`0xA0..=0xFF`) in `DcsEntry`, `DcsParam` or `DcsIntermediate`
-/// sent the parser to Ground, so the string after it printed and ran as
-/// terminal input: `ESC P 1 é q #0;2;0;0;0#0~~~~ ESC \ after` printed
-/// `\u{fffd}q#0;2;0;0;0#0~~~~after`. The header now ignores it, as vte's does.
 #[test]
 fn a_gr_byte_in_a_dcs_header_keeps_the_string() {
     for state in [State::DcsEntry, State::DcsParam, State::DcsIntermediate] {

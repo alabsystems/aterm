@@ -199,7 +199,6 @@ impl Cell {
         } else if fg.is_indexed() {
             self.colors = colors.set_fg_indexed(fg.index());
         } else {
-            // RGB: the value itself lives in `CellExtras`.
             self.colors = colors.with_rgb_fg();
         }
     }

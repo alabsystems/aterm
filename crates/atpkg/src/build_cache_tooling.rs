@@ -8,11 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use super::{Planned, RECLAIM_IDLE, Unused};
 
-/// How far under a row its use is read: `bin/<tool>`, `lib/<library>`.
 const DEPTH: usize = 2;
-
-/// What a pass renames a row to before removing it: a scratch name, so a resolver never
-/// reads it as a row.
 const STAGE: &str = ".provision-reclaim-";
 
 /// The tooling cache under `home`, on macOS's rule (`aterm_uds::host::user_cache`):
@@ -23,8 +19,6 @@ pub fn root(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join("Library/Caches/aterm/tooling.noindex"))
 }
 
-/// The last use of `path` and what it holds `depth` more levels down, never following a
-/// link: a file's modification or access time, a folder's or a link's modification time.
 fn last_used(path: &Path, depth: usize) -> Option<SystemTime> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     let mut newest = meta.modified().ok()?;
@@ -43,11 +37,8 @@ fn last_used(path: &Path, depth: usize) -> Option<SystemTime> {
     Some(newest)
 }
 
-/// Why the root's child `entry` goes at `now`, if it does: a completed row's stage at
-/// once, a row unused for [`RECLAIM_IDLE`], or a scratch carrying both its give-up stamp
-/// and a run's proof. Both markers must be regular files, not links. Elapsed time or a
-/// reboot cannot prove an image ran. Current failed provisioning paths publish no run
-/// proof, so their scratches stay, as do live scratches, scratch stages and nonfolders.
+// Scratch rows are reclaimed only when both EXEC_STAMP and RAN exist as regular files, since
+// elapsed time or a reboot cannot prove an image finished running.
 fn why(entry: &Path, now: SystemTime) -> Option<Unused> {
     let name = entry.file_name()?.to_str()?;
     if !std::fs::symlink_metadata(entry).is_ok_and(|m| m.is_dir()) {
@@ -70,7 +61,6 @@ fn why(entry: &Path, now: SystemTime) -> Option<Unused> {
     (idle >= after).then_some(Unused::Tooling { idle, after })
 }
 
-/// The root's folders, sorted.
 fn entries(root: &Path) -> Vec<PathBuf> {
     if !std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
         return Vec::new();
@@ -278,7 +268,6 @@ mod tests {
 
     /// Only an actual run proof admits a given-up scratch. Old, malformed and pre-reboot
     /// exec stamps without proof stay; so do live scratches and non-file/link markers.
-    /// The private files are metadata stand-ins, never copied or executed programs.
     #[cfg(unix)]
     #[test]
     fn a_given_up_scratch_goes_only_after_its_run_is_proven() {

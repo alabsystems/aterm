@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Scripted Linux baseline session (`linux baseline`): records and replays `<class> <key> <value>` lines (`=` behaviour, `~` measured, `@` stack, `#` comment) per architecture and [`guest::Screen::BASELINE`].
+//! Scripted Linux baseline session (`linux baseline`).
 //! STOCK EXCEPTION: the guest builds with rustup's stock toolchain, as [`crate::linux_proof`] does.
 
 use std::collections::BTreeSet;
@@ -21,7 +21,6 @@ pub(crate) use deck::{row as deck_row, row_name as deck_row_name};
 
 /// Committed recordings directory under the checkout.
 pub const DIR: &str = "crates/aterm-lab/linux-baseline";
-
 /// AT-SPI root application name for `aterm-gui`.
 pub const APP: &str = "aterm-gui";
 
@@ -36,13 +35,10 @@ pub const IME_COMPOSED: &str = "X-\u{e9}-Y";
 
 /// IBus engine for dead-key XIM composition.
 pub const XIM_ENGINE: &str = "xkb:us::eng";
-
 /// IBus CJK engine for pinyin XIM composition.
 pub const XIM_CJK_ENGINE: &str = "libpinyin";
-
 /// Pinyin keys typed to [`XIM_CJK_ENGINE`].
 pub const XIM_CJK_KEYS: [&str; 5] = ["n", "i", "h", "a", "o"];
-
 /// Committed first candidate for [`XIM_CJK_KEYS`].
 pub const XIM_CJK_TEXT: &str = "\u{4f60}\u{597d}";
 

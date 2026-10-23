@@ -1,26 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of `OccupancyDoor` (`docs/DESIGN-harness-occupancy-2026-10-20.md` §7, as the red-team
-//! corrects it): proved at `Buggy = 0` in each autopilot (`Mode`, Cruise committed, Off
-//! and Land its scenarios) and caught at `Buggy = 1`, each law broken by the mutant written to
-//! break it with every other mutant removed, and walked along the paths the design names: a
-//! nudge at a hold of age, the upgrade's notice first, a wake over the notice under Land, the K
-//! Entry, a hold that outlasts its breaks and a harness line's answer, a crash between the
-//! intent row and the line, and the stuck fact under its key (`Key`, both key-on scenarios
-//! checked with the three autopilots). Tier-1 is
-//! `aterm-agent/tests/conformance_occupancy.rs`.
-//!
-//! The non-vacuity sweep over the three configurations and the audit of `TheDueIsToldOrRaised`
-//! are `aterm-models`' `non_vacuity` (the model and its liveness register themselves), not
-//! repeated here.
+//! Tier-0 of `OccupancyDoor`.
 
 use aterm_models_harness::occupancy_door_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp;
 use aterm_spec::walk::walk;
 
-/// Each mutant, its dial, the law it was written to break, and the autopilot it breaks it under.
 const MUTANTS: [(&str, i64, &str, i64); 23] = [
     ("RestartClock", 1, "TheClockNeverRestarts", 1),
     ("LoseDeadline", 1, "TheDeadlineStaysArmed", 1),
@@ -47,17 +34,14 @@ const MUTANTS: [(&str, i64, &str, i64); 23] = [
     ("StuckWithoutKey", 22, "TheStuckLineNeedsItsKey", 1),
 ];
 
-/// The model under autopilot `mode` (0 Off, 1 Cruise, 2 Land).
 fn under(mode: i64) -> Model {
     interp::with_consts(&occupancy_door_model(), &[("Mode", mode)])
 }
 
-/// The model under autopilot `mode` with the stuck fact's key on.
 fn keyed(mode: i64) -> Model {
     interp::with_consts(&occupancy_door_model(), &[("Mode", mode), ("Key", 1)])
 }
 
-/// `m` with every mutant removed but `keep`.
 fn alone(m: &Model, keep: &str) -> Model {
     let mut one = m.clone();
     one.actions
@@ -89,7 +73,6 @@ fn occupancy_door_fires_exactly_its_committed_moves() {
     }
 }
 
-/// Each mutant breaks the law it was written to break, alone, and the committed door keeps it.
 #[test]
 fn each_mutant_breaks_its_own_law_alone() {
     let model = occupancy_door_model();
@@ -112,9 +95,6 @@ fn each_mutant_breaks_its_own_law_alone() {
     }
 }
 
-/// A NUDGE: a hold comes of age at a break, the nudge opens, its intent row goes before its one
-/// line, and the line stands untaken and paced; a second line at that door, or in that episode,
-/// is not enabled. Under Land the nudge is held (it is Cruise's); under Off nothing is.
 #[test]
 fn a_nudge_goes_once_at_a_break_under_cruise_only() {
     let m = under(1);
@@ -139,14 +119,12 @@ fn a_nudge_goes_once_at_a_break_under_cruise_only() {
         "the same hold nudged again"
     );
     assert!(!early.check_invariant("AnEpisodeEndsWithItsCondition", &again));
-    // Not before its hold's age.
     let young = walk(&m, &["Break", "Holds"]);
     assert!(!m.action_enabled("OpenNudge", &young), "{young:?}");
     let unheld = interp::with_buggy(&m, 21);
     let mut wrong = young.clone();
     assert!(unheld.fire("NudgeUnheld", &mut wrong));
     assert!(!unheld.check_invariant("TheNudgeWaitsForItsAge", &wrong));
-    // Not into a turn: the same steps from a live turn have no line.
     let mut turn = walk(&m, &["Break", "HoldAges", "OpenNudge", "Intend"]);
     assert!(m.fire("Turn", &mut turn));
     assert!(!m.action_enabled("Type", &turn), "{turn:?}");
@@ -158,10 +136,6 @@ fn a_nudge_goes_once_at_a_break_under_cruise_only() {
     }
 }
 
-/// THE UPGRADE FIRST: with the upgrade's notice due (`IdleHost::upgrade_due`, asked only
-/// after the grant), a nudge waits and the notice is the break's one line, an act untaken until
-/// the agent takes it; the next read after that has the nudge. A wake outranks the notice:
-/// under Land it goes with the notice still due, and the notice does not.
 #[test]
 fn the_upgrade_notice_goes_first_but_under_a_wake() {
     let m = under(1);
@@ -186,8 +160,6 @@ fn the_upgrade_notice_goes_first_but_under_a_wake() {
         ],
     );
     assert!(!m.action_enabled("Type", &noticed), "one line a door");
-    // The notice stands untaken past its door: a later read of the same break has no line
-    // until the agent takes it.
     let untaken = walk(
         &m,
         &[
@@ -238,8 +210,6 @@ fn the_upgrade_notice_goes_first_but_under_a_wake() {
     assert!(!first.check_invariant("AWakeOutranksTheUpgrade", &wrong));
 }
 
-/// THE K ENTRY: a due line untold for K looks is raised at the K-th; restarted, or with its
-/// deadline lost, it is not.
 #[test]
 fn a_due_line_is_raised_at_its_kth_look() {
     let m = under(1);
@@ -279,9 +249,6 @@ fn a_due_line_is_raised_at_its_kth_look() {
     assert!(!buggy.check_invariant("TheDeadlineStaysArmed", &lost));
 }
 
-/// THE HOLD'S CLOCK: a hold of age outlasts an idle read with no point (a new break, and a
-/// new door), and ends only at a live turn or a point, its rules' condition with it; a clock
-/// that restarts at the idle read ends it there.
 #[test]
 fn a_hold_outlasts_its_breaks() {
     let m = under(1);
@@ -296,10 +263,6 @@ fn a_hold_outlasts_its_breaks() {
     assert!(!restarts.check_invariant("TheHoldOutlastsItsBreaks", &wrong));
 }
 
-/// THE HARNESS'S OWN LINE (§3.1): the turn that answers a line typed in a hold of age, and
-/// the point that ends that answer, keep the hold; the turn after that point, or a break's read
-/// of the answer, ends the answer, and a turn the harness did not type may end the hold. Closed
-/// at the line's own turn, or at its answer's point, the hold breaks the law each copy breaks.
 #[test]
 fn a_harness_lines_answer_keeps_the_hold() {
     let m = under(1);
@@ -327,8 +290,6 @@ fn a_harness_lines_answer_keeps_the_hold() {
     assert!(!answer.check_invariant("TheAnswersPointKeepsTheHold", &wrong));
 }
 
-/// A CRASH between the intent row and the line: re-seeded from the rows, the episode is untold,
-/// and its one line still goes; seeded as told, the book says told and the screen never got it.
 #[test]
 fn a_crash_after_the_intent_leaves_the_episode_untold() {
     let m = under(1);
@@ -360,10 +321,6 @@ fn a_crash_after_the_intent_leaves_the_episode_untold() {
     assert!(!seeded.check_invariant("TheBookMatchesTheScreen", &wrong));
 }
 
-/// THE STUCK FACT (R3, §2.1's rank 4): with the key on, a held condition opens its own episode
-/// under Cruise and Land, waits for the upgrade's notice and its act, goes once, and goes again
-/// only after its condition failed and the episode closed; under Off it never goes, and with the
-/// key off it never opens: opened anyway, its line breaks the key's law.
 #[test]
 fn the_stuck_line_needs_its_key_and_goes_once_an_episode() {
     let m = keyed(1);

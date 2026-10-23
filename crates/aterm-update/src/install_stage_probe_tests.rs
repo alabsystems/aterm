@@ -1,16 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The stage's start probe (`verify::probe_staged_bundle_starts`), driven through the real stage
-//! gate on an ad-hoc-signed bundle in the structural tier: the candidate runs only once every check
-//! before it has passed, and one that cannot start is refused before any ready marker.
+//! Tests for `verify::probe_staged_bundle_starts` driven through the real stage gate.
 
 use super::*;
 
 const BUILD: u64 = 777;
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// A manifest naming `build` and `commit`, everything else inert.
 fn manifest(build: u64, commit: &str) -> Manifest {
     Manifest {
         schema: 1,
@@ -29,8 +26,6 @@ fn manifest(build: u64, commit: &str) -> Manifest {
     }
 }
 
-/// An ad-hoc-signed `staged/aterm.app.incoming` sealed as [`BUILD`] / [`COMMIT`],
-/// whose executable writes its pid to `ran` each time it starts and exits `exit`.
 fn incoming(staging: &Staging, ran: &Path, exit: i32) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     ensure_private_dir(&staging.staged_dir()).unwrap();
@@ -61,22 +56,14 @@ fn incoming(staging: &Staging, ran: &Path, exit: i32) -> PathBuf {
     app
 }
 
-/// Stage `incoming` against `manifest` as both container paths do, in the
-/// structural tier (no Team ID pinned).
 fn stage(staging: &Staging, incoming: &Path, manifest: &Manifest) -> Result<(), String> {
     let commit = staging_manifest_commit(manifest)?;
     verify_and_publish_incoming(staging, incoming, manifest, &commit, "", "")
 }
 
-/// THE CANDIDATE RUNS ONLY ONCE ITS WHOLE GATE HAS PASSED. A broken seal, a
-/// build or a commit that does not match the manifest each refuse the stage
-/// before anything of the bundle executes (its executable never wrote `ran`),
-/// with no marker and no bundle left; a bundle that passes every check is started
-/// once, before its marker, and published.
 #[test]
 fn the_stage_starts_the_candidate_only_after_its_whole_gate_passes() {
     aterm_uds::deadline::require_trust_service();
-    /// What the case does to the bundle's executable, and the manifest it stages under.
     type Prepare = fn(&Path) -> Manifest;
     let refusals: [(&str, Prepare); 3] = [
         ("failed verification", |exe| {
@@ -115,10 +102,6 @@ fn the_stage_starts_the_candidate_only_after_its_whole_gate_passes() {
     assert!(staging.staged_app.join("Contents/MacOS/aterm").is_file());
 }
 
-/// A BUILD THE RECORDS WITHDREW WHILE IT DOWNLOADED IS NEVER STARTED. A sibling's
-/// check recorded the revocation of the machine that signed it; the stage refuses
-/// it with the publish's words, and its executable never ran, though every check
-/// of the bundle itself passed.
 #[test]
 fn a_build_withdrawn_while_it_downloaded_is_never_started() {
     aterm_uds::deadline::require_trust_service();
@@ -147,9 +130,6 @@ fn a_build_withdrawn_while_it_downloaded_is_never_started() {
     assert!(!staging.ready.exists());
 }
 
-/// A CANDIDATE THAT CANNOT START IS A STAGE VERDICT, refused before its marker:
-/// the bundle is gone, nothing is published, and the refusal is no passing
-/// moment, so the check books it against the build like any other verdict.
 #[test]
 fn a_candidate_that_cannot_start_is_refused_before_any_marker() {
     aterm_uds::deadline::require_trust_service();
@@ -166,15 +146,6 @@ fn a_candidate_that_cannot_start_is_refused_before_any_marker() {
     assert!(!staging.staged_app.exists());
 }
 
-/// A PROBE THAT RUNS TO NO ANSWER IS NO VERDICT: a candidate the probe could not
-/// start just then (`EAGAIN`: the process table full — a passing refusal) publishes,
-/// and the apply's own probe still has to pass before any swap, so nothing is trusted
-/// that was not, and the download is not thrown away. A probe whose spawned child
-/// timed out (`STAGE_PROBE_TIMED_OUT`, killed while waiting at `_dyld_start`) is a
-/// passing refusal that leaves `incoming` in place without publishing, so `syspolicyd`
-/// never meets an unlinked or renamed path mid-assessment. The same spawn refused for
-/// a cause that comes back every time (`EACCES`) is a verdict, refused before any
-/// marker with the bundle gone: the stage tells the cases apart by the refusal alone.
 #[test]
 fn a_stage_probe_that_runs_to_no_answer_publishes_for_the_apply_to_judge() {
     aterm_uds::deadline::require_trust_service();

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Programs BUILT INTO aterm (amacs design §8.5).
+//! Programs built into aterm.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -38,7 +38,6 @@ pub fn builtin(name: &str) -> Option<&'static Builtin> {
 /// The directory the running aterm's argv0 aliases are laid in: its own executable's,
 /// links resolved, which is the rule [`crate::stub::co_located_atpkg_path`] finds the
 /// `atpkg` alias by. An alias found through `~/.local/bin` resolves to the bundle first.
-/// `None` when the executable's path cannot be read.
 #[must_use]
 pub fn alias_dir() -> Option<PathBuf> {
     let dir = std::env::current_exe()
@@ -109,8 +108,6 @@ pub fn which_line_at(
     }
 }
 
-/// Whether `a` and `b` are one file: as spelled, or as both resolve. An alias is a link
-/// to the `aterm` beside it, and a `~/.local/bin` link to the alias resolves there too.
 fn same_file(a: &Path, b: &Path) -> bool {
     a == b
         || matches!(
@@ -200,10 +197,6 @@ pub fn verb_answer(
 mod tests {
     use super::*;
 
-    /// THE ROSTER ARM STAYS AWAY. The front door sends any name [`crate::stub::describe`]
-    /// knows to `atpkg run`, which looks in the store: a built-in program must be unknown
-    /// to every compiled roster that feeds it, and answered by no reroute row (which
-    /// `which` asks first) and no vendor lane.
     #[test]
     fn describe_does_not_know_amacs() {
         assert!(builtin("amacs").is_some(), "amacs is built in");
@@ -290,9 +283,6 @@ mod tests {
         assert_eq!(which_line("ay", Some(&path)), None, "ay is not built in");
     }
 
-    /// Only a lone name of a built-in program, the verb's own flags aside, is answered,
-    /// by the verbs that would otherwise reach the store for it; any other argv is the
-    /// verb's own to judge.
     #[test]
     fn verb_answer_takes_only_a_lone_built_in_operand() {
         let argv = |xs: &[&str]| xs.iter().map(ToString::to_string).collect::<Vec<_>>();

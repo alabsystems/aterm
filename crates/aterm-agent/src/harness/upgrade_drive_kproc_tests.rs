@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PROCESS READS ARE `ps`'s, on the live machine.
+//! Process table (`ps`) integration tests on the live machine.
 
 use std::collections::BTreeMap;
 
@@ -9,12 +9,8 @@ use aterm_uds::spawnfd::{Child, Stdio};
 
 use super::*;
 
-/// The hang detector for what must happen (an exec).
 const HANG: Duration = Duration::from_secs(60);
 
-/// A `bash` whose `argv[0]` is a login shell's (`-kproc-fixture`), blocked
-/// in `read` until its stdin closes, its words holding every escape `ps`
-/// makes.
 fn login_shell() -> Child {
     let child = Command::new("/bin/bash")
         .arg0("-kproc-fixture")
@@ -47,16 +43,10 @@ fn end(mut c: Child) {
     let _ = c.wait();
 }
 
-/// Rows keyed by pid.
 fn keyed<R: Clone>(rows: &[R], pid: impl Fn(&R) -> u32) -> BTreeMap<u32, R> {
     rows.iter().map(|r| (pid(r), r.clone())).collect()
 }
 
-/// THE TABLE IS THE ONE `ps` PRINTS: pid, parent and the `comm` column's
-/// basename, a login shell's `-` dropped, for every process `ps` lists that
-/// held still across the read. Another user's process is named by its
-/// image's path (its `argv[0]` is `ps`'s alone to read, setuid root), so only
-/// its pid and parent are held to `ps`'s.
 #[test]
 fn the_table_is_the_one_ps_prints() {
     let shell = login_shell();
@@ -106,11 +96,6 @@ fn the_table_is_the_one_ps_prints() {
     );
 }
 
-/// A PROCESS'S IDS AND START ARE THE ONES `ps` PRINTS, and its age (what
-/// [`started_ms`] and [`held_of`] count from) lies between two readings
-/// that sandwich `ps`'s `etime`: this process, a child in a group of its own
-/// (a job, not the terminal's foreground) and one on a terminal it leads.
-/// A pid nothing runs as reads nothing, as `ps -p` prints nothing.
 #[test]
 fn a_processs_ids_start_and_age_are_the_ones_ps_prints() {
     let mut own = parked().process_group(0).spawn().expect("spawn");
@@ -156,13 +141,6 @@ fn a_processs_ids_start_and_age_are_the_ones_ps_prints() {
     assert_eq!(started_ms(led_id), None);
 }
 
-/// THE TERMINAL'S OWNER AND OPENER ARE THE ONES `ps`'s TABLE GIVES: the walk
-/// up from every process that held still, over one read of the kernel's
-/// records, names the owner the walk over `ps -A -o pid=,ppid=,tty=,comm=`
-/// names; the fixtures — a stand-in leading a terminal this process opened,
-/// a `sleep` on the pty another process ([`pty_host`]) opened, a child on no
-/// terminal — are always compared, live too, and so is the two-process opener
-/// read.
 #[test]
 fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
     use aterm_sysprobe::kproc;
@@ -263,11 +241,6 @@ fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
     );
 }
 
-/// WHAT RUNS UNDER AN AGENT IS NAMED AS `ps` NAMES IT: the same processes,
-/// the agent's own child's command head out of its `args` (escaped as `ps`
-/// escapes them in the C locale), a grandchild's none, each one's age
-/// between two readings that sandwich `ps`'s; a process gone since the walk
-/// is left out of both.
 #[test]
 fn what_runs_under_an_agent_is_named_as_ps_names_it() {
     let shell = login_shell();

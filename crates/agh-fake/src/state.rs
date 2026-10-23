@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 
 //! Fake GitHub state: owners, repositories, releases, assets, files, commits, refs, and faults.
 

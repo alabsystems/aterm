@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg-publish publish-group rustc`: coherent packing, signing, upload, and indexing of the `trust` bundle and its siblings.
+//! `atpkg-publish publish-group rustc`: coherent packing, signing, upload, and indexing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -93,7 +93,7 @@ impl SealProbe for RealProbe {
     }
 }
 
-/// Everything a group publish calls out to.
+/// Injected dependencies for a group publish.
 pub struct Parts<'a> {
     /// The seal and the switch.
     pub probe: &'a dyn SealProbe,
@@ -138,7 +138,7 @@ pub struct Preflight {
     pub seal_commit: String,
     /// Its release string.
     pub seal_version: String,
-    /// Its host — the target the group is published for.
+    /// Host target the group is published for.
     pub triple: Option<Triple>,
     /// `rev-list --count <commit>` in the trust repo.
     pub trust_build: Option<u64>,
@@ -694,10 +694,8 @@ pub struct GroupOutcome {
 /// Re-verifies `program`'s checkout commit, cleanliness, and floor clearance before packing.
 ///
 /// # Errors
-/// A refusal naming what moved: the checkout moved, became dirty, would now pack a build
-/// lower than the one judged, or no longer clears the floor; a refusal for a `program` the
-/// preflight never judged; whatever [`pack_build`] fails on. Nothing of `program` is packed
-/// after one.
+/// Returns an error if `program` was not judged by preflight, its checkout moved or became dirty,
+/// its computed build dropped below the judged build or floor, or [`pack_build`] fails.
 pub fn recheck(ctx: &Ctx, pf: &Preflight, program: &str, force: bool) -> Result<u64> {
     let judged = pf
         .judged

@@ -13,7 +13,7 @@ use super::driver::{cargo_driver, target_dir};
 use super::floors::last_json_line;
 use super::{LaneRun, workspace_root};
 
-/// The harness's cold ops, each OP of `aos_harness --cold OP` (the harness refuses any other).
+/// Cold ops accepted by `aos_harness --cold OP`.
 pub(crate) const COLD_OPS: [&str; 7] = [
     "direct",
     "host",
@@ -29,11 +29,8 @@ pub(crate) const COLD_RUNS: usize = 5;
 
 const EXAMPLE: &str = "aos_harness";
 
-/// How many lines of a failed build's or run's stderr a failure quotes.
 const TAIL: usize = 30;
 
-/// The trace file the export run writes and the import run reads, under the target
-/// directory.
 const TRACE_FILE: &str = "aos_harness.trace";
 
 /// One build of the harness.
@@ -196,8 +193,6 @@ fn measure(json_out: Option<&Path>) -> Result<String, Halt> {
     Ok(format!("summary above; every report in {}", path.display()))
 }
 
-/// One harness run: its report (the last JSON line on stdout, which must say `ok`) and that
-/// line as printed. Its stderr's progress lines are echoed.
 fn harness(bin: &Path, args: &[&str]) -> Result<(Value, String), Halt> {
     let out = command(bin)
         .args(args)
@@ -242,8 +237,7 @@ fn harness(bin: &Path, args: &[&str]) -> Result<(Value, String), Halt> {
     Ok((report, raw))
 }
 
-/// The one story every report measured (its digest), or which report measured another.
-/// Pure (unit-tested).
+/// Returns the common story digest across `reports`, or the first mismatch.
 pub(crate) fn one_story(reports: &[&Value]) -> Result<String, String> {
     let digest = |r: &Value| {
         r.pointer("/story/digest")
@@ -279,7 +273,6 @@ pub(crate) struct Head {
     pub agreeing: usize,
 }
 
-/// That `found`, `who`'s `what` digest, is the export's `want`.
 fn agree(who: &str, what: &str, found: Option<&str>, want: &str) -> Result<(), String> {
     match found {
         None => Err(format!("{who} reports no {what} digest")),
@@ -290,11 +283,7 @@ fn agree(who: &str, what: &str, found: Option<&str>, want: &str) -> Result<(), S
     }
 }
 
-/// The head the export run's attached host reached (its state digest and observation chain),
-/// checked against every other process that reached it: the head the import read from the
-/// file, the import's own replay on its own epoch, each cold `replay` run (state and chain)
-/// and each cold `checkpoint` run (state). The first disagreement, or a report that names no
-/// digest, is refused; so is a lane with no cold run of either op. Pure (unit-tested).
+/// Checks that every process reached the same state digest and observation chain as the export run.
 pub(crate) fn cross_process(
     export: &Value,
     import: &Value,
@@ -374,9 +363,7 @@ pub(crate) struct ColdRow {
     pub runs: usize,
 }
 
-/// Every number under each cold report's `cold.ns` (and its `ghz`), by op and key in the order
-/// first seen: the median (the lower middle for an even count), min and max over the runs
-/// that report it. Pure (unit-tested).
+/// Aggregates median, min, and max across cold runs by op and metric key.
 pub(crate) fn cold_rows(cold: &[(&str, Value, String)]) -> Vec<ColdRow> {
     let mut keys: Vec<(String, String)> = Vec::new();
     let mut values: Vec<Vec<f64>> = Vec::new();
@@ -420,7 +407,6 @@ pub(crate) fn cold_rows(cold: &[(&str, Value, String)]) -> Vec<ColdRow> {
         .collect()
 }
 
-/// A number from a report by JSON pointer, printed plainly, or `?`.
 fn num(v: &Value, pointer: &str) -> String {
     match v.pointer(pointer).and_then(Value::as_f64) {
         Some(n) if n.fract() == 0.0 && n.abs() < 1e15 => format!("{n:.0}"),
@@ -436,7 +422,6 @@ fn text(v: &Value, pointer: &str) -> String {
         .to_string()
 }
 
-/// The summary lines: per-call latencies, throughput, checkpoint, log, replay, repair, cold.
 fn summary(warm: &Value, stranded: &Value, rows: &[ColdRow]) -> Vec<String> {
     let mut lines = vec![
         format!(
@@ -523,7 +508,6 @@ fn summary(warm: &Value, stranded: &Value, rows: &[ColdRow]) -> Vec<String> {
     lines
 }
 
-/// `sysctl -n vm.loadavg`'s three averages, or `unavailable`.
 fn load_average() -> String {
     stdout_of(command(aterm_uds::os_path!("sysctl")).args(["-n", "vm.loadavg"]))
         .map(|s| {
@@ -534,7 +518,6 @@ fn load_average() -> String {
         .unwrap_or_else(|| "unavailable".into())
 }
 
-/// The checkout's HEAD and how many paths `git status` lists.
 fn commit() -> (String, usize) {
     let root = workspace_root();
     let head = stdout_of(
@@ -656,8 +639,6 @@ mod tests {
         );
     }
 
-    /// Every process that reached the head agrees with the export, and the first one that
-    /// does not, or names no digest, is refused by name.
     #[test]
     fn every_process_must_reach_the_exported_head_and_the_first_that_does_not_is_named() {
         let export = report(r#"{"export":{"state":"aa","chain":"cc"}}"#);

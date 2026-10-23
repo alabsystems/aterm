@@ -446,47 +446,140 @@ fn write_path(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()> {
 /// rename over it, so two admins publishing at once cannot both pass the check and the
 /// later rename silently drop the other's version (a revocation, say). It is made by an
 /// exclusive create, which a shared mount (SMB, NFSv3 and later) also serializes, holds
-/// `<host> <pid>`, and goes when the publish ends. One a killed publisher left behind
-/// refuses every publish until a person removes it.
+/// `<host> <pid>`, and goes when the publish ends. A server takes it too, over the vault
+/// file in its store, so an admin whose vault is that file publishes under the same rule,
+/// and only the server, under its state lock, clears one whose holder names its machine's host
+/// name and no longer runs ([`PublishLock::take_clearing_dead`]); two machines that share the
+/// mount and a host name are told apart by nothing, and two servers on one store are not
+/// serialized with each other. Any other one a killed publisher left
+/// behind refuses every publish until a person removes it.
 #[cfg(unix)]
-struct PublishLock(std::path::PathBuf);
+pub(crate) struct PublishLock(std::path::PathBuf);
+
+/// Why [`PublishLock::take_clearing_dead`] did not take the lock.
+#[cfg(unix)]
+pub(crate) enum NotTaken {
+    /// A lock the server did not clear: a publish that runs, or a holder it cannot tell is
+    /// gone. `holder` is the line it holds, for a person (empty when unread).
+    Held { lock: PathBuf, holder: String },
+    /// The lock could not be made.
+    Failed(Error),
+}
 
 #[cfg(unix)]
 impl PublishLock {
-    fn take(path: &std::path::Path) -> crate::Result<Self> {
+    pub(crate) fn take(path: &std::path::Path) -> crate::Result<Self> {
+        Self::taken(path, false).map_err(|refused| match refused {
+            NotTaken::Held { lock, holder } => Error::new(format!(
+                "{}: another publish to this vault holds it{}; if none is running, remove it and \
+                 publish again",
+                lock.display(),
+                held_by(&holder)
+            )),
+            NotTaken::Failed(e) => e,
+        })
+    }
+
+    /// [`take`](Self::take) for a server, which first clears a lock left by a holder on this
+    /// machine that no longer runs. A server alone does, under its state lock, so no two
+    /// clearers race to remove another's new lock, as long as one server serves the store.
+    pub(crate) fn take_clearing_dead(path: &std::path::Path) -> Result<Self, NotTaken> {
+        Self::taken(path, true)
+    }
+
+    fn taken(path: &std::path::Path, clear_dead: bool) -> Result<Self, NotTaken> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut name = path.as_os_str().to_owned();
         name.push(".lock");
         let lock = PathBuf::from(name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&lock)
-        {
-            Ok(mut file) => {
-                let holder = aterm_uds::process::host_name().unwrap_or_default();
-                // Who holds it is for a person reading the file; the lock is the file.
-                let _ = writeln!(file, "{holder} {}", std::process::id());
-                Ok(Self(lock))
+        let mut cleared = false;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .open(&lock)
+            {
+                Ok(mut file) => {
+                    let holder = aterm_uds::process::host_name().unwrap_or_default();
+                    // Who holds it is for a person reading the file; the lock is the file.
+                    let _ = writeln!(file, "{holder} {}", std::process::id());
+                    return Ok(Self(lock));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if clear_dead && !cleared && remove_dead(&lock) {
+                        cleared = true;
+                        continue;
+                    }
+                    let holder = read_path(&lock)
+                        .ok()
+                        .flatten()
+                        .map_or_else(String::new, |bytes| reason(&bytes));
+                    return Err(NotTaken::Held { lock, holder });
+                }
+                Err(e) => {
+                    return Err(NotTaken::Failed(Error::new(format!(
+                        "{}: {e}",
+                        lock.display()
+                    ))));
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let holder = read_path(&lock)
-                    .ok()
-                    .flatten()
-                    .map(|bytes| reason(&bytes))
-                    .filter(|holder| !holder.is_empty())
-                    .map_or_else(String::new, |holder| format!(" ({holder})"));
-                Err(Error::new(format!(
-                    "{}: another publish to this vault holds it{holder}; if none is running, \
-                     remove it and publish again",
-                    lock.display()
-                )))
-            }
-            Err(e) => Err(Error::new(format!("{}: {e}", lock.display()))),
         }
     }
+}
+
+/// ` (<holder>)`, or nothing for a lock whose holder line was not read.
+#[cfg(unix)]
+pub(crate) fn held_by(holder: &str) -> String {
+    if holder.is_empty() {
+        String::new()
+    } else {
+        format!(" ({holder})")
+    }
+}
+
+/// Remove `lock` when it is a plain file whose holder line names this machine's host name and
+/// a pid no process has, the kernel says, and the file judged, held open until the remove so
+/// its inode cannot be handed to another, is still the one at that path.
+#[cfg(unix)]
+fn remove_dead(lock: &std::path::Path) -> bool {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    // Never waits: a FIFO there would hold the server's state lock until a writer came.
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(lock)
+    else {
+        return false;
+    };
+    let Ok(judged) = file.metadata() else {
+        return false;
+    };
+    let mut line = String::new();
+    if !judged.is_file() || (&file).take(256).read_to_string(&mut line).is_err() {
+        return false;
+    }
+    let Some((host, pid)) = line.trim_end().rsplit_once(' ') else {
+        return false;
+    };
+    let ours = !host.is_empty()
+        && [
+            aterm_uds::process::host_name(),
+            aterm_uds::process::kernel_host_name(),
+        ]
+        .iter()
+        .any(|name| name.as_deref() == Some(host));
+    let gone = pid.parse::<i32>().is_ok_and(|pid| {
+        aterm_uds::process::process_presence(pid) == aterm_uds::process::ProcessPresence::Absent
+    });
+    // A person may have put another lock there since it was read.
+    let same = std::fs::symlink_metadata(lock)
+        .is_ok_and(|now| (now.dev(), now.ino()) == (judged.dev(), judged.ino()));
+    let removed = ours && gone && same && std::fs::remove_file(lock).is_ok();
+    drop(file);
+    removed
 }
 
 #[cfg(unix)]

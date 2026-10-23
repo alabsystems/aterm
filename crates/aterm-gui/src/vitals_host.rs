@@ -153,6 +153,13 @@ pub(crate) static PROC_EDGE: ProcEdge = ProcEdge::new();
 #[derive(Default)]
 pub(crate) struct Handover {
     snap: Option<Arc<Snapshot>>,
+    /// When the probe thread began the oldest of the readings handed over since the loop last
+    /// adopted one that carry `snap`'s jobs view: no later than that view's making when one of
+    /// them made it (a later reading may carry the view an earlier one made). A reading with a
+    /// new view starts this again, since an earlier reading's start (a `sys` pull's, which wakes
+    /// no one, while the loop slept) is not the new view's; a view the loop already adopted keeps
+    /// its first post on the board (`JobsBoard::post`).
+    began: Option<Instant>,
     words: Vec<WordSeen>,
     job_events: Vec<aterm_vitals::events::Event>,
 }
@@ -481,11 +488,19 @@ pub(crate) struct VitalsHost {
     pub(crate) snapshot: Option<Arc<Snapshot>>,
     /// When the held snapshot's jobs view was adopted: where a reading no window shows counts its next from ([`Self::windowless_due`]).
     pub(crate) adopted_at: Option<Instant>,
+    /// When the probe thread began the oldest reading carrying the held snapshot's jobs view
+    /// since the adoption before (`Handover::began`): what the jobs board counts a new view's
+    /// age from (`App::post_jobs_reading`).
+    read_began: Option<Instant>,
     full_adopted_at: Option<Instant>,
     /// When the next reading is due: the bars' cadence while a window in view shows them.
     pub(crate) next_due: Option<Instant>,
     asked_at: Option<Instant>,
     jobs_due: Option<Instant>,
+    /// When a full queue dropped the loop's last windowless ask (`App::serve_windowless_vitals`),
+    /// until an ask is sent, the thread is gone, or a reading begun since makes a new jobs view
+    /// ([`Self::adopt`]): the look it owes is due [`JOBS_FLOOR`] on ([`Self::windowless_due`]).
+    jobs_dropped: Option<Instant>,
     delegated_due: Option<Instant>,
     windowed: bool,
     disk_pull: bool,
@@ -516,10 +531,12 @@ impl Default for VitalsHost {
             latest: Arc::default(),
             snapshot: None,
             adopted_at: None,
+            read_began: None,
             full_adopted_at: None,
             next_due: None,
             asked_at: None,
             jobs_due: None,
+            jobs_dropped: None,
             delegated_due: None,
             windowed: false,
             disk_pull: false,
@@ -552,10 +569,11 @@ impl VitalsHost {
 
     /// Adopts the thread's newest snapshot if newer than the held one, along with its job events.
     pub(crate) fn adopt(&mut self, now: Instant) -> bool {
-        let (fresh, words, events) = {
+        let (fresh, began, words, events) = {
             let mut h = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
             (
                 h.snap.take(),
+                h.began.take(),
                 std::mem::take(&mut h.words),
                 std::mem::take(&mut h.job_events),
             )
@@ -574,6 +592,14 @@ impl VitalsHost {
                 };
                 if !same {
                     self.adopted_at = Some(now);
+                    // The engine made this view in a reading begun since the dropped ask: the
+                    // look that ask owed.
+                    if began
+                        .zip(self.jobs_dropped)
+                        .is_some_and(|(began, dropped)| began >= dropped)
+                    {
+                        self.jobs_dropped = None;
+                    }
                     self.parked = snap
                         .jobs
                         .as_deref()
@@ -583,6 +609,7 @@ impl VitalsHost {
                 if !snap.machine_only {
                     self.full_adopted_at = Some(now);
                 }
+                self.read_began = began;
                 self.snapshot = Some(snap);
                 true
             }
@@ -591,10 +618,17 @@ impl VitalsHost {
     }
 
     fn windowless_due(&self) -> Option<Instant> {
-        let view = self.snapshot.as_ref()?.jobs.as_deref()?;
-        let after =
-            crate::vitals_jobs::windowless_after(view).or_else(|| job_demand_after(view))?;
-        Some(self.adopted_at? + after)
+        let engine = self.snapshot.as_ref().and_then(|snap| {
+            let view = snap.jobs.as_deref()?;
+            let after =
+                crate::vitals_jobs::windowless_after(view).or_else(|| job_demand_after(view))?;
+            Some(self.adopted_at? + after)
+        });
+        let owed = self.jobs_dropped.map(|at| at + JOBS_FLOOR);
+        match (engine, owed) {
+            (Some(engine), Some(owed)) => Some(engine.min(owed)),
+            (engine, owed) => engine.or(owed),
+        }
     }
 
     fn windowless_deadline(&self, hidden: Option<Duration>, now: Instant) -> Option<Instant> {
@@ -844,6 +878,7 @@ fn run(
         if req.self_pid == 0 {
             req.self_pid = std::process::id();
         }
+        let began = Instant::now();
         let snap = if asked.pull {
             pull(&mut source, &req, last_whole)
         } else {
@@ -855,7 +890,7 @@ fn run(
         }
         peaks.keep(source.model().peaks(), Instant::now(), false);
         let words = req.ttys.iter().map(TtyWord::seen).collect();
-        let jobs_moved = hand_over(latest, &snap, words);
+        let jobs_moved = hand_over(latest, &snap, words, began);
         if let Some(sys) = sys {
             sys.publish(snap, source.machine().unwrap_or(&no_machine));
         }
@@ -898,7 +933,12 @@ fn keep_warm_events(warm: Snapshot, snap: &mut Snapshot) {
     snap.events = events;
 }
 
-fn hand_over(latest: &Mutex<Handover>, snap: &Arc<Snapshot>, words: Vec<WordSeen>) -> bool {
+fn hand_over(
+    latest: &Mutex<Handover>,
+    snap: &Arc<Snapshot>,
+    words: Vec<WordSeen>,
+    began: Instant,
+) -> bool {
     let events: Vec<_> = snap
         .events
         .iter()
@@ -906,6 +946,17 @@ fn hand_over(latest: &Mutex<Handover>, snap: &Arc<Snapshot>, words: Vec<WordSeen
         .cloned()
         .collect();
     let mut h = latest.lock().unwrap_or_else(PoisonError::into_inner);
+    let same_view = match (
+        h.snap.as_ref().and_then(|s| s.jobs.as_ref()),
+        snap.jobs.as_ref(),
+    ) {
+        (Some(held), Some(new)) => Arc::ptr_eq(held, new),
+        _ => false,
+    };
+    h.began = Some(match h.began {
+        Some(held) if same_view => held.min(began),
+        _ => began,
+    });
     h.snap = Some(Arc::clone(snap));
     h.words = words;
     let moved = !events.is_empty();
@@ -2225,6 +2276,15 @@ impl crate::App {
             self.serve_windowless_vitals(audience, now, delegated);
             return;
         };
+        // A call at no progress is told only from a view 5 s old: while one stands, a window
+        // slower than the engine reads a beat past its cadence (`vitals_jobs::told_after`).
+        let period = self
+            .vitals
+            .snapshot
+            .as_ref()
+            .and_then(|snap| snap.jobs.as_deref())
+            .and_then(crate::vitals_jobs::told_after)
+            .map_or(period, |told| told.min(period));
         if !std::mem::replace(&mut self.vitals.windowed, true) {
             self.vitals.next_due = None;
             self.vitals.asked_at = None;
@@ -2245,14 +2305,23 @@ impl crate::App {
         }
     }
 
-    fn ask_reading(&mut self, now: Instant, period: Duration, machine_only: bool, jobs_now: bool) {
+    /// Asks the thread for a reading: false when its queue was full or the thread is gone.
+    fn ask_reading(
+        &mut self,
+        now: Instant,
+        period: Duration,
+        machine_only: bool,
+        jobs_now: bool,
+    ) -> bool {
         let mut req = self.vitals_request(period, machine_only);
         req.jobs_now = jobs_now;
         let layout = self.layout_fingerprint();
         self.vitals.layout_looked = Some(now);
-        if self.vitals.offer(Msg::Read(Box::new(req))) {
+        let sent = self.vitals.offer(Msg::Read(Box::new(req)));
+        if sent {
             self.vitals.sent_layout = Some(layout);
         }
+        sent
     }
 
     fn send_layout(&mut self, now: Instant, period: Duration, machine_only: bool) {
@@ -2318,7 +2387,17 @@ impl crate::App {
             } else {
                 period
             };
-            self.ask_reading(now, period, false, true);
+            if self.ask_reading(now, period, false, true) || !self.vitals.reader_runs() {
+                self.vitals.jobs_dropped = None;
+            } else {
+                // The queue was full (a `sys` pull reading, two more asks behind it): a pull's
+                // reading wakes no one, so ask again at the floor, not at the next edge or look.
+                // The pull's own whole reading, adopted first at that wake, need not have looked
+                // (its engine paced, `jobs_now` off), so the ask stays owed until one begun since
+                // makes a new view (`VitalsHost::adopt`).
+                self.vitals.jobs_dropped = Some(now);
+                self.vitals.jobs_due = Some(now + JOBS_FLOOR);
+            }
         } else if let Some((period, machine_only)) = hidden
             && due_at(self.vitals.asked_at, None, period, now) <= now
         {
@@ -2504,7 +2583,10 @@ impl crate::App {
                 })
                 .collect()
         };
-        self.vitals.board.post(view, sids, Instant::now());
+        // A new view is as old as the reading that made it, not its adoption: the probe's read and
+        // the wait for the loop count toward the facts gate. A held view keeps its first post.
+        let read = self.vitals.read_began.unwrap_or_else(Instant::now);
+        self.vitals.board.post(view, sids, read);
     }
 
     /// Starts a "where" survey when the Disk lens opens.

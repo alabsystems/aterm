@@ -65,10 +65,6 @@ struct OriginSlot {
 }
 
 impl OriginSlot {
-    /// [subset] A restore of this slot would put origin mode back on over a
-    /// region that may no longer hold the saved row, where xterm and aterm
-    /// clamp differently (the `decrc_under_origin_mode_above_the_region`
-    /// exclusion).
     fn blocks_restore(self) -> bool {
         self.origin && self.region_moved
     }
@@ -137,7 +133,6 @@ struct Track {
 }
 
 impl Track {
-    /// Whether a token of `kind` may come next.
     fn admits(&self, kind: Kind, caps: Caps) -> bool {
         match kind {
             Kind::Alt { mode: 47, .. } if !caps.alt_persists => false,
@@ -172,7 +167,6 @@ impl Track {
         }
     }
 
-    /// The DECSC slot of the buffer that is up.
     fn slot(&self) -> OriginSlot {
         if self.in_alt {
             self.alt_slot
@@ -181,8 +175,6 @@ impl Track {
         }
     }
 
-    /// A DECSC (or the save `?1049h` makes) into the slot of the buffer
-    /// that is up.
     fn save(&mut self) {
         let slot = OriginSlot {
             origin: self.origin,
@@ -203,8 +195,6 @@ impl Track {
                 }
                 if mode == 1049 {
                     if set {
-                        // `?1049h` saves into the slot of the buffer it
-                        // leaves (or of the alternate one, already up).
                         self.save();
                     }
                     if set && self.in_alt {
@@ -244,14 +234,9 @@ impl Track {
     }
 }
 
-/// Grid sizes: the degenerate one-row and one-column screens (every glyph a
-/// pending wrap, every line feed a scroll), small ones where wraps, tabs and
-/// scroll regions collide, and a couple of ordinary widths.
 const COLS: [u16; 11] = [1, 2, 3, 4, 5, 8, 10, 13, 16, 20, 33];
 const ROWS: [u16; 8] = [1, 2, 3, 4, 5, 6, 8, 10];
 
-/// Printable glyphs. All one cell wide in both engines: ASCII, and narrow
-/// non-ASCII (Latin-1 letters, a box-drawing rule).
 const GLYPHS: &[char] = &[
     'a', 'b', 'c', 'x', 'y', 'z', 'A', 'M', 'Z', '0', '7', '9', ' ', '-', '#', '~', '[', ';', 'q',
     'l', '_', '^', '`', '{', '}', '\u{e9}', '\u{df}', '\u{f1}', '\u{2500}',
@@ -261,8 +246,6 @@ fn csi(params: &str, final_byte: char) -> Vec<u8> {
     format!("\x1b[{params}{final_byte}").into_bytes()
 }
 
-/// A CSI numeric parameter: absent, zero (both read 0 as the default), small,
-/// or past the grid so the clamps run.
 fn num(r: &mut Rng, limit: u16) -> String {
     match r.below(6) {
         0 => String::new(),
@@ -281,9 +264,6 @@ fn text(r: &mut Rng, len: usize) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// A run length that lands on the interesting edges as often as in between:
-/// a glyph or three, one short of the width, the width exactly (the pending
-/// wrap), one past it, and two lines' worth (a wrap that scrolls).
 fn run_len(r: &mut Rng, cols: u16) -> usize {
     let c = usize::from(cols);
     match r.below(7) {
@@ -295,8 +275,6 @@ fn run_len(r: &mut Rng, cols: u16) -> usize {
     }
 }
 
-/// An SGR parameter list. Foreground and the three attributes always; the
-/// background only when `bg` (see `Gen::token` for when that is safe).
 fn sgr(r: &mut Rng, bg: bool) -> Vec<u8> {
     let mut parts: Vec<String> = Vec::new();
     let n = r.below(4);
@@ -335,10 +313,6 @@ fn sgr(r: &mut Rng, bg: bool) -> Vec<u8> {
     csi(&parts.join(";"), 'm')
 }
 
-/// After a cursor restore. [subset] While the pinned fold restores the
-/// position only, the pen is put back to a known state at once: xterm's
-/// DECRC (and `?1049l`) restore the SGR rendition with the cursor, and the
-/// pen the program saved is not the oracle's to compare.
 fn after_restore(caps: Caps, mut t: Vec<u8>) -> Vec<u8> {
     if !caps.decsc_saves_pen {
         t.extend_from_slice(b"\x1b[0m");
@@ -346,10 +320,6 @@ fn after_restore(caps: Caps, mut t: Vec<u8>) -> Vec<u8> {
     t
 }
 
-/// A motion that resolves a pending wrap. [subset] While the pinned fold
-/// erases past a parked glyph (the xterm.js reading) instead of through it
-/// (xterm's `ClearRight`), every erase is preceded by one of these, so no
-/// erase starts from a pending wrap.
 fn resolve_wrap(r: &mut Rng, cols: u16, rows: u16) -> Vec<u8> {
     match r.below(3) {
         0 => csi(
@@ -369,7 +339,6 @@ fn erase(r: &mut Rng, caps: Caps) -> Vec<u8> {
     let modes: &[&str] = if caps.ed3_spares_screen {
         &["", "0", "1", "2", "3"]
     } else {
-        // [subset] `ED 3` only while the fold leaves the screen alone.
         &["", "0", "1", "2"]
     };
     match r.below(5) {
@@ -384,8 +353,6 @@ fn erase(r: &mut Rng, caps: Caps) -> Vec<u8> {
     }
 }
 
-/// The generator's own state: the grid, the capabilities, and the [`Track`]
-/// a token's shape depends on.
 struct Gen {
     r: Rng,
     cols: u16,
@@ -395,11 +362,6 @@ struct Gen {
 }
 
 impl Gen {
-    /// An alternate-screen switch, shaped to what [`Track`] admits. [subset]
-    /// While the pinned fold carries a pending wrap across `?1049h` and
-    /// `?1047l` (each of which xterm ends or starts with `ClearScreen`, and so
-    /// `ResetWrap`), those two are preceded by a motion that resolves the
-    /// wrap.
     fn alt_switch(&mut self) -> (Kind, Vec<u8>) {
         let caps = self.caps;
         let mut modes = vec![1049, 1047];
@@ -410,7 +372,6 @@ impl Gen {
         let set = self.r.chance(1, 2);
         if !self.track.admits(Kind::Alt { mode, set }, caps) {
             if mode == 1049 && set && self.track.in_alt {
-                // The second `?1049h` the fold would not clear for.
                 return (Kind::Plain, csi("?25", 'h'));
             }
             mode = if set { 1049 } else { 1047 };
@@ -434,7 +395,6 @@ impl Gen {
         }
     }
 
-    /// One token, and its kind.
     fn token(&mut self) -> (Kind, Vec<u8>) {
         let (cols, rows, caps) = (self.cols, self.rows, self.caps);
         let lim = cols.max(rows);

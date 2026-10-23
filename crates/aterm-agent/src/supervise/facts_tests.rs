@@ -139,12 +139,14 @@ fn a_no_progress_episode_is_told_once_until_a_fresh_reading_no_longer_names_it()
     assert_eq!(second.key, EpisodeKey::of_call(&newer).expect("born"));
     s.told(second.key, T0);
     assert_eq!(s.pending(Some(&r), T0), None, "each told once");
-    let aged = T0 + FACT_FRESH_MS + 1;
-    assert_eq!(
-        s.pending(Some(&reading(T0, vec![call(40001, Some(8), 90)])), aged),
-        None,
-        "a reading older than FACT_FRESH_MS tells nothing"
-    );
+    let later = reading(T0, vec![call(40001, Some(8), 90)]);
+    for (age, tells) in [(FACT_FRESH_MS, true), (FACT_FRESH_MS + 1, false)] {
+        assert_eq!(
+            s.pending(Some(&later), T0 + age).is_some(),
+            tells,
+            "a reading {age} ms old tells only within FACT_FRESH_MS"
+        );
+    }
     let stale = T0 + NO_PROGRESS_FRESH_MS + 1;
     for (seen, now) in [(None, T0), (Some(reading(T0, Vec::new())), stale)] {
         s.observe(seen.as_ref(), now);

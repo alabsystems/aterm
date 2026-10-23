@@ -29,7 +29,7 @@ fn a_stopped_search_is_never_a_verdict() {
     )));
 }
 
-/// Per-invariant oracle for [`super::uncaught_invariants`]: an isolated `bmc` per invariant at `Buggy = 1`.
+/// Isolated `bmc` per invariant at `Buggy = 1` as an oracle for [`super::uncaught_invariants`].
 fn uncaught_invariants_one_walk_per_invariant(m: &super::Model) -> Vec<&'static str> {
     let buggy = super::interp::with_buggy(m, 1);
     m.invariants
@@ -51,7 +51,6 @@ fn the_one_walk_ghost_sweep_matches_the_per_invariant_oracle() {
 
     use crate::derive::{Expr, Invariant};
 
-    /// Number of models per outcome held to the oracle.
     const PER_OUTCOME: usize = 3;
 
     /// Compare `m` against the oracle; returns `None` if both panicked.
@@ -160,7 +159,7 @@ use super::*;
 use crate::test_models::{config_catalog_snapshot_model, ring_model};
 use crate::ty_model;
 
-/// Store shim resolution fails closed on missing, dangling, or tombstone shims and resolves live targets.
+/// Store shim resolution fails closed on missing, dangling, or tombstone shims.
 #[cfg(unix)]
 #[test]
 fn store_shim_resolution_is_fail_closed() {
@@ -368,7 +367,7 @@ fn a_shell_literal_word_is_read_only_when_nothing_expands() {
     }
 }
 
-/// `caps_from` parses `ty capabilities --json` and returns empty on non-zero exit, signal, or non-JSON output.
+/// `caps_from` parses `ty capabilities --json` and returns empty on failure or non-JSON.
 #[test]
 fn ty_capabilities_are_the_json_list_and_an_older_ty_has_none() {
     let json = b"{\"ty\":\"0.15.0\",\"capabilities\":[\"check-no-cache-v1\",\"trace-cases-v1\"]}\n";
@@ -412,7 +411,7 @@ fn stand_in(dir: &Path, body: &str) -> PathBuf {
     bin
 }
 
-/// Stand-in `ty` advertising `--cases`, logging pool spawns to `<dir>/spawns`, and failing per-process calls.
+/// Stand-in `ty` advertising `--cases`, logging pool spawns to `<dir>/spawns`.
 #[cfg(unix)]
 fn cases_stand_in(dir: &Path, model: &str, cases: &str) -> PathBuf {
     let header = format!(
@@ -433,7 +432,7 @@ fn cases_stand_in(dir: &Path, model: &str, cases: &str) -> PathBuf {
     )
 }
 
-/// Emit the `--cases` header and reply `{"id":<id>,<rest>}` per request, running `after` after each.
+/// Emit the `--cases` header and reply `{"id":<id>,<rest>}` per request.
 #[cfg(unix)]
 fn answering(rest: &str, after: &str) -> String {
     format!(
@@ -505,7 +504,7 @@ fn a_case_with_no_verdict_line_is_never_an_accept() {
     }
 }
 
-/// `memoized_verdict` caches by binary identity (`mtime`/`ctime`) and input, invalidating on in-place rewrites or mid-run swaps.
+/// `memoized_verdict` caches by binary identity and input, invalidating on rewrites or swaps.
 #[cfg(unix)]
 #[test]
 fn a_ty_verdict_is_replayed_only_for_the_same_binary_and_files() {
@@ -670,11 +669,7 @@ fn the_cases_pool_and_the_memo_answer_only_for_the_build_in_use() {
     );
 }
 
-/// A pooled `--cases` co-process is killed and reaped before the process that pooled it exits,
-/// so no member of that process's group outlives it. The pooling process is this test binary
-/// re-run on this one test in a group of its own; its stand-in lingers after its stdin's EOF (as
-/// a real `ty` exiting does for a moment), which a pool left to that EOF leaves in the group
-/// (aterm-verify's sweep at the leader's exit named it `? ×1`).
+/// A pooled `--cases` co-process is killed and reaped before the process that pooled it exits.
 #[cfg(unix)]
 #[test]
 fn a_pooled_co_process_ends_before_the_process_that_pooled_it() {
@@ -781,7 +776,7 @@ fn audit_dead_negative_controls_needs_tier_agreement_and_a_committed_dial() {
     }
 }
 
-/// `audit_dead_negative_controls` rejects actions that never fire or violate no invariant at `Buggy = 1`.
+/// `audit_dead_negative_controls` rejects never-firing or uncaught mutants at `Buggy = 1`.
 #[test]
 fn audit_rejects_never_firing_and_uncaught_mutants() {
     let never = ty_model! {
@@ -842,7 +837,7 @@ fn audit_rejects_two_mutants_when_only_one_is_independently_caught() {
     );
 }
 
-/// `audit_dead_negative_controls` credits dead actions that violate a law from a lawful state, not actions after a prior violation.
+/// `audit_dead_negative_controls` credits only dead actions that violate a law from a lawful state.
 #[test]
 fn audit_credits_a_violation_step_and_not_a_step_after_one() {
     let consequence = ty_model! {
@@ -948,7 +943,7 @@ fn ty_state_count_is_parsed_or_refused() {
     assert_eq!(ty_states_explored("  States found: many\n"), None);
 }
 
-/// `assert_ty_saw_whole_space` panics if `ty` reports a clean verdict on a model violated in the interpreter.
+/// `assert_ty_saw_whole_space` panics if `ty` passes a model the interpreter refutes.
 #[test]
 fn a_clean_ty_verdict_over_a_violated_model_is_a_false_proof_not_a_coverage_gap() {
     // `Cap = -1` violates `LenBounded` at `Buggy = 0` in the initial state.
@@ -971,7 +966,7 @@ fn a_clean_ty_verdict_over_a_violated_model_is_a_false_proof_not_a_coverage_gap(
     );
 }
 
-/// `assert_same_space_explored` rejects `ty` transcripts whose state count is smaller, larger, or missing.
+/// `assert_same_space_explored` rejects transcripts with a mismatched or missing state count.
 #[test]
 fn a_ty_verdict_over_another_space_is_not_a_proof() {
     let m = ring_model();

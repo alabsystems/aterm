@@ -298,8 +298,6 @@ mod tests {
         Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH, duration_from_millis_f64,
     };
 
-    /// The clock conversion is total: every `f64` a browser binding could
-    /// return produces a `Duration` rather than a panic.
     #[test]
     fn millisecond_conversion_is_total() {
         for ms in [
@@ -326,7 +324,6 @@ mod tests {
         );
     }
 
-    /// Whole and fractional milliseconds both survive the conversion.
     #[test]
     fn millisecond_conversion_keeps_the_fraction() {
         assert_eq!(duration_from_millis_f64(1.0), Duration::from_millis(1));
@@ -341,8 +338,6 @@ mod tests {
         );
     }
 
-    /// Sub-microsecond resolution survives an hour-old time origin, so two
-    /// frames stay distinguishable.
     #[test]
     fn resolution_survives_an_aged_time_origin() {
         let hour_ms = 3_600_000.0_f64;
@@ -355,8 +350,6 @@ mod tests {
         );
     }
 
-    /// `Instant` differences: forward is the gap, backward is zero (with the
-    /// `checked_` form reporting `None` instead).
     #[test]
     fn instant_differences_saturate_backwards() {
         let a = Instant::from_js_millis(1000.0);
@@ -374,8 +367,6 @@ mod tests {
         assert!(b > a);
     }
 
-    /// `Instant` duration arithmetic round-trips, and the checked forms report
-    /// the boundary rather than wrapping through it.
     #[test]
     fn instant_arithmetic_round_trips_and_checks() {
         let a = Instant::from_js_millis(1000.0);
@@ -393,8 +384,6 @@ mod tests {
         assert_eq!(a.checked_add(Duration::MAX), None);
     }
 
-    /// `SystemTime` is anchored at the epoch, and a backwards step is an error
-    /// carrying the magnitude, never a panic or a wrap.
     #[test]
     fn system_time_reports_backwards_steps() {
         let t0 = SystemTime::from_js_millis(1_700_000_000_000.0);
@@ -415,7 +404,6 @@ mod tests {
         assert!(!boxed.to_string().is_empty());
     }
 
-    /// `SystemTime` duration arithmetic mirrors the `Instant` side.
     #[test]
     fn system_time_arithmetic_round_trips() {
         let t = SystemTime::from_js_millis(1_700_000_000_000.0);

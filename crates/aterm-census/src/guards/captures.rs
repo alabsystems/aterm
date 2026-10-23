@@ -24,7 +24,6 @@ pub(super) const CAPTURE_PRIVACY: Rule = Rule {
 /// The export's own rows, relative to the checkout.
 pub(super) const EXTRA: &str = "publish/forbidden-extra.txt";
 
-/// The engine's baseline, relative to the engine's checkout.
 const BASELINE: &str = "baseline/forbidden-content.txt";
 
 /// Capture-specific forbidden `(description, pattern)` pairs beyond the export's rows.
@@ -47,14 +46,11 @@ pub(super) const CAPTURE_ROWS: &[(&str, &str)] = &[
     ),
 ];
 
-/// One capture format: the extension its files wear and its decoder.
 struct Format {
     ext: &'static str,
     decode: fn(&str) -> Result<Vec<Stream>, Undecodable>,
 }
 
-/// Every encoded capture format the checkout holds. A test that records a new
-/// encoding adds its decoder here.
 const FORMATS: &[Format] = &[
     Format {
         ext: "ptylog",
@@ -90,7 +86,6 @@ impl Stream {
         self.bytes.extend_from_slice(bytes);
     }
 
-    /// The 1-based line of the record holding byte `at`.
     fn record_of(&self, at: usize) -> usize {
         let i = self.records.partition_point(|&(start, _)| start <= at);
         self.records
@@ -99,13 +94,10 @@ impl Stream {
     }
 }
 
-/// A record the decoder could not read: its 1-based line and why.
+/// A record the decoder could not read.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Undecodable(usize, String);
 
-/// A pty log: `<stamp> <I|O> <hex>` per line. A record of another kind
-/// without a payload (a fence) carries no bytes; anything else the guard
-/// cannot read is refused, so no line hides bytes from it.
 fn ptylog(text: &str) -> Result<Vec<Stream>, Undecodable> {
     let (mut out, mut inp) = (Stream::new("output"), Stream::new("input"));
     for (i, line) in text.lines().enumerate() {
@@ -148,7 +140,6 @@ fn unhex(hex: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// PTY reads: one per line, `#` lines comments, escapes decoded.
 fn reads(text: &str) -> Result<Vec<Stream>, Undecodable> {
     let mut s = Stream::new("reads");
     for (i, line) in text.lines().enumerate() {
@@ -189,12 +180,10 @@ enum Read {
     Joined,
     /// As [`Read::Joined`], but a CSI breaks the line too.
     Spaced,
-    /// As [`Read::Joined`], but a Backspace or a DEL takes back the byte
-    /// before it on its line.
+    /// As [`Read::Joined`], but a Backspace or a DEL takes back the byte before it on its line.
     Edited,
 }
 
-/// One view of a stream: its bytes, each with the stream offset it came from.
 struct View {
     bytes: Vec<u8>,
     from: Vec<usize>,
@@ -213,14 +202,12 @@ impl View {
         self.from.push(at);
     }
 
-    /// A line break, once however many controls make it.
     fn split(&mut self, at: usize) {
         if self.bytes.last().is_some_and(|&b| b != b'\n') {
             self.put(b'\n', at);
         }
     }
 
-    /// An erase: the byte before it on its line is taken back.
     fn take_back(&mut self) {
         if self.bytes.last().is_some_and(|&b| b != b'\n') {
             self.bytes.pop();
@@ -228,10 +215,7 @@ impl View {
         }
     }
 
-    /// What the stream prints: escape sequences gone (a string sequence's
-    /// payload on its own line, a CSI a line break when `read` is
-    /// [`Read::Spaced`]), a Backspace or DEL an erase when `read` is
-    /// [`Read::Edited`], every other control a line break.
+    /// What the stream prints ([`Read::Spaced`], [`Read::Edited`]).
     fn printable(stream: &[u8], read: Read) -> Self {
         const ESC: u8 = 0x1b;
         let mut v = Self {
@@ -301,7 +285,6 @@ impl View {
         v
     }
 
-    /// Every line, with the view offset it starts at.
     fn lines(&self) -> impl Iterator<Item = (usize, &[u8])> {
         let mut start = 0;
         self.bytes.split(|&b| b == b'\n').map(move |line| {
@@ -323,8 +306,6 @@ pub(super) struct Row {
     any: Regex,
 }
 
-/// The work one whole-view prefilter search may spend; exhausting it only
-/// sends the view to the per-line search.
 const VIEW_STEPS: u64 = 1 << 32;
 
 impl Row {
@@ -378,7 +359,6 @@ pub(super) fn capture_rows() -> Vec<Row> {
         .collect()
 }
 
-/// Where this host keeps the engine's baseline, if it names one.
 fn baseline_path() -> Option<PathBuf> {
     std::env::var_os("PUBLICATION_ENGINE")
         .filter(|v| !v.is_empty())
@@ -418,8 +398,6 @@ fn capture_privacy(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     held_to(tree, baseline(), out);
 }
 
-/// The rule over `tree`, with the engine's baseline as this host reads it
-/// (`Err` when it has none, which holds the captures to the other rows).
 fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mut Vec<Finding>) {
     let captures: Vec<&String> = tree
         .corpus
@@ -467,7 +445,6 @@ fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mu
     }
 }
 
-/// The format a path's extension names.
 fn format_of(rel: &str) -> Option<&'static Format> {
     let ext = rel.rsplit('/').next()?.rsplit_once('.')?.1;
     FORMATS.iter().find(|f| f.ext == ext)

@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The Windows half of `aterm-dirfd` on real NTFS trees under the temp directory.
+//!
+//! STOCK EXCEPTION: Windows only, and Trust has no Windows std, so only stock Rust builds this (the
+//! Windows lane's guest pins its version: `aterm-lab/src/windows_guest.rs`).
 
 #![cfg(windows)]
 

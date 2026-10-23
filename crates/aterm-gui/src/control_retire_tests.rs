@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The cold update lane retires the control socket right before its `exec`
-//! (`App::run_cold_exec`, `control_listener::Endpoint`), and reopens it when the `exec` returns
-//! (`App::resume_after_cold_exec`). Driven over the real supervised accept loop and request
-//! lanes on a temporary socket; only the request handling is a stand-in, whose `hold` keeps its
-//! lane the way a verb waiting on the main thread does.
+//! Tests control-socket retirement before cold `exec` and reopening on failure.
 
 use std::io::{BufRead as _, BufReader, ErrorKind, Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,8 +14,6 @@ use super::control_lanes::{LaneLimits, LaneReader, LaneService, Lanes, Outbox};
 use super::{Request, Scope, ServeDisposition, read_request_line};
 use crate::control_listener::{Endpoint, Supervisor, rebind_socket, socket_file_id};
 
-/// How long a wait for something that must happen may take before the test
-/// calls it a hang.
 const HANG: Duration = Duration::from_secs(60);
 
 /// `AUTH ok` authenticates; `hold` is answered only once the test releases it (a verb whose
@@ -119,24 +113,10 @@ fn assert_answers(path: &std::path::Path, what: &str) {
     assert_eq!(reply, "OK ping\n", "{what}");
 }
 
-/// A client holds an authenticated connection whose verb the main thread owes while the main
-/// thread prepares the `exec`. By the time the `exec` runs the held connection reads EOF and a
-/// new client is refused; when the `exec` returns the same path serves again.
+/// `prepare_cold_exec` keeps the socket open, `run_cold_exec` retires it (held connections
+/// read EOF and new connects are refused), and `resume_after_cold_exec` reopens it.
 ///
-/// First the steps before the `exec` (`App::prepare_cold_exec`): they retire
-/// nothing, so the held connection must stay open (WouldBlock) and the socket
-/// keep answering — retired there, a refusal after them would leave the held
-/// connection reading EOF for an `exec` that never ran.
-///
-/// Then the `exec` runs: by then the held connection must already read EOF
-/// and a new client be refused — not, as before, left open (WouldBlock) and
-/// queued (a connect that succeeds) for as long as the `exec` takes to
-/// terminate every other thread, which is seconds on a saturated machine.
-/// The `exec` returns: the same path must serve again.
-///
-/// Runs alone in its own process: a forked child holds a copy of the listening socket until it
-/// execs, so a sibling test's not-yet-exec'd child keeps a retired listener accepting. macOS has
-/// no working close-on-fork (`F_SETFD` drops `FD_CLOFORK` on 26.6).
+/// Runs alone because a sibling test's forked child can inherit the listening fd before exec.
 #[test]
 fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
     if !crate::test_alone::alone() {

@@ -196,6 +196,15 @@ pub fn stuck_verdict_liveness() -> Liveness {
 }
 
 /// THE SCOPE BALANCE, CPU (`docs/DESIGN-system-awareness-2026-10-16.md` §7.7, §17).
+///
+/// `a` is aterm's coalitions' counters, which hold the work of members that
+/// exited inside the window (`x`, SA's `Container`); `d` is the caller tab's
+/// live delegated members under a launcher outside aterm, `e` another tab's
+/// under the same launcher, and `l` that launcher's coalition, whose own work
+/// and exited members' (`LauncherWork`) stay in its part. Law
+/// `ExitedWorkStaysCounted` (Buggy 6, SA's `DropReapedChildTime`: aterm's
+/// part is its live members' work and the reaped members' time is charged to
+/// services, the reaper's).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn scope_balance_model() -> Model {
@@ -209,6 +218,8 @@ pub fn scope_balance_model() -> Model {
             var t = 0;
             var tf = 0;
             var d = 0;
+            var e = 0;
+            var x = 0;
             var l = 0;
             var o = 0;
             var s = 0;
@@ -234,6 +245,13 @@ pub fn scope_balance_model() -> Model {
                 tf = tf + 1;
                 fresh = 0;
             }
+            action ExitedWork when (n <= Work - 1) {
+                n = n + 1;
+                g = g + 1;
+                a = a + 1;
+                x = x + 1;
+                fresh = 0;
+            }
             action BuildStarts when (n <= Work - 1) {
                 n = n + 1;
                 tf = tf + 1;
@@ -256,6 +274,13 @@ pub fn scope_balance_model() -> Model {
                 g = g + 1;
                 l = l + 1;
                 d = d + 1;
+                fresh = 0;
+            }
+            action DelegatedElsewhere when (n <= Work - 1) {
+                n = n + 1;
+                g = g + 1;
+                l = l + 1;
+                e = e + 1;
                 fresh = 0;
             }
             action DelegatedAhead when (n <= Work - 1) {
@@ -287,18 +312,34 @@ pub fn scope_balance_model() -> Model {
             }
 
             action Move when (fresh == 0) {
-                moved = if (Buggy == 3 || d <= l) { d } else { l };
+                moved = if (Buggy == 3 || d + e <= l) { d + e } else { l };
                 others = if (Buggy == 2) {
                     o + l
                 } else {
-                    if (Buggy == 3 || d <= l) { o + l - d } else { o }
+                    if (Buggy == 3 || d + e <= l) { o + l - d - e } else { o }
                 };
                 tab = if (Buggy == 5) { tf + d } else { t + d };
                 fresh = 1;
             }
             action Close when (fresh == 1) {
-                rest = if (tab <= a + moved) { a + moved - tab } else { 0 };
-                services = if (Buggy == 4 && g > a + l + o + s) { g - a - l - o } else { s };
+                rest = if (tab <= a + moved) {
+                    if (Buggy == 6) {
+                        if (x <= a + moved - tab) { a + moved - tab - x } else { 0 }
+                    } else {
+                        a + moved - tab
+                    }
+                } else {
+                    0
+                };
+                services = if (Buggy == 4 && g > a + l + o + s) {
+                    g - a - l - o
+                } else {
+                    if (Buggy == 6 && tab <= a + moved) {
+                        s + (if (x <= a + moved - tab) { x } else { a + moved - tab })
+                    } else {
+                        s
+                    }
+                };
                 residual = if (Buggy == 4 && g > a + l + o + s) {
                     if (a + moved <= tab) { a + moved - tab } else { 0 }
                 } else {
@@ -325,6 +366,10 @@ pub fn scope_balance_model() -> Model {
                             + (if (a + moved <= tab) { a + moved - tab } else { 0 });
             invariant DelegatedCountedOnce: fresh == 0 || others + moved == o + l;
             invariant MatchedWindowsOnly: fresh == 0 || tab == t + d;
+            invariant ExitedWorkStaysCounted:
+                fresh <= 1
+                    || rest + tab
+                        == a + moved + (if (a + moved <= tab) { tab - a - moved } else { 0 });
             bound Box: n <= Work;
         }
     }

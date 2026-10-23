@@ -420,9 +420,13 @@ impl Jobs {
                 .get(&self.jobs[i].key.tab)
                 .copied()
                 .unwrap_or_default();
-            let class_mu = self
-                .classes
-                .mu(&command_class(&self.jobs[i].command, self.jobs[i].kind));
+            // A job whose command is unknown has no class: it reads its own μ or the prior.
+            let class_mu = (!self.jobs[i].command.is_empty())
+                .then(|| {
+                    self.classes
+                        .mu(&command_class(&self.jobs[i].command, self.jobs[i].kind))
+                })
+                .flatten();
             let elsewhere = scene_elsewhere(i);
             let job = &mut self.jobs[i];
 
@@ -773,7 +777,10 @@ impl Jobs {
                 exit: job.exit,
                 tick: out.tick,
             });
-            if exited && let Some(own) = job.track.own_mu() {
+            if exited
+                && !job.command.is_empty()
+                && let Some(own) = job.track.own_mu()
+            {
                 let class = command_class(&job.command, job.kind);
                 self.classes.learn(&class, own);
             }
@@ -1195,9 +1202,11 @@ fn discover(
             pgid: p.map_or(d, |p| p.pgid),
             members,
             consumer_pid: p.map(|p| p.ppid),
-            command: hint
-                .and_then(|h| h.command.clone())
-                .unwrap_or_else(|| p.map(|p| p.name.clone()).unwrap_or_default()),
+            // Only the join names a call's command. Its leader is the agent's shell wrapper
+            // (`zsh -c …` leads every Claude Code call), so the leader's name would put every
+            // call in one command class, and a later `sleep 600` would be judged by an
+            // earlier build's μ.
+            command: hint.and_then(|h| h.command.clone()).unwrap_or_default(),
             block: None,
             shell: None,
         });

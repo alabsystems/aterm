@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FACTS RING (`docs/DESIGN-harness-occupancy-2026-10-20.md` §6):
-//! `<state>/occupancy/facts.ring`, a row a minute look, the newest [`RING_ROWS`] kept (a day of
-//! looks; a look the disk watch is poked into between minutes takes no row), so `occupancy check --replay` can judge the rules again over what the board saw
-//! ([`super::replay`]). This module is the ring's pure part: its row, its text and what it
-//! counts. The window's board writes the file (aterm-gui's `occupancy_ring`); nothing in the
-//! supervise loop reads or writes it.
-//!
-//! A row is one JSON line ([`RingRow`]): the board's machine facts at the look, as
-//! [`OccupancyReading`] carries them, and for each supervised session the last look its jobs
-//! held a build slot, whether its hold read ready ([`super::rules::ready`]) and the first guard
-//! its loop last told ([`super::OccupancySaid::guard`]). Plain numbers and closed words, never
-//! a path, a name or a process's text. A line this build cannot read is passed over.
-//!
-//! IDLE WHILE READY ([`idle_ready_ms`]): at each look, the build slots the board proves usable
-//! and the sessions ready, the smaller of the two, for the time since the look before (at most
-//! a look): slot-time that sat idle while a session waited with its next work ready.
+//! THE FACTS RING (`docs/DESIGN-harness-occupancy-2026-10-20.md` §6).
 
 use std::path::{Path, PathBuf};
 
@@ -85,7 +70,6 @@ pub struct RingRow {
     pub sessions: Vec<RingSession>,
 }
 
-/// The pressure's word.
 const fn pressure_word(p: Pressure) -> &'static str {
     match p {
         Pressure::Normal => "normal",
@@ -94,7 +78,6 @@ const fn pressure_word(p: Pressure) -> &'static str {
     }
 }
 
-/// The pressure a word names.
 fn pressure_of(word: &str) -> Option<Pressure> {
     match word {
         "normal" => Some(Pressure::Normal),
@@ -104,7 +87,6 @@ fn pressure_of(word: &str) -> Option<Pressure> {
     }
 }
 
-/// The disk level a word names ([`Level::as_str`]); `unknown` is none.
 fn level_of(word: &str) -> Option<Level> {
     match word {
         "ok" => Some(Level::Ok),
@@ -116,8 +98,7 @@ fn level_of(word: &str) -> Option<Level> {
 }
 
 impl RingRow {
-    /// The row of a look whose machine facts `machine` carries (any session's reading: the
-    /// session's own field, `held_slot_last_ms`, is not read), with `sessions`.
+    /// The row of a look whose machine facts `machine` carries.
     #[must_use]
     pub fn of(machine: &OccupancyReading, sessions: Vec<RingSession>) -> Self {
         Self {
@@ -166,8 +147,7 @@ impl RingRow {
         u16::try_from(self.sessions.iter().filter(|s| s.ready).count()).unwrap_or(u16::MAX)
     }
 
-    /// The build slots idle while ready at this look: the usable slots of a board that spoke
-    /// for the look, or the sessions ready, whichever is fewer.
+    /// The build slots idle while ready at this look.
     #[must_use]
     pub fn idle_ready(&self) -> u16 {
         let usable = if self.stale {
@@ -193,10 +173,7 @@ pub fn rows_in(body: &str) -> Vec<RingRow> {
         .collect()
 }
 
-/// THE SLOT-TIME IDLE WHILE READY over `rows` (oldest first) from `since_ms` on, ms
-/// ([module docs](self)): each look's [`RingRow::idle_ready`] for the time since the look
-/// before it, at most a look ([`LOOK_EVERY_MS`]; the first a look), so a window asleep counts
-/// nothing for its sleep.
+/// THE SLOT-TIME IDLE WHILE READY over `rows` (oldest first) from `since_ms` on, ms.
 #[must_use]
 pub fn idle_ready_ms<'a>(rows: impl IntoIterator<Item = &'a RingRow>, since_ms: i64) -> u64 {
     let mut total = 0_u64;

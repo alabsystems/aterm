@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! REGISTRY WAKE (`docs/DESIGN-card-engine-2026-10-19.md` §3.10): the resolver reads an awaited
-//! Claude Code process's registry row when the kernel says its Claude dir moved, never on a timer.
+//! REGISTRY WAKE (`docs/DESIGN-card-engine-2026-10-19.md` §3.10).
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -14,13 +13,10 @@ use super::{Asks, Command, FOLLOW_UPS, Job, LogWake, NO_TAP, REGISTRY_READ, Reso
 use crate::claude_registry::{RegistryWatch, Sink, row_of};
 use crate::session_timeline::SessionTimeline;
 
-/// A hang detector, never a budget.
 const MUST_HAPPEN: Duration = aterm_spec::wait::MUST_HAPPEN;
 
-/// The session every test watches (a second one is `SESSION + 1`).
 const SESSION: u64 = 7;
 
-/// The conversation the rows name.
 const SESSION_ID: &str = "00000000-0000-4000-8000-000000000a51";
 
 thread_local! {
@@ -30,9 +26,6 @@ thread_local! {
         .expect("exclusive resolver scratch");
 }
 
-/// The scratch root of process `pid`. Each test's pid is above every
-/// kernel's `pid_max`, so no live process has it: the read finds no start
-/// time, and no test reads another's row.
 fn root_of(pid: i32) -> PathBuf {
     OWNED_ROOT.with(|owned| {
         std::fs::canonicalize(owned.path())
@@ -41,17 +34,14 @@ fn root_of(pid: i32) -> PathBuf {
     })
 }
 
-/// `pid`'s Claude dir.
 fn claude_of(pid: i32) -> PathBuf {
     root_of(pid).join("claude")
 }
 
-/// `pid`'s registry row.
 fn row_path(pid: i32) -> PathBuf {
     row_of(&claude_of(pid), u32::try_from(pid).expect("a positive pid"))
 }
 
-/// The exec read of `pid`: its Claude dir, by `CLAUDE_CONFIG_DIR`.
 fn args_of(pid: i32) -> Option<atpkg::caller_shell::ProcArgs> {
     Some(atpkg::caller_shell::ProcArgs {
         argv: vec!["claude".into()],
@@ -67,7 +57,6 @@ fn no_roster() -> Option<aterm_agent::harness::accounts::Roster> {
     None
 }
 
-/// What a read asks outside Claude Code's files, answered here.
 const ASKS: Asks = Asks {
     tap: NO_TAP,
     args: args_of,
@@ -76,8 +65,6 @@ const ASKS: Asks = Asks {
     stored_login: |_, _, _| true,
 };
 
-/// A fresh scratch root for `pid`: its working directory, and its Claude
-/// dir's `sessions/` when `sessions`, else no Claude dir at all.
 fn lay(pid: i32, sessions: bool) {
     let root = root_of(pid);
     std::fs::create_dir(&root).expect("fresh process fixture");
@@ -87,7 +74,6 @@ fn lay(pid: i32, sessions: bool) {
     }
 }
 
-/// The registry row Claude Code writes for `pid`.
 fn row_text(pid: i32) -> String {
     format!(
         r#"{{"pid":{pid},"sessionId":"{SESSION_ID}","cwd":{},"startedAt":1790607848684,"version":"2.1.287"}}"#,
@@ -95,16 +81,12 @@ fn row_text(pid: i32) -> String {
     )
 }
 
-/// Write `pid`'s row whole by a rename into `sessions/`: one directory
-/// event, the row complete when it lands.
 fn rename_row_in(pid: i32) {
     let staged = root_of(pid).join("row.staged");
     std::fs::write(&staged, row_text(pid)).unwrap();
     std::fs::rename(&staged, row_path(pid)).unwrap();
 }
 
-/// A resolver whose registry watch opens with `open` and tells a channel the
-/// test reads.
 fn resolver(
     open: fn() -> std::io::Result<atpkg::dirwatch::Watcher>,
 ) -> (Resolver, Receiver<Command>) {
@@ -113,14 +95,12 @@ fn resolver(
     (Resolver::new(RegistryWatch::new(open, sink), ASKS), rx)
 }
 
-/// A session timeline with `pid` in front.
 fn timeline_of(pid: i32) -> Arc<Mutex<SessionTimeline>> {
     let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
     timeline.lock().unwrap().note_foreground_group(pid);
     timeline
 }
 
-/// The status sweep's ask for `pid` in `session`.
 fn ask(session: u64, timeline: &Arc<Mutex<SessionTimeline>>, pid: i32) -> Command {
     Command::Request(Job {
         session,
@@ -130,8 +110,6 @@ fn ask(session: u64, timeline: &Arc<Mutex<SessionTimeline>>, pid: i32) -> Comman
     })
 }
 
-/// The next batch the forwarder told: its first command (a hang detector),
-/// then whatever is queued behind it.
 fn told(rx: &Receiver<Command>) -> Vec<Command> {
     let first = rx
         .recv_timeout(MUST_HAPPEN)
@@ -141,7 +119,6 @@ fn told(rx: &Receiver<Command>) -> Vec<Command> {
         .collect()
 }
 
-/// The build the session's footer names.
 fn version(timeline: &Arc<Mutex<SessionTimeline>>) -> Option<String> {
     timeline
         .lock()
@@ -150,7 +127,6 @@ fn version(timeline: &Arc<Mutex<SessionTimeline>>) -> Option<String> {
         .and_then(|facts| facts.version.clone())
 }
 
-/// Each `registry-read` dev row's `cause=… row=…`, in order.
 fn reads(timeline: &Arc<Mutex<SessionTimeline>>) -> Vec<String> {
     timeline
         .lock()
@@ -168,12 +144,6 @@ fn reads(timeline: &Arc<Mutex<SessionTimeline>>) -> Vec<String> {
         .collect()
 }
 
-/// A ROW WRITTEN AFTER THE ASK IS READ ON THE DIRECTORY EVENT. Claude Code
-/// is named before it writes its row: the ask's read misses, the process is
-/// awaited, and its `sessions/` is watched (and read once more, the watch
-/// being new). The row lands; the forwarder tells the Claude dir; the
-/// event's read publishes the build. The clock never moved, so no clock
-/// read could have found it, and none is owed before the first follow-up.
 #[test]
 fn a_row_created_after_the_ask_is_read_on_the_directory_event() {
     const PID: i32 = 2_000_000_101;
@@ -204,7 +174,6 @@ fn a_row_created_after_the_ask_is_read_on_the_directory_event() {
     let _ = std::fs::remove_dir_all(root_of(PID));
 }
 
-/// A ROW CREATED EMPTY, THEN WRITTEN IN PLACE, IS READ ON THE FILE EVENT.
 #[test]
 fn a_row_created_empty_then_written_is_read_on_the_file_event() {
     const PID: i32 = 2_000_000_102;
@@ -240,13 +209,6 @@ fn a_row_created_empty_then_written_is_read_on_the_file_event() {
     let _ = std::fs::remove_dir_all(root_of(PID));
 }
 
-/// `sessions/` MADE AFTER THE ASK: THE WATCH MOVES INWARD, NO TIMER. With no
-/// Claude dir yet (a first launch), the watch is on the nearest level there;
-/// what a first launch writes beside it opens no row (nothing outside
-/// `sessions/` is one); the Claude dir and its `sessions/` made in one burst
-/// are both found by the one event, the watch moving in a level at a time
-/// (each registered before the next is looked for) and reading once where it
-/// lands, and the row written next is read on its event.
 #[test]
 fn sessions_made_after_the_ask_moves_the_watch_inward() {
     const PID: i32 = 2_000_000_103;
@@ -287,9 +249,6 @@ fn sessions_made_after_the_ask_moves_the_watch_inward() {
     let _ = std::fs::remove_dir_all(root_of(PID));
 }
 
-/// REGISTER FIRST, THEN READ. A row written after the ask's read and before
-/// its watch is placed reports no event (the watch did not exist); the read
-/// the new watch owes finds it.
 #[test]
 fn a_row_written_before_its_watch_is_read_when_the_watch_is_placed() {
     const PID: i32 = 2_000_000_104;
@@ -311,10 +270,6 @@ fn a_row_written_before_its_watch_is_read_when_the_watch_is_placed() {
     let _ = std::fs::remove_dir_all(root_of(PID));
 }
 
-/// THE WATCH DROPS WHEN NOTHING AWAITS. Two sessions await their rows under
-/// two Claude dirs: a stop of one lets its watch go and keeps the other's;
-/// the other's watch lapsing ([`WATCH_FOR`] with no ask) takes the last
-/// watch, the watcher and the forwarder with it.
 #[test]
 fn the_watch_drops_when_nothing_awaits() {
     const PID: i32 = 2_000_000_105;
@@ -350,10 +305,6 @@ fn the_watch_drops_when_nothing_awaits() {
     }
 }
 
-/// CONTROL — NO HIDDEN LADDER. With the registry watch refused, a row
-/// written after the ask is read at the first follow-up and not before: no
-/// clock read is owed, nor taken at any instant, until then. So every read
-/// the tests above saw before it was pushed.
 #[test]
 fn with_the_watch_refused_the_row_waits_for_the_first_follow_up() {
     const PID: i32 = 2_000_000_107;

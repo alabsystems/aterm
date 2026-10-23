@@ -101,16 +101,9 @@ aterm_types::bitflags! {
         const MAXIMIZED         = 1 << 11;
         const POPUP             = 1 << 12;
 
-        /// Marker flag for fullscreen. Should always match `WindowState::fullscreen`, but is
-        /// included here to make masking easier.
         const MARKER_EXCLUSIVE_FULLSCREEN = 1 << 13;
         const MARKER_BORDERLESS_FULLSCREEN = 1 << 14;
 
-        /// The `WM_SIZE` event contains some parameters that can effect the state of `WindowFlags`.
-        /// In most cases, it's okay to let those parameters change the state. However, when we're
-        /// running the `WindowFlags::apply_diff` function, we *don't* want those parameters to
-        /// effect our stored state, because the purpose of `apply_diff` is to update the actual
-        /// window's state to match our stored state. This controls whether to accept those changes.
         const MARKER_RETAIN_STATE_ON_SIZE = 1 << 15;
 
         const MARKER_IN_SIZE_MOVE = 1 << 16;
@@ -119,9 +112,7 @@ aterm_types::bitflags! {
 
         const IGNORE_CURSOR_EVENT = 1 << 18;
 
-        /// Fully decorated window (incl. caption, border and drop shadow).
         const MARKER_DECORATIONS = 1 << 19;
-        /// Drop shadow for undecorated windows.
         const MARKER_UNDECORATED_SHADOW = 1 << 20;
 
         const MARKER_ACTIVATE = 1 << 21;
@@ -313,11 +304,6 @@ impl WindowFlags {
         (style, style_ex)
     }
 
-    /// aterm: the `ShowWindow` command [`Self::apply_diff`] shows a window with, going
-    /// from `old` to `new` (visible). No activation for a window that asked for none; for a
-    /// hidden window revealed maximized, `SW_SHOWMAXIMIZED` (`SW_MAXIMIZE`, the same value),
-    /// which shows it maximized in one step instead of at its normal frame first and then
-    /// maximized on glass.
     fn show_command(old: WindowFlags, new: WindowFlags) -> SHOW_WINDOW_CMD {
         if !old.contains(WindowFlags::MARKER_ACTIVATE) {
             SW_SHOWNOACTIVATE
@@ -328,15 +314,10 @@ impl WindowFlags {
         }
     }
 
-    /// aterm: whether a maximize waits for the window's reveal ([`Self::show_command`]):
-    /// a hidden window's. `SW_MAXIMIZE` would show it, and `apply_diff`'s `SW_HIDE` hide it
-    /// again, on glass; nor does it take the `WS_MAXIMIZE` style early, which `ShowWindow`
-    /// reads as "already maximized" and would then show it at its normal frame.
     fn maximize_waits_for_reveal(new: WindowFlags) -> bool {
         new.contains(WindowFlags::MAXIMIZED) && !new.contains(WindowFlags::VISIBLE)
     }
 
-    /// Adjust the window client rectangle to the return value, if present.
     fn apply_diff(mut self, window: HWND, mut new: WindowFlags) {
         self = self.mask();
         new = new.mask();
@@ -553,8 +534,6 @@ mod reveal_tests {
     use super::WindowFlags;
     use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, SW_SHOW, SW_SHOWNOACTIVATE};
 
-    /// aterm: a hidden window maximized before its reveal keeps the maximize for the
-    /// reveal, which shows it maximized in one step; a shown window maximizes at once.
     #[test]
     fn a_hidden_window_is_revealed_maximized_in_one_step() {
         let hidden = WindowFlags::MARKER_ACTIVATE | WindowFlags::RESIZABLE;

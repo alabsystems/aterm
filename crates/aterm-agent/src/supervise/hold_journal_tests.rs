@@ -7,9 +7,6 @@ use super::*;
 
 const SAID: &str = "Fixed the parser; the suite is green.";
 
-/// Claude Code's screen while only the agent's own background work holds it
-/// busy: a shell outlived the turn (the measured break the wake's settle
-/// test draws).
 fn break_screen() -> Vec<String> {
     let mut r = rows(&[
         "⏺ Waiting for the build.",
@@ -21,7 +18,6 @@ fn break_screen() -> Vec<String> {
     r
 }
 
-/// `rows` as the server's read numbered `seq`.
 fn screen_at(seq: u64, rows: Vec<String>) -> Screen {
     Screen {
         seq,
@@ -29,7 +25,6 @@ fn screen_at(seq: u64, rows: Vec<String>) -> Screen {
     }
 }
 
-/// The `HOLD` lines of `noted`.
 fn holds(noted: &[String]) -> Vec<&str> {
     noted
         .iter()
@@ -38,9 +33,6 @@ fn holds(noted: &[String]) -> Vec<&str> {
         .collect()
 }
 
-/// The session's background step over each read of `reads` (`true`: the
-/// break; `false`: a live turn), numbered from 1, with `host` as the host
-/// the loop offers breaks to: everything the steps noted.
 fn background_reads(host: Option<Arc<dyn IdleHost>>, reads: &[bool]) -> Vec<String> {
     let mut m = Mock::new(Vec::new());
     let mut s = session(&mut m, Some("@s-1".to_string()));
@@ -60,10 +52,6 @@ fn background_reads(host: Option<Arc<dyn IdleHost>>, reads: &[bool]) -> Vec<Stri
     heard.noted
 }
 
-/// A BREAK NO HOST ASKS A STEP AT (F1's sixteen dark hours): journaled once
-/// per episode — three reads of the break, a live turn, two more — whether
-/// no host runs or the host asks for nothing. NEGATIVE CONTROL: a host that
-/// asks and is offered the break journals its step and never a hold.
 #[test]
 fn a_background_break_no_host_wants_is_journaled_once_per_episode() {
     let reads = [true, true, true, false, true, true];
@@ -88,10 +76,6 @@ fn a_background_break_no_host_wants_is_journaled_once_per_episode() {
     assert!(host.backgrounds.load(Ordering::SeqCst) > 0, "{noted:#?}");
 }
 
-/// A BREAK A GUARD HOLDS names the guard, once: the loop's own act stands
-/// untaken, so three reads of the break say `held why=act-untaken` once.
-/// NEGATIVE CONTROL: once a live turn shows the act taken, the break is
-/// offered and nothing more is held.
 #[test]
 fn a_held_break_names_its_guard_once() {
     let mut m = Mock::new(Vec::new());
@@ -173,11 +157,6 @@ impl Review for Attended {
     }
 }
 
-/// A POINT DECIDED NOTHING says why, once per change: decided again with
-/// the host still withholding the turn ends, nothing more; the host lifting
-/// it, the policy's own NOTHING is a change; a wait decided ends the hold,
-/// so the next NOTHING is said again; and nobody's loop running unattended
-/// is `attended`. NEGATIVE CONTROL: an act or a wait decided says no hold.
 #[test]
 fn a_nothing_point_is_journaled_once_per_change() {
     let host = Arc::new(Withholds {
@@ -237,12 +216,6 @@ fn a_nothing_point_is_journaled_once_per_change() {
     assert!(holds(&heard.noted).is_empty(), "{:#?}", heard.noted);
 }
 
-/// THROUGH THE UPDATE HANDOFF: a successor loop on the same journal (a
-/// live upgrade's, at the same screen: each loop reads only the point, with
-/// no live turn between to end the hold its predecessor said) says its first
-/// hold again — its memory is its own, never seeded from the journal — and
-/// so does a successor's wait. Each loop says its hold once however long the
-/// point sits.
 #[test]
 fn a_successor_journals_its_first_hold_after_a_handoff() {
     let (dir, journal) = journal_file("hold-successor");
@@ -296,10 +269,6 @@ fn a_successor_journals_its_first_hold_after_a_handoff() {
     assert_eq!(waited(), 1, "and once its successor");
 }
 
-/// A POINT DECIDED WITH NO READ OF THE HOST (this loop watching behind
-/// another's claim) says no `withheld` an earlier decision read: the read is
-/// the deciding point's, taken by its act. NEGATIVE CONTROL: the point that
-/// read the host withholding says so.
 #[test]
 fn a_point_decided_with_no_host_read_says_no_earlier_withheld() {
     let host = Arc::new(Withholds {
@@ -346,11 +315,6 @@ fn a_point_decided_with_no_host_read_says_no_earlier_withheld() {
     );
 }
 
-/// A BREAK'S FIRST MOMENTS ARE NO HOLD, whether a host asks for a step or
-/// not: no host asking, the break is said only once it has stood the settle
-/// (the shipped one), so a screen that flips between the break and a live
-/// turn says nothing however often it flips. NEGATIVE CONTROL: a break that
-/// stands the settle is said, once.
 #[test]
 fn a_break_no_host_wants_is_said_only_once_it_stood_the_settle() {
     let clock = Arc::new(crate::supervise::fx::ScriptedClock::default());

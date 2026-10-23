@@ -7,11 +7,7 @@ use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd as _, IntoRawFd as _};
 use std::sync::atomic::{AtomicI32, Ordering};
 
-/// The pipe's write end the handler wakes the watch's thread through, or -1 while nothing
-/// watches. Never closed once made, so a handler running at any moment writes into this pipe
-/// and never into a descriptor that later took its number.
 static WAKE: AtomicI32 = AtomicI32::new(-1);
-/// The pid of the latest person's SIGTERM, which the watch's thread hands on.
 static SENDER: AtomicI32 = AtomicI32::new(0);
 
 /// Whether a SIGTERM from `sender` is the system's: launchd's (pid 1) or the kernel's (0).
@@ -78,7 +74,6 @@ pub(super) fn watch(quit: fn(libc::pid_t)) -> Option<Watching> {
     Some(Watching { _private: () })
 }
 
-/// The SIGTERM handler [`watch`] installs.
 extern "C" fn on_term(sig: libc::c_int, info: *mut libc::siginfo_t, _context: *mut libc::c_void) {
     let sender = if info.is_null() {
         0
@@ -92,9 +87,7 @@ extern "C" fn on_term(sig: libc::c_int, info: *mut libc::siginfo_t, _context: *m
         return;
     }
     SENDER.store(sender, Ordering::Release);
-    // SAFETY: `__error` is this thread's errno, put back after the `write`, which reads one byte
-    // of this frame into the pipe's write end, kept open for good. A failed write loses nothing:
-    // a full pipe holds a wake already.
+    // SAFETY: `__error` is this thread's errno, put back after the `write`, which reads one byte of this frame into the pipe's write end, kept open for good. A failed write loses nothing: a full pipe holds a wake already.
     unsafe {
         let errno = libc::__error();
         let saved = *errno;
@@ -104,10 +97,6 @@ extern "C" fn on_term(sig: libc::c_int, info: *mut libc::siginfo_t, _context: *m
     }
 }
 
-/// Route SIGTERM to [`on_term`]; whether it took. `SA_RESTART` restarts the restartable calls
-/// it interrupts (`read`, `write`, `waitpid`, ...); `poll`, `select`, `kevent` and the sleeps
-/// still return `EINTR`, which every wait the mug makes retries (`aterm_uds::deadline`'s
-/// `poll`, std's sleep).
 fn install() -> bool {
     // SAFETY: all-zero is a valid action, filled in below.
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -121,7 +110,6 @@ fn install() -> bool {
     unsafe { libc::sigaction(libc::SIGTERM, &raw const action, std::ptr::null_mut()) == 0 }
 }
 
-/// SIGTERM's default action back.
 fn set_default() {
     // SAFETY: all-zero is a valid empty mask and no flags; `SIG_DFL` is the default action.
     let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -135,10 +123,8 @@ pub(super) fn end_by_sigterm() {
     end_by(libc::SIGTERM);
 }
 
-/// Raise `sig` with its default action.
 fn end_by(sig: libc::c_int) {
-    // SAFETY: `signal` and `raise` are async-signal-safe; the default action of the one signal
-    // this is called with, SIGTERM, ends the process without a core.
+    // SAFETY: `signal` and `raise` are async-signal-safe; the default action of the one signal this is called with, SIGTERM, ends the process without a core.
     unsafe {
         libc::signal(sig, libc::SIG_DFL);
         #[expect(
@@ -158,13 +144,9 @@ mod tests {
 
     use super::*;
 
-    /// The variable naming the one test a child of this test binary runs.
     const CHILD: &str = "ATERM_TEST_CAFFEINE_SIGTERM";
-    /// The hang detector of every wait here.
     const HANG: Duration = Duration::from_secs(60);
-    /// What the child prints just before it signals itself as launchd would.
     const ENDING: &str = "ending by the system's SIGTERM";
-    /// The hand-over's pids, for the test waiting on them (`quit` is a plain `fn`).
     static HEARD: OnceLock<mpsc::Sender<libc::pid_t>> = OnceLock::new();
 
     fn heard(sender: libc::pid_t) {
@@ -173,7 +155,6 @@ mod tests {
         }
     }
 
-    /// The disposition SIGTERM has now.
     fn disposition() -> libc::sigaction {
         // SAFETY: all-zero is valid storage; a null new action only reads.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -195,10 +176,6 @@ mod tests {
         );
     }
 
-    /// Signal dispositions are process-wide, so each test here runs alone in a child of this
-    /// test binary (`<test> --exact`), never beside the runner's other threads: `None` in that
-    /// child, which runs the body with SIGTERM at its default; in the parent, the child's
-    /// output once it ended.
     fn isolated(test: &str) -> Option<std::process::Output> {
         let test = module_path!()
             .split_once("::")
@@ -213,7 +190,6 @@ mod tests {
         Some(aterm_uds::deadline::output_within(&mut cmd, HANG).expect("the child ends"))
     }
 
-    /// The child ran its one test to a pass.
     fn passed(out: &std::process::Output) {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert_eq!(
@@ -238,8 +214,6 @@ mod tests {
         assert!(!sent_by_the_system(4242));
     }
 
-    /// A SIGTERM from a pid other than launchd's reaches `quit` with that pid, and the process
-    /// lives on; the watch dropped, SIGTERM has its default action again.
     #[test]
     fn a_persons_sigterm_is_handed_over_with_its_pid() {
         let Some(out) = isolated("a_persons_sigterm_is_handed_over_with_its_pid") else {
@@ -258,8 +232,6 @@ mod tests {
         passed(&out);
     }
 
-    /// A SIGTERM from launchd ends the process as the default action does, and reaches no
-    /// `quit`.
     #[test]
     fn the_systems_sigterm_ends_the_process_as_its_default_does() {
         let Some(out) = isolated("the_systems_sigterm_ends_the_process_as_its_default_does") else {
@@ -287,7 +259,6 @@ mod tests {
         );
     }
 
-    /// A SIGTERM a parent left ignored stays ignored: the mug does not take it.
     #[test]
     fn an_ignored_sigterm_is_left_alone() {
         let Some(out) = isolated("an_ignored_sigterm_is_left_alone") else {

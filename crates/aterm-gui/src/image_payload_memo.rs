@@ -11,12 +11,8 @@ use aterm_types::MutexExt as _;
 
 use crate::control::control_media::MAX_IMAGE_PAYLOAD_BYTES;
 
-/// The process memo's byte budget: about three images at the F4 cap, or a
-/// screen of ordinary thumbnails.
 const MEMO_BYTES: usize = 16 * 1024 * 1024;
 
-/// What an entry charges against the budget besides its base64: its slot in
-/// the map. A screen of tiny images is bounded too.
 const ENTRY_BYTES: usize = std::mem::size_of::<(usize, Entry)>();
 
 static MEMO: LazyLock<PayloadMemo> = LazyLock::new(|| PayloadMemo::with_budget(MEMO_BYTES));
@@ -41,8 +37,6 @@ impl ImagePayload {
         b64: None,
     };
 
-    /// `img` encoded under the F4 cap: an oversized image is `truncated`, not
-    /// encoded.
     fn encode(img: &ImageData) -> ImagePayload {
         let format = match img.format {
             ImageFormat::Png => "png",
@@ -78,8 +72,6 @@ impl ImagePayload {
     }
 }
 
-/// Encoded payloads keyed by image identity, bounded by bytes. See the module
-/// doc for the eviction rule.
 struct PayloadMemo {
     budget: usize,
     /// A STRICT LEAF: held to look up or store entries, never across an
@@ -106,8 +98,6 @@ struct Entry {
     used: u64,
 }
 
-/// A batch between its two holds of the lock: what the lookup served, and the
-/// images it left to encode.
 struct Batch {
     /// The batch's number: [`Entries::batches`] when it began.
     number: u64,
@@ -117,8 +107,6 @@ struct Batch {
     misses: Vec<usize>,
 }
 
-/// The entries a batch may evict to keep what it encoded: those no batch used
-/// since it began.
 struct Evictable {
     /// Most recently used first, so `pop` takes the least recent.
     order: Vec<(u64, usize)>,
@@ -134,15 +122,11 @@ impl PayloadMemo {
         }
     }
 
-    /// The payload of each of `images`, in order: the memo's entry when it has
-    /// one, else encoded here with the lock released and kept while it fits.
     fn payloads_of(&self, images: &[&Arc<ImageData>]) -> Vec<ImagePayload> {
         let batch = self.begin(images);
         self.finish(images, batch)
     }
 
-    /// Begin a batch over `images`: number it, drop freed images' entries, and
-    /// serve every image the memo holds, marking its entry used by the batch.
     fn begin(&self, images: &[&Arc<ImageData>]) -> Batch {
         let mut out = Vec::with_capacity(images.len());
         let mut misses = Vec::new();
@@ -174,9 +158,6 @@ impl PayloadMemo {
         }
     }
 
-    /// Finish `batch` over the same `images`: encode its misses with the lock
-    /// released, keep each while it fits, and return its payloads. Other
-    /// batches may begin and finish between this batch's two holds.
     fn finish(&self, images: &[&Arc<ImageData>], batch: Batch) -> Vec<ImagePayload> {
         let Batch {
             number,
@@ -233,7 +214,6 @@ fn key(img: &Arc<ImageData>) -> usize {
 }
 
 impl Entries {
-    /// Move the entries of images that have been freed into `freed`.
     fn drop_freed(&mut self, freed: &mut Vec<Entry>) {
         let before = freed.len();
         freed.extend(
@@ -246,11 +226,6 @@ impl Entries {
         }
     }
 
-    /// Keep `payload` for `img`, encoded by `batch`, if evicting entries no
-    /// batch has used since `batch` began, least recently used first, can make
-    /// room for it; otherwise leave the memo as it is. `evictable` is the
-    /// batch's eviction order, built on first need and kept to the entries the
-    /// batch does not use; evicted entries move into `freed`.
     fn keep(
         &mut self,
         budget: usize,
@@ -300,7 +275,6 @@ impl Entries {
         );
     }
 
-    /// The entries no batch has used since `batch` began, least recent last.
     fn evictable_by(&self, batch: u64) -> Evictable {
         let mut order: Vec<(u64, usize)> = self
             .by_image
@@ -345,15 +319,10 @@ mod tests {
         aterm_codec::base64::encode(&img.bytes).expect("encode")
     }
 
-    /// What `img`'s payload charges against a memo's budget.
     fn charge_of(img: &ImageData) -> usize {
         ENTRY_BYTES + b64_of(img).len()
     }
 
-    /// The case the retired two-slot shape lost: three images, in one order
-    /// frame after frame, are each encoded once, and every later frame
-    /// shares the first encoding. The negative control is a fresh memo,
-    /// which encodes all three again.
     #[test]
     fn three_images_are_encoded_once_across_frames() {
         let memo = PayloadMemo::with_budget(1 << 20);
@@ -387,10 +356,6 @@ mod tests {
         assert_eq!(take_images_encoded(), 3, "the negative control re-encodes");
     }
 
-    /// A full memo keeps what the frame reaches first and encodes only the
-    /// rest, frame after frame. The negative control is the thrash the
-    /// eviction rule forbids: evicting the frame's own entries would encode
-    /// all three every frame.
     #[test]
     fn a_full_memo_keeps_what_the_frame_uses_and_encodes_only_the_rest() {
         let len = 300;
@@ -429,12 +394,6 @@ mod tests {
         assert!(memo.charged_bytes() <= budget);
     }
 
-    /// Two batches interleave over one image X: B begins, then A, then B
-    /// keeps X while A is encoding, so A's keep finds an entry an older batch
-    /// left evictable. A uses it from then on: W's miss evicts only the
-    /// entry no batch uses, and Y, which would need X's room, is served
-    /// without being kept. Were X left in A's eviction order, Y's miss would
-    /// evict it and keep Y.
     #[test]
     fn a_batch_never_evicts_an_entry_an_older_batch_kept_for_it() {
         let len = 300;
@@ -465,9 +424,6 @@ mod tests {
         assert!(memo.charged_bytes() <= budget);
     }
 
-    /// A freed image's entry pins its address until the next batch drops the
-    /// entry, so no other image can be served the freed one's payload. The
-    /// negative control is an image kept alive: its entry stays.
     #[test]
     fn a_freed_image_leaves_the_memo_and_its_address_serves_no_stale_payload() {
         let memo = PayloadMemo::with_budget(1 << 20);
@@ -495,8 +451,6 @@ mod tests {
         assert_eq!(memo.charged_bytes(), charge_of(&kept) + charge_of(&other));
     }
 
-    /// F4: a payload over the cap is `truncated` with no base64, and is never
-    /// kept.
     #[test]
     fn an_oversized_image_is_truncated_and_not_kept() {
         let memo = PayloadMemo::with_budget(1 << 30);

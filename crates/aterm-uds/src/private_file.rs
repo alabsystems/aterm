@@ -37,12 +37,8 @@ impl fmt::Display for PrivateFileError {
 
 impl std::error::Error for PrivateFileError {}
 
-/// What a file or directory an extended access list opens to others is
-/// refused as.
 const ACL_OPEN: &str = "an access list (ACL) grants other users access; `chmod -N` removes it";
 
-/// astream-sys's verdict on an open FILE ([`astream_sys::owner_private`]) in
-/// this module's words.
 fn file_verdict(file: &std::fs::File) -> Result<std::fs::Metadata, PrivateFileError> {
     use astream_sys::NotPrivate;
     match astream_sys::owner_private(file).map_err(PrivateFileError::Io)? {
@@ -58,7 +54,7 @@ fn file_verdict(file: &std::fs::File) -> Result<std::fs::Metadata, PrivateFileEr
 
 /// Reads `name` inside private directory `dir` up to `max` bytes.
 /// # Errors
-/// Returns [`PrivateFileError`] if `dir` or `name` is missing, symlinked, not private, or exceeds `max`.
+/// Returns [`PrivateFileError`] if `dir` or `name` is missing, symlinked, not private, or too big.
 pub fn read_private(dir: &Path, name: &str, max: usize) -> Result<Vec<u8>, PrivateFileError> {
     let (file, _meta) = open_private(dir, name)?;
     let mut bytes = Vec::with_capacity(max.min(64 * 1024) + 1);
@@ -73,17 +69,12 @@ pub fn read_private(dir: &Path, name: &str, max: usize) -> Result<Vec<u8>, Priva
     Ok(bytes)
 }
 
-/// What a name of more than one path component is refused as.
 const ONE_COMPONENT: &str = "a private file's name is one path component";
 
-/// Whether `name` is one path component: not empty, `.` or `..`, and no `/`. Only `dir`
-/// is judged, and `O_NOFOLLOW` covers only the last component, so a name that reaches
-/// through another directory would escape the rules.
 fn one_component(name: &str) -> bool {
     !(name.is_empty() || name == "." || name == ".." || name.contains('/'))
 }
 
-/// [`one_component`] as the refusal [`write_private`] and [`remove_private`] give.
 fn one_component_io(name: &str) -> io::Result<()> {
     if one_component(name) {
         Ok(())
@@ -92,7 +83,6 @@ fn one_component_io(name: &str) -> io::Result<()> {
     }
 }
 
-/// What a directory is under the private-directory rule.
 enum DirIs {
     /// There is none.
     Missing,
@@ -111,12 +101,6 @@ enum DirIs {
     Acl,
 }
 
-/// `dir` judged by astream's one owner-only rule on the OPEN directory
-/// ([`astream_sys::owner_private_dir`]): opened read-only, non-blocking and
-/// refusing a symlink at its last component, then judged off the descriptor —
-/// a directory, this user's (the effective uid), no access-list entry that
-/// allows anyone anything (macOS), and no group or other mode bit, in that
-/// order, so [`DirIs::Open`] means every other clause held.
 fn dir_is(dir: &Path) -> io::Result<DirIs> {
     use astream_sys::NotPrivate;
     use std::os::unix::fs::MetadataExt as _;
@@ -141,7 +125,7 @@ fn dir_is(dir: &Path) -> io::Result<DirIs> {
     })
 }
 
-/// Opens `name` inside `dir` under [`read_private`] rules and returns the file and its `fstat` metadata.
+/// Opens `name` in `dir` under [`read_private`] rules and returns the file and metadata.
 /// # Errors
 /// Returns [`PrivateFileError`] if `dir` or `name` is missing, symlinked, or not owner-private.
 pub fn open_private(
@@ -210,7 +194,7 @@ pub struct PrivateRead {
 
 /// Reads `name` in `dir` into `buf` (up to `max` bytes) and returns [`PrivateRead`].
 /// # Errors
-/// Returns [`PrivateFileError`] if `dir` or `name` fails privacy checks or exceeds `max`/`buf.len()`.
+/// Returns [`PrivateFileError`] if privacy checks fail or the file exceeds `max`/`buf.len()`.
 pub fn read_private_into(
     dir: &Path,
     name: &str,
@@ -250,7 +234,6 @@ pub fn read_private_into(
     })
 }
 
-/// Read from `file` until `buf` is full or the file ends: how many bytes were read.
 fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -275,7 +258,6 @@ pub enum PrivateDir {
     Open(u32),
 }
 
-/// [`ensure_private_dir`]'s refusal of `dir`, `why` worded for a person.
 fn dir_refused(dir: &Path, why: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
@@ -283,7 +265,6 @@ fn dir_refused(dir: &Path, why: &str) -> io::Error {
     )
 }
 
-/// [`ensure_private_dir`]'s refusal of a directory an access list opens to others.
 fn dir_acl_refused(dir: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
@@ -297,7 +278,7 @@ fn dir_acl_refused(dir: &Path) -> io::Error {
 
 /// Inspects `dir` under [`ensure_private_dir`] rules without modifying it.
 /// # Errors
-/// Returns an error if `dir` is a symlink, not a directory, owned by another user, or has ACL grants.
+/// Returns an error if `dir` is a symlink, not a directory, not owned, or has ACL grants.
 pub fn judge_private_dir(dir: &Path) -> io::Result<PrivateDir> {
     match dir_is(dir)? {
         DirIs::Missing => Ok(PrivateDir::Missing),
@@ -343,7 +324,7 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<Option<u32>> {
 
 /// Verifies that `dir` already exists as an owner-private `0700` directory with no ACL grants.
 /// # Errors
-/// Returns an error if `dir` is missing, loose, symlinked, owned by another user, or has ACL grants.
+/// Returns an error if `dir` is missing, loose, symlinked, not owned, or has ACL grants.
 pub fn check_private_dir(dir: &Path) -> io::Result<()> {
     let refused = |why: &dyn fmt::Display| {
         io::Error::new(
@@ -370,7 +351,7 @@ pub fn check_private_dir(dir: &Path) -> io::Result<()> {
 
 /// Atomically writes `bytes` to `name` in private directory `dir` with mode `0600`.
 /// # Errors
-/// Returns an error if `name` is not a single path component, `dir` is not private, or writing fails.
+/// Returns an error if `name` spans multiple components, `dir` is not private, or write fails.
 pub fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     one_component_io(name)?;
     check_private_dir(dir)?;
@@ -398,7 +379,6 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             match std::fs::DirBuilder::new().mode(0o700).create(dir) {
                 Ok(()) => {
-                    // The umask can only narrow the mode `mkdir` gave; this sets it exactly.
                     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -421,7 +401,6 @@ mod tests {
         judge_private_dir, read_private, read_private_into, remove_private, write_private,
     };
 
-    /// A directory `name` in `root`, mode `mode`.
     fn dir_in(root: &Path, name: &str, mode: u32) -> PathBuf {
         let dir = root.join(name);
         std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
@@ -429,7 +408,6 @@ mod tests {
         dir
     }
 
-    /// A file `name` in `dir` holding `bytes`, mode `mode`.
     fn file_in(dir: &Path, name: &str, bytes: &[u8], mode: u32) {
         use std::io::Write as _;
         let path = dir.join(name);
@@ -451,8 +429,6 @@ mod tests {
             & 0o777
     }
 
-    /// A 0600 file in a 0700 directory reads whole, and the identity it names is the
-    /// file's own.
     #[test]
     fn a_private_file_reads_into_the_buffer_with_its_identity() {
         use std::os::unix::fs::MetadataExt as _;
@@ -473,7 +449,6 @@ mod tests {
         assert_eq!(&buf[..read.len], b"eleven byte");
     }
 
-    /// A file one byte past the cap is malformed, whether the cap is `max` or the buffer.
     #[test]
     fn a_file_past_the_cap_is_malformed() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -501,7 +476,6 @@ mod tests {
         );
     }
 
-    /// A file or a directory open to others is not private.
     #[test]
     fn a_loose_file_or_directory_is_not_private() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -520,8 +494,6 @@ mod tests {
         ));
     }
 
-    /// A name of more than one path component is refused before anything is opened, even
-    /// when the file it reaches is private: only `dir` would be judged.
     #[test]
     fn a_name_of_more_than_one_component_is_malformed() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -544,8 +516,6 @@ mod tests {
         );
     }
 
-    /// `write_private` and `remove_private` refuse a name of more than one path component
-    /// as `InvalidInput`: nothing is made below `dir` or written or removed beside it.
     #[test]
     fn a_name_of_more_than_one_component_is_neither_written_nor_removed() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -569,7 +539,6 @@ mod tests {
         assert!(remove_private(&dir, "token").unwrap());
     }
 
-    /// `usize::MAX` as `read_private`'s cap is no cap: the file reads whole.
     #[test]
     fn read_private_with_no_cap_reads_the_file() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -655,10 +624,6 @@ mod tests {
         assert_eq!(ensure_private_dir(&denied).unwrap(), None);
     }
 
-    /// `judge_private_dir` says what `ensure_private_dir` would do and changes nothing: a
-    /// missing directory stays missing, an open one keeps its mode until
-    /// `ensure_private_dir` narrows it (returning the mode it had), and a symlink is
-    /// refused with no OS error code.
     #[test]
     fn judge_private_dir_says_what_ensure_would_do_and_changes_nothing() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -681,10 +646,6 @@ mod tests {
         assert!(refusal.raw_os_error().is_none(), "{refusal}");
     }
 
-    /// The file's clauses are astream's owner-only rule, worded here: a FIFO in the file's
-    /// place is refused as no regular file AT ONCE (the open does not wait for a writer;
-    /// the read runs behind the one-minute hang detector), and on macOS a 0600 file with
-    /// an `everyone allow read` entry is not private, naming `chmod -N`.
     #[test]
     fn a_fifo_or_an_access_list_in_the_files_place_is_refused() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -733,7 +694,6 @@ mod tests {
         }
     }
 
-    /// A symlink in the file's place is refused as one.
     #[test]
     fn a_symlink_in_the_files_place_is_refused() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -747,9 +707,6 @@ mod tests {
         ));
     }
 
-    /// `create_private_dir` makes a missing directory 0700, accepts a private one, and
-    /// never narrows: a loose one is refused and left as it was, a symlink is refused, and
-    /// a missing parent is `NotFound`.
     #[test]
     fn create_private_dir_makes_or_accepts_and_never_narrows() {
         let root = aterm_tempfile::tempdir().unwrap();

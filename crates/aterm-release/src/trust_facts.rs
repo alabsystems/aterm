@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Trust verification lane fact recording, memory-ceiling admission, ratchet judgment, and CLI verbs.
+//! Trust verification lane fact recording, memory admission, ratchet judgment, and CLI verbs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -71,14 +71,14 @@ pub struct Measured {
     pub path_refused: Vec<PathRefusal>,
 }
 
-/// Path rejected by `targo` due to unsafe characters, paired with its classification.
+/// Path rejected by `targo` for permissions or ownership.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PathRefusal {
     pub path: String,
     pub why: Refused,
 }
 
-/// Classification of why `targo` refused a path (`Colon` or `Other`).
+/// Why `targo` refused a path.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Refused {
     Writable {
@@ -1446,7 +1446,7 @@ impl Decision {
     }
 }
 
-/// Selected crate in a verification run, pairing its [`Decision`], [`MemRow`], and [`Measured`] result.
+/// Selected crate in a verification run, pairing [`Decision`], [`MemRow`], and [`Measured`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Crate {
     pub name: String,
@@ -1725,7 +1725,7 @@ fn refused_path_note(r: &PathRefusal, names: &[&str], me: u32) -> String {
     )
 }
 
-/// Final verification verdict (`PASS`, `FAIL`, `COULD-NOT-RUN`, or `NARROWED`) returned by [`judge`].
+/// Final verification verdict (`PASS`, `FAIL`, `COULD-NOT-RUN`, or `NARROWED`) from [`judge`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Verdict {
     pub report: String,
@@ -2888,7 +2888,7 @@ impl Plan {
         Ok(p)
     }
 
-    /// Evaluates up-front memory admission for all crates in the plan and returns the rewritten plan text.
+    /// Evaluates up-front memory admission for all crates and returns the rewritten plan text.
     pub fn admit(&self) -> std::result::Result<(String, Vec<(String, String)>), String> {
         let shown = self.memory.display().to_string();
         let text = fs::read_to_string(&self.memory)
@@ -3570,7 +3570,7 @@ pub fn ratchet_at(git: &dyn GitRunner, commit: &str) -> Result<Option<String>> {
     ))
 }
 
-/// Checks whether `judged` lowers any ratchet floor relative to the commit where `facts` were measured.
+/// Checks whether `judged` lowers any ratchet floor relative to when `facts` were measured.
 pub fn lowered_since_measured(
     git: &dyn GitRunner,
     facts: &Facts,
@@ -5224,7 +5224,6 @@ mod tests {
             Instant::now() + aterm_uds::deadline::FIRST_EXEC_HANG,
         )
         .expect("owned ancestor fixture finishes and is reaped");
-        // An exit of its own shows the link ran; a timeout or a signal keeps it.
         if out.status.code().is_some() {
             scratch.ran();
         }

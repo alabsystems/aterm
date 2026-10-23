@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The seamless update's history carry, terminal half: the grid primitives of
-//! `aterm_grid::grid::history_carry`, aimed at the grid holding this terminal's
-//! history ([`Terminal::main_grid`], the saved primary while the alternate
-//! screen is up), so a tab running a full-screen program keeps the lines above
-//! its shell prompt across an update.
+//! Terminal-level wrappers for `aterm_grid::grid::history_carry` targeting [`Terminal::main_grid`].
 
 use aterm_grid::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
@@ -16,8 +12,7 @@ use crate::grid::Grid;
 use crate::scrollback::Line;
 
 impl Terminal {
-    /// The grid holding this terminal's history, mutably — the twin of
-    /// [`Self::main_grid`].
+    /// Mutable counterpart of [`Self::main_grid`].
     #[inline]
     pub(super) const fn history_grid_mut(&mut self) -> &mut Grid {
         if self.modes.alternate_screen
@@ -28,8 +23,7 @@ impl Terminal {
         &mut self.grid
     }
 
-    /// The fence a history export of this terminal is taken on
-    /// ([`HistoryFence`]), over the grid that holds its history. A pure read.
+    /// Captures a [`HistoryFence`] on the main grid.
     #[inline]
     #[must_use]
     pub fn history_fence(&self) -> HistoryFence {
@@ -48,40 +42,30 @@ impl Terminal {
         self.main_grid().history_lines_since_fence(fence, from, max)
     }
 
-    /// The width the history grid wraps its lines at — what an import must be
-    /// built for ([`OlderHistory::build`]).
+    /// Column width of the main grid for [`OlderHistory::build`].
     #[inline]
     #[must_use]
     pub const fn history_cols(&self) -> u16 {
         self.main_grid().cols()
     }
 
-    /// Reserve absolute-row keys below the oldest history line for `lines`
-    /// imported later ([`Grid::reserve_older_history_keys`]). Call only right
-    /// after [`Self::restore_checkpoint`], before anything else reads an
-    /// absolute row. The restore continues the source's numbering, so the
-    /// reserve moves nothing and restored shell marks keep naming their lines.
-    /// Returns the claim the import presents ([`OlderHistoryClaim`]).
+    /// Reserves absolute-row keys below the oldest history line for `lines` imported later
+    /// ([`Grid::reserve_older_history_keys`]); call immediately after [`Self::restore_checkpoint`].
     #[inline]
     #[must_use]
     pub fn reserve_older_history_keys(&mut self, lines: u64) -> OlderHistoryClaim {
         self.history_grid_mut().reserve_older_history_keys(lines)
     }
 
-    /// Whether `claim` still admits an import: the history grid's scrollback
-    /// has not been cleared since the reserve
-    /// ([`Grid::older_history_claim_holds`]). A pure read.
+    /// Whether `claim` still admits an import ([`Grid::older_history_claim_holds`]).
     #[inline]
     #[must_use]
     pub const fn older_history_claim_holds(&self, claim: OlderHistoryClaim) -> bool {
         self.main_grid().older_history_claim_holds(claim)
     }
 
-    /// Place `older` before the oldest history line
-    /// ([`Grid::attach_older_history`]); refused, and the history handed back,
-    /// if the scrollback was cleared since `claim` was minted. Releases the
-    /// cached search index and advances the absolute-coordinate epoch. Returns
-    /// how many imported lines the terminal retained.
+    /// Attaches `older` before the oldest history line ([`Grid::attach_older_history`]),
+    /// invalidating the search index and scroll state.
     pub fn attach_older_history(
         &mut self,
         older: OlderHistory,

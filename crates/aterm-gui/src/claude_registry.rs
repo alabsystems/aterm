@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE REGISTRY BY PUSH (`docs/DESIGN-card-engine-2026-10-19.md` §3.10).
+//! Push-based watcher for Claude session registry rows.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
@@ -78,7 +78,7 @@ fn ident(_meta: &std::fs::Metadata) -> Option<Ident> {
     None
 }
 
-/// The watch over the registry rows the resolver awaits (module docs).
+/// Watch over the registry rows the resolver awaits.
 pub(crate) struct RegistryWatch {
     /// Makes the watcher ([`Watcher::new`]; a test's refusal disables it).
     open: fn() -> io::Result<Watcher>,
@@ -134,14 +134,11 @@ impl Route {
 /// The watcher, the route of each watch, and the forwarder reading them.
 struct Live {
     watcher: Arc<Watcher>,
-    /// The forwarder's map from a fired watch to what it tells. Held across
-    /// each registration and its route, so an event that fires at once is
-    /// not missed for want of its route.
+    /// Map from a fired watch to what it tells, held across registration and routing.
     routes: Arc<Mutex<HashMap<WatchId, Route>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    /// The forwarder's finished waits ([`Forwarder::waits`]), read by
-    /// registry_tests' platforms alone, as the helpers below are.
+    /// The forwarder's finished waits ([`Forwarder::waits`]).
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     waits: Arc<AtomicU64>,
 }
@@ -152,8 +149,7 @@ struct Forwarder {
     routes: Arc<Mutex<HashMap<WatchId, Route>>>,
     stop: Arc<AtomicBool>,
     sink: Sink,
-    /// Each wait counted once what it fired is told: how a test sees a wait
-    /// that told nothing, which no sink shows.
+    /// Completed waits, incremented after notifying the sink.
     #[cfg(test)]
     waits: Arc<AtomicU64>,
 }
@@ -359,7 +355,7 @@ impl RegistryWatch {
         self.places.files.contains_key(row)
     }
 
-    /// Remove `claude`'s directory watch and `row`'s file watch from the watcher behind this watch's back.
+    /// Remove `claude`'s directory watch and `row`'s file watch from the underlying watcher.
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     pub(crate) fn lose_watches(&self, claude: &Path, row: &Path) {
         let Some(live) = self.live.as_ref() else {
@@ -373,7 +369,7 @@ impl RegistryWatch {
         }
     }
 
-    /// Wake the forwarder with nothing changed, and wait (a hang detector) until it has finished that wait.
+    /// Wake the forwarder with nothing changed and wait until that wait finishes.
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     pub(crate) fn wake_and_settle(&self) {
         let Some(live) = self.live.as_ref() else {
@@ -388,7 +384,7 @@ impl RegistryWatch {
         );
     }
 
-    /// Whether the watcher still holds the Claude dir `claude`'s directory watch and the row `row`'s file watch.
+    /// Whether the watcher still holds `claude`'s directory watch and `row`'s file watch.
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     pub(crate) fn holds(&self, claude: &Path, row: &Path) -> (bool, bool) {
         let Some(live) = self.live.as_ref() else {
@@ -458,8 +454,8 @@ impl Places {
         fresh.into_iter().collect()
     }
 
-    /// Put the Claude dir `claude`'s directory watch as far in toward its
-    /// `sessions` as is there; whether a watch was newly placed.
+    /// Place `claude`'s directory watch as far inward toward `sessions` as exists; returns whether
+    /// a watch was newly placed.
     fn place_dir(&mut self, live: &Live, claude: &Path) -> bool {
         let target = claude.join(SESSIONS);
         if let Some(placed) = self.dirs.get(claude)
@@ -494,9 +490,8 @@ impl Places {
         fresh
     }
 
-    /// Watch the row `row` of the Claude dir `claude` while it is there;
-    /// whether a watch was newly placed, or the file was replaced while it
-    /// was (read it now, watch it on the next reconcile).
+    /// Watch `row` under `claude` while it exists; returns whether a watch was newly placed or the
+    /// file was replaced during registration.
     fn place_file(&mut self, live: &Live, claude: &Path, row: &Path) -> bool {
         if let Some(filed) = self.files.get(row) {
             if file_ident(row) == Some(filed.ident) && !live.watcher.is_gone(filed.id) {
@@ -662,10 +657,8 @@ mod tests {
         );
     }
 
-    /// With `sessions/` and its parent missing, the watch is on the nearest
-    /// ancestor there and moves inward as each level appears: registered
-    /// first, then the next level looked for, so a parent and child made in
-    /// one burst both count.
+    /// With `sessions/` and its parent missing, the watch starts on the nearest existing ancestor
+    /// and moves inward as each level appears.
     #[test]
     fn the_watch_moves_inward_as_the_levels_appear() {
         let (_owned_root, root) = root("inward");
@@ -712,10 +705,7 @@ mod tests {
         until(&rx, &Told::Rows(claude.clone()));
     }
 
-    /// A watch the kernel let go of is placed again although its object is
-    /// the one it was put on: on Linux a `sessions/` removed and made again
-    /// between two reconciles can take the old inode number, and a watch
-    /// kept by `(dev, ino)` alone would never fire again.
+    /// A watch the kernel dropped is placed again even if `(dev, ino)` is unchanged.
     #[test]
     fn a_watch_the_kernel_let_go_is_placed_again() {
         let (_owned_root, root) = root("gone");
@@ -744,9 +734,7 @@ mod tests {
         until(&rx, &Told::Rows(claude.clone()));
     }
 
-    /// The forwarder tells only what the kernel fired, never on a clock or a
-    /// bare wake: woken with nothing changed, it finishes that wait and tells
-    /// nothing, then tells the next real change.
+    /// The forwarder reports only kernel-fired events, never a bare wake.
     #[test]
     fn the_forwarder_tells_only_what_the_kernel_fired() {
         let (_owned_root, root) = root("kernel-only");

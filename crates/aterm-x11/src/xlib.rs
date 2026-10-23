@@ -566,8 +566,7 @@ pub struct XIMPreeditDrawCallbackStruct {
     pub text: *mut XIMText,
 }
 
-/// `XIMPreeditCaretCallbackStruct`: `direction` is an `XIMCaretDirection`,
-/// `style` an `XIMCaretStyle` (C enums).
+/// `XIMPreeditCaretCallbackStruct` (`XIMCaretDirection` and `XIMCaretStyle`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIMPreeditCaretCallbackStruct {

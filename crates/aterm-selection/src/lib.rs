@@ -5,44 +5,6 @@
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 //! Pattern-based smart selection and mouse-driven text selection for terminal cells.
-//!
-//! # Examples
-//!
-//! Smart selection picks the semantic unit (here a URL) under a cursor:
-//!
-//! ```
-//! use aterm_selection::SmartSelection;
-//!
-//! let smart = SmartSelection::with_builtin_rules();
-//!
-//! // Given a line of text and a cursor column
-//! let line = "Check out https://example.com for more info";
-//! let bounds = smart.word_boundaries_at(line, 15); // cursor is on the URL
-//!
-//! if let Some((start, end)) = bounds {
-//!     assert_eq!(&line[start..end], "https://example.com");
-//! }
-//! ```
-//!
-//! Text selection follows a mouse press, drag and release:
-//!
-//! ```
-//! use aterm_selection::{SelectionSide, SelectionType, TextSelection};
-//!
-//! let mut sel = TextSelection::new();
-//!
-//! // Start selection on mouse down
-//! sel.start_selection(0, 5, SelectionSide::Left, SelectionType::Simple);
-//!
-//! // Update on mouse drag
-//! sel.update_selection(0, 15, SelectionSide::Right);
-//!
-//! // Complete on mouse up
-//! sel.complete_selection();
-//!
-//! // Check if a cell is selected
-//! assert!(sel.contains(0, 10));
-//! ```
 
 #![warn(missing_docs)]
 

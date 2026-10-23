@@ -23,6 +23,17 @@ pub(crate) const BLOOM: &str = include_str!("../../shaders/bloom.metal");
 /// EMBERFORGE heat-haze displacement shader (WGSL twin: `renderer.rs::SHIMMER_SHADER`).
 pub(crate) const SHIMMER: &str = include_str!("../../shaders/shimmer.metal");
 
+/// The line [`source_for`] puts before [`CELL`] for a device with framebuffer fetch: it compiles `cell.metal`'s fetch twins and probe (`#if ATERM_FETCH`).
+pub(crate) const FETCH_DEFINE: &str = "#define ATERM_FETCH 1\n";
+
+/// The MSL a device compiles for `library`: [`source`], with [`FETCH_DEFINE`] before `cell.metal` when `fetch` (the device has framebuffer fetch, [`super::fetch::capable`]).
+pub(crate) fn source_for(library: ShaderLibrary, fetch: bool) -> std::borrow::Cow<'static, str> {
+    match library {
+        ShaderLibrary::Cell if fetch => format!("{FETCH_DEFINE}{CELL}").into(),
+        _ => source(library).into(),
+    }
+}
+
 /// MSL source for [`ShaderLibrary`].
 #[inline]
 pub(crate) const fn source(library: ShaderLibrary) -> &'static str {

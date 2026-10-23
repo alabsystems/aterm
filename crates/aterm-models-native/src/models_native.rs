@@ -42,7 +42,7 @@ pub fn control_connection_admission_model() -> Model {
     }
 }
 
-/// WHERE A CONTROL CONNECTION IS between its requests, and so what a fresh client is refused for (`aterm-gui/src/control_lanes.rs`).
+/// WHERE A CONTROL CONNECTION IS between its requests, and so what a fresh client is refused for.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn control_lane_tenure_model() -> Model {
@@ -1721,7 +1721,7 @@ pub fn native_settings_singleton_model() -> Model {
     }
 }
 
-/// Native Settings keeps text drafts across navigation/publication, blocks every close scope while a draft exists, and keeps explicit recovery visible.
+/// Native Settings keeps text drafts across navigation, blocks closes, and shows recovery.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_settings_draft_close_model() -> Model {
@@ -1796,7 +1796,7 @@ pub fn native_settings_draft_close_model() -> Model {
     }
 }
 
-/// Versioned preference patches use touched-key expectations rather than blind whole-file overwrite.
+/// Versioned preference patches use touched-key expectations.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_config_transaction_model() -> Model {
@@ -2019,7 +2019,7 @@ pub fn native_config_observation_handoff_model() -> Model {
     }
 }
 
-/// Process-global Serious Mode commands keep semantic desired values while another config write is in flight.
+/// Process-global Serious Mode commands keep desired values while another write is in flight.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn serious_mode_intent_queue_model() -> Model {
@@ -2379,7 +2379,7 @@ pub fn config_file_commit_cas_model() -> Model {
     }
 }
 
-/// A composite accessibility tree publishes independent route ownership for two visible native views.
+/// Composite accessibility tree publishes independent route ownership for two visible views.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn composite_accessibility_route_model() -> Model {
@@ -2536,7 +2536,7 @@ pub fn native_document_publication_model() -> Model {
     }
 }
 
-/// File-watch observations are a five-way decision with strict precedence: an in-flight save defers every changed observation; otherwise byte-equivalent generations rebind only the baseline; otherwise dirty local bytes surface a conflict and clean bytes reload atomically.
+/// File-watch observations are a five-way decision with strict precedence.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_file_watch_model() -> Model {
@@ -2708,7 +2708,7 @@ pub fn watcher_failure_recovery_model() -> Model {
     }
 }
 
-/// Crash-journal serialization has one in-flight generation, coalesces edits to the latest desired head, accepts durability only for the exact fsync proof, and rebases/prunes only after an atomic file-save proof.
+/// Crash-journal serialization model with single in-flight generation and fsync/save proofs.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_draft_journal_model() -> Model {
@@ -2967,7 +2967,7 @@ pub fn restore_manifest_single_use_model() -> Model {
     }
 }
 
-/// Atomic close planning freezes the final document sequence, waits for a durable acknowledgement and every leaf's readiness, and only then detaches the tree.
+/// Atomic close planning model freezing final document sequence until durable acknowledgment.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_close_plan_model() -> Model {
@@ -3052,7 +3052,7 @@ pub fn native_close_plan_model() -> Model {
     }
 }
 
-/// A document owns the latest explicit Save/close durability intent while an older atomic file generation is in flight.
+/// Document save/close durability model while an older atomic file generation is in flight.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_save_intent_latch_model() -> Model {

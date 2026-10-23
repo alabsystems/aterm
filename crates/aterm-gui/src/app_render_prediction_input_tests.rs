@@ -11,7 +11,6 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 const WID: WindowId = WindowId(0);
-/// A link slow enough for `adaptive` to display: two such echoes open it.
 const RTT: Duration = Duration::from_millis(60);
 
 fn glyph(c: char) -> InputEvent {
@@ -24,8 +23,6 @@ fn glyph(c: char) -> InputEvent {
     }
 }
 
-/// The scripted app in `mode`, split when `split` (the composed path), with
-/// `$ ` at the keyboard's terminal and one frame presented.
 fn rig(mode: &str, split: bool) -> App {
     let mut app = scripted_app();
     if split {
@@ -53,7 +50,6 @@ fn feed(app: &App, text: &str) {
     term_lock(&term).process(text.as_bytes());
 }
 
-/// The keyboard terminal's cursor, coordinate generation and grid.
 fn sample(app: &App) -> ((u16, u16), u64, (u16, u16)) {
     let term = app
         .front_terminal(WID)
@@ -69,11 +65,6 @@ fn sample(app: &App) -> ((u16, u16), u64, (u16, u16)) {
     )
 }
 
-/// Prime the window's predictor as a slow, echoing line does: `ab` typed at
-/// the cursor, each echoed one RTT after its press (the program's echo fed to
-/// the terminal, the reconcile at an instant the test chooses), so `adaptive`
-/// displays the next key. Typed on the predictor itself: no input edge is armed
-/// for these two. Returns the instant of the second echo's reconcile.
 fn prime_slow_echoes(app: &mut App) -> Instant {
     let mut at = crate::app_input::past_timeline_start();
     for ch in ['a', 'b'] {
@@ -93,14 +84,11 @@ fn prime_slow_echoes(app: &mut App) -> Instant {
     at
 }
 
-/// Press `ev` through the press path, stamped at `at`.
 fn press_at(app: &mut App, ev: InputEvent, at: Instant) {
     crate::app_input::pin_input_clock(Some(at));
     let _ = app.input(WID, ev, Source::Human);
 }
 
-/// Stamp output on every session, so the next present is a CONTENT present
-/// (one with PTY output behind it): what the echo's frame is.
 fn arm_output(app: &App) {
     let now = u64::try_from(app.lat_epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
     for session in app.pool.iter() {
@@ -110,10 +98,6 @@ fn arm_output(app: &App) {
     }
 }
 
-/// Press `c` through the press path at `at`, present a frame with no output
-/// there, then the echo's content present one RTT later: `(the slices the first
-/// present booked, of them predicted, whether it painted a prediction, the
-/// slices the echo's booked)`.
 fn press_then_echo(app: &mut App, at: Instant) -> ((usize, usize), bool, (usize, usize)) {
     press_at(app, glyph('c'), at);
     let commits = surface(app).commits();
@@ -131,11 +115,6 @@ fn press_then_echo(app: &mut App, at: Instant) -> ((usize, usize), bool, (usize,
     (before_echo, painted, work_counts::take_input_slices())
 }
 
-/// Before a present or echo, `c,d,Backspace,e` leaves only `c,e` pending.
-/// The first frame shows both, but the cancelled `d` is no longer a shown
-/// op. Its edge stays for the content present and stops the ordered run, as
-/// does Backspace's untagged edge; only `c` may book as predicted. Every key is
-/// pressed at `at`, the first frame presented there and the echo's one RTT later.
 fn cancelled_key_then_echo(app: &mut App, at: Instant) -> ((usize, usize), (usize, usize)) {
     let commits = surface(app).commits();
     press_at(app, glyph('c'), at);
@@ -182,12 +161,6 @@ fn cancelled_key_then_echo(app: &mut App, at: Instant) -> ((usize, usize), (usiz
     (before_echo, work_counts::take_input_slices())
 }
 
-/// `adaptive` on a slow, echoing line, on the single pane's render path and on
-/// the composed one: the frame after the press paints `c`'s prediction and
-/// its present books `c`'s slice, counted as predicted; the echo's content
-/// present then books nothing more. The controls: with prediction `off` the
-/// frame paints nothing and the key waits for its echo's present; `always`
-/// paints the ghost with no proof, and its key waits for its echo too.
 #[test]
 fn a_keys_proven_prediction_on_glass_closes_its_input_slice() {
     for split in [false, true] {

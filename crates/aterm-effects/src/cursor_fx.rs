@@ -19,6 +19,15 @@ use crate::cursor_phaser::{CursorPhaser, PhaserConfig};
 use crate::cursor_rainbow::{CursorRainbow, RainbowConfig};
 use crate::cursor_trail::{CursorTrail, TrailConfig, TypingCadence};
 
+#[derive(Clone, Copy)]
+pub(crate) struct FloorFillMemo {
+    candidate: BlockFill,
+    ground: u32,
+    live_cursor: u32,
+    pinned_cursor: Option<u32>,
+    floored: BlockFill,
+}
+
 /// Cursor effect engines and per-frame scratch for one drawing surface.
 #[derive(Default)]
 pub struct CursorFx {
@@ -53,6 +62,8 @@ pub struct CursorFx {
     pub trail_scratch: Vec<TrailCell>,
     /// Memoised [`bed_legible_share`] for the last `(color, ground, ink)` triple.
     pub(crate) legible_memo: Option<((u32, u32, u32), f32)>,
+    /// Memoised [`floor_block_fill`] for the last `(candidate, ground, live_cursor, pinned_cursor)`.
+    pub(crate) floor_fill_memo: Option<FloorFillMemo>,
 }
 
 /// Everything one [`CursorFx::tick`] reads besides the two folded configs.
@@ -829,11 +840,11 @@ impl CursorFx {
     #[inline]
     pub fn retire_body_geometry(&mut self) {
         self.trail.reset();
-        self.rainbow = CursorRainbow::default();
-        self.droplet = CursorDroplet::default();
-        self.beamrod = CursorBeamRod::default();
-        self.comet = CursorComet::default();
-        self.phaser = CursorPhaser::default();
+        self.rainbow.reset();
+        self.droplet.reset();
+        self.beamrod.reset();
+        self.comet.reset();
+        self.phaser.reset();
         self.glow_scratch.clear();
         self.trail_scratch.clear();
     }
@@ -872,7 +883,7 @@ impl CursorFx {
     /// Any body (not the aurora, not the comet) still animating — the part of the scheduler's frame-cadence set this step owns.
     #[inline]
     #[must_use]
-    pub const fn bodies_active(&self) -> bool {
+    pub fn bodies_active(&self) -> bool {
         self.rainbow.is_active()
             || self.droplet.is_active()
             || self.momentum.is_active()
@@ -884,7 +895,7 @@ impl CursorFx {
     /// A body that still owes frames but not the frame cadence, once its fingerprint stops moving frame to frame.
     #[inline]
     #[must_use]
-    pub const fn bodies_settling(&self) -> bool {
+    pub fn bodies_settling(&self) -> bool {
         self.rainbow.settling() || self.momentum.settling()
     }
 
@@ -1253,7 +1264,27 @@ impl CursorFx {
         )
         .map(|owned| {
             let ground = f.cursor_cell_bg.unwrap_or(f.default_bg);
-            floor_block_fill(owned, ground, f.live_cursor, pinned_base)
+            match self.floor_fill_memo {
+                Some(memo)
+                    if memo.candidate == owned
+                        && memo.ground == ground
+                        && memo.live_cursor == f.live_cursor
+                        && memo.pinned_cursor == pinned_base =>
+                {
+                    memo.floored
+                }
+                _ => {
+                    let floored = floor_block_fill(owned, ground, f.live_cursor, pinned_base);
+                    self.floor_fill_memo = Some(FloorFillMemo {
+                        candidate: owned,
+                        ground,
+                        live_cursor: f.live_cursor,
+                        pinned_cursor: pinned_base,
+                        floored,
+                    });
+                    floored
+                }
+            }
         });
         let block_fill = project_block_fill(candidate, f.live_cursor, f.shed_envelope);
         let glow_fp = block_fill.map_or(glow_fp, |owned| {

@@ -9,12 +9,10 @@ use std::path::{Path, PathBuf};
 use crate::identity::Identity;
 use crate::wire::Birth;
 
-/// The variable naming the executable a keeper was started as, set when it re-executes from its own
-/// copy: its socket, label and relaunch bundle are still that executable's.
+/// Variable naming the executable a keeper was started as.
 pub const ORIGIN_ENV: &str = "ATERM_KEEPER_ORIGIN";
 
-/// The file a keeper running from its copy writes into the copy's directory first thing
-/// ([`mark_ran`]): the copy's exec is over, so it may go once its keeper is gone ([`sweep`]).
+/// Marker file written into the copy's directory ([`mark_ran`], [`sweep`]).
 pub const RAN: &str = aterm_uds::deadline::RAN;
 
 /// Say, in `copy` (the directory [`own_copy`] names), that this keeper runs from it.
@@ -27,8 +25,7 @@ pub fn mark_ran(copy: &Path) {
     }
 }
 
-/// Where keepers keep the copies they run from: `$HOME/Library/Application
-/// Support/aterm/keeper-code`.
+/// Where keepers keep the copies they run from.
 #[must_use]
 pub fn code_dir() -> Option<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
@@ -40,7 +37,6 @@ pub fn code_dir() -> Option<PathBuf> {
     })
 }
 
-/// This process's executable, canonical.
 fn own_exe() -> Option<PathBuf> {
     std::env::current_exe().ok()?.canonicalize().ok()
 }
@@ -54,8 +50,7 @@ pub fn own_copy(dir: &Path) -> Option<PathBuf> {
     Some(dir.join(name))
 }
 
-/// The executable this keeper was started as: what [`ORIGIN_ENV`] names when it runs from its copy
-/// (`from_copy`), else its own.
+/// The executable this keeper was started as: what [`ORIGIN_ENV`] names when it runs from its copy.
 #[must_use]
 pub fn origin_exe(from_copy: bool) -> Option<PathBuf> {
     let named = std::env::var_os(ORIGIN_ENV)
@@ -67,8 +62,7 @@ pub fn origin_exe(from_copy: bool) -> Option<PathBuf> {
     }
 }
 
-/// Copy `exe`'s code into `dir`, check the copy against `identity`, and re-execute this process
-/// from it with the same arguments and [`ORIGIN_ENV`] naming `exe`.
+/// Copy `exe`'s code into `dir` ([`ORIGIN_ENV`]).
 #[must_use]
 pub fn run_from_own_copy(exe: &Path, dir: &Path, identity: &Identity) -> String {
     let copy = match copy_own_code(exe, dir, identity) {
@@ -81,7 +75,6 @@ pub fn run_from_own_copy(exe: &Path, dir: &Path, identity: &Identity) -> String 
     format!("re-running from {}: {failed}", copy.exe.display())
 }
 
-/// A copy made for this process.
 struct Copy {
     /// Its directory, `<dir>/<pid>-<seconds>-<micros>`.
     home: PathBuf,
@@ -89,13 +82,10 @@ struct Copy {
     exe: PathBuf,
 }
 
-/// What names a copy: its keeper's pid and kernel start time.
 fn copy_name(pid: u32, birth: Birth) -> String {
     format!("{pid}-{}-{}", birth.seconds, birth.micros)
 }
 
-/// The keeper a copy's directory name says it belongs to (a copy still being
-/// made carries `.partial`); `None` for any other name.
 fn owner_of(name: &str) -> Option<(u32, Birth)> {
     let name = name.strip_suffix(".partial").unwrap_or(name);
     let mut parts = name.split('-');
@@ -152,8 +142,6 @@ fn copy_own_code(exe: &Path, dir: &Path, identity: &Identity) -> Result<Copy, St
     })
 }
 
-/// Copy `src` to `dst`: directories recreated, symbolic links recreated as
-/// they read, files copied (a clone on APFS) with their permissions.
 fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(src)?;
     let kind = meta.file_type();
@@ -176,9 +164,7 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
-/// Become `copy`, with this process's arguments (its `argv[0]` too) and [`ORIGIN_ENV`] naming
-/// `origin`. Returns only the error of a failed `exec`, which (Darwin's `POSIX_SPAWN_SETEXEC`)
-/// leaves this process as it was.
+/// Become `copy` ([`ORIGIN_ENV`]).
 fn reexec(copy: &Path, origin: &Path) -> io::Error {
     let mut args = std::env::args_os();
     let mut cmd = aterm_uds::spawnfd::command(copy);
@@ -221,11 +207,7 @@ fn sweep_at(dir: &Path, born: impl Fn(u32) -> Option<Birth>, now: std::time::Sys
         .count()
 }
 
-/// Whether a gone keeper's copy at `home` may go at `now`: it was never run
-/// (a half-made copy, `partial`, is renamed whole before its exec), its keeper
-/// said it ran from it ([`RAN`]), or the first-exec hang has passed since its
-/// exec (stamped just before it, [`run_from_own_copy`];
-/// [`aterm_uds::deadline::copy_may_go`]).
+/// Whether `home` may go ([`RAN`], [`run_from_own_copy`], [`aterm_uds::deadline::copy_may_go`]).
 fn may_go(home: &Path, partial: bool, now: std::time::SystemTime) -> bool {
     partial || aterm_uds::deadline::copy_may_go(home, now)
 }
@@ -261,11 +243,6 @@ mod tests {
         }
     }
 
-    /// The sweep removes exactly the copies whose keeper is gone (a dead pid, a reused pid, a
-    /// half-made copy of either) and that said they ran, and keeps a live keeper's copy and
-    /// anything not a copy (r4g-4: a keeper killed in its first exec never said it ran, so its
-    /// copy stays while macOS may still be assessing it). NEGATIVE CONTROL: the same unproven
-    /// copy goes once the first-exec hang has passed since its exec.
     #[test]
     fn the_sweep_removes_only_copies_whose_keeper_is_gone_and_ran() {
         let dir = std::env::temp_dir().join(format!("akcopies-{}", std::process::id()));

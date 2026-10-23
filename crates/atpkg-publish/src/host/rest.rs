@@ -17,7 +17,6 @@ use aterm_update_core::github_rest::{Client, Method, Origins, RestError, Token};
 
 use super::{HostError, Probe, RETRY_PAUSE, Release, ReleaseHost, Replace, Slug};
 
-/// Releases per listing page (GitHub's most).
 const PER_PAGE: usize = 100;
 
 /// Suffix used when staging a replacement asset under [`Replace::Clobber`].
@@ -108,7 +107,6 @@ impl RestHost {
         }
     }
 
-    /// The token, when the token file holds one.
     fn token(&self) -> Result<Option<Token>, HostError> {
         match &self.token_file {
             None => Ok(None),
@@ -116,7 +114,6 @@ impl RestHost {
         }
     }
 
-    /// A client speaking as `token`, or anonymously.
     fn client(&self, token: Option<Token>) -> Client {
         let client = Client::new(self.origins.clone(), token);
         #[cfg(any(test, debug_assertions))]
@@ -127,12 +124,10 @@ impl RestHost {
         client
     }
 
-    /// A client reading: the token when there is one, else anonymous.
     fn reader(&self) -> Result<Client, HostError> {
         Ok(self.client(self.token()?))
     }
 
-    /// A client writing: as the configured identity's token, never anonymously.
     fn writer(&self) -> Result<Client, HostError> {
         match self.token()? {
             Some(token) => Ok(self.client(Some(token))),
@@ -144,8 +139,6 @@ impl RestHost {
         }
     }
 
-    /// The release object `tag` names on `slug` (the module's rule): the published one by
-    /// tag, else the one draft of that tag in the listing.
     fn object(&self, client: &Client, slug: &Slug, tag: &str) -> Result<Value, HostError> {
         let by_tag = format!("/repos/{slug}/releases/tags/{}", segment(tag));
         match client.read(&by_tag) {
@@ -168,9 +161,6 @@ impl RestHost {
         }
     }
 
-    /// Every release object of `slug`, drafts included when the token can push. A 404 here
-    /// is the repository's own (private to another identity, or gone), never "no releases":
-    /// [`HostError::Unreachable`], as the read contract has it.
     fn listing(&self, client: &Client, slug: &Slug) -> Result<Vec<Value>, HostError> {
         client
             .pages(
@@ -185,14 +175,12 @@ impl RestHost {
             })
     }
 
-    /// The release object's id.
     fn id_of(object: &Value) -> Result<u64, HostError> {
         object["id"]
             .as_u64()
             .ok_or_else(|| HostError::Unreachable("GitHub answered a release with no id".into()))
     }
 
-    /// `PATCH` the release `id` of `slug` to a published prerelease that never takes `latest`.
     fn publish(client: &Client, slug: &Slug, id: u64) -> Result<(), HostError> {
         let body = aterm_json::json!({"draft": false, "prerelease": true, "make_latest": "false"});
         client
@@ -206,7 +194,6 @@ impl RestHost {
             .map_err(|e| host_error(&e))
     }
 
-    /// Upload `file` to release `id` of `slug` as `name`: the new asset's id.
     fn upload_one(
         client: &Client,
         slug: &Slug,
@@ -228,7 +215,6 @@ impl RestHost {
         })
     }
 
-    /// Delete asset `asset` of `slug`; one already gone is no failure.
     fn delete_asset(client: &Client, slug: &Slug, asset: u64) -> Result<(), HostError> {
         let gone = client
             .send(
@@ -244,7 +230,6 @@ impl RestHost {
         }
     }
 
-    /// Delete the staged asset of `name` that an interrupted replace left on `object`, if any.
     fn drop_staged(
         client: &Client,
         slug: &Slug,
@@ -258,8 +243,6 @@ impl RestHost {
         }
     }
 
-    /// Replace asset `old`, named `name`, of release `id` with `file` (the module's rule): the
-    /// bytes up under the staged name, then the old asset deleted and the staged one renamed.
     fn replace_one(
         client: &Client,
         slug: &Slug,
@@ -283,7 +266,6 @@ impl RestHost {
             .map_err(|e| host_error(&e))
     }
 
-    /// git `args` as this identity (the module's rule).
     fn git(&self, args: &[OsString]) -> Result<(), HostError> {
         let out = self
             .git_command(args)?
@@ -302,9 +284,6 @@ impl RestHost {
         )))
     }
 
-    /// The git command [`Self::git`] runs (the module's rule): every configured helper
-    /// cleared, and with a token (and a base git asks a helper about) the one helper scoped to
-    /// that origin, the token in [`GIT_TOKEN_ENV`] of git's environment alone.
     fn git_command(&self, args: &[OsString]) -> Result<Command, HostError> {
         let token = self.token()?;
         let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
@@ -329,15 +308,11 @@ impl RestHost {
         Ok(cmd)
     }
 
-    /// `slug`'s git URL.
     fn git_url(&self, slug: &Slug) -> String {
         format!("{}/{slug}.git", self.git_base)
     }
 }
 
-/// The origin git's credential helper is scoped to (`credential.<origin>.helper`): `base` when
-/// it is `http(s)://host[:port]`; `None` for a base git would never ask a helper about (a
-/// `file://` test remote).
 fn credential_origin(base: &str) -> Option<&str> {
     let (scheme, host) = base.split_once("://")?;
     (matches!(scheme, "https" | "http")
@@ -346,10 +321,6 @@ fn credential_origin(base: &str) -> Option<&str> {
     .then_some(base)
 }
 
-/// git's credential helper (the module's rule): on `get`, the token as the password of
-/// `x-access-token` (which GitHub reads for any token kind), from [`GIT_TOKEN_ENV`] through
-/// the shell's builtin `printf`; on `store` and `erase`, nothing. git runs it as `sh -c '<it>
-/// get'`, after its stdin description, which it does not read.
 fn git_helper() -> String {
     format!(
         "!f() {{ if test \"$1\" = get; then printf 'username=x-access-token\\npassword=%s\\n' \
@@ -357,8 +328,6 @@ fn git_helper() -> String {
     )
 }
 
-/// `text` as one URL path segment or query value: every byte outside RFC 3986's unreserved
-/// set as `%XX`.
 fn segment(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for b in text.bytes() {
@@ -371,7 +340,6 @@ fn segment(text: &str) -> String {
     out
 }
 
-/// A file's name, as its asset is named.
 fn file_name(file: &Path) -> Result<&str, HostError> {
     file.file_name()
         .and_then(|n| n.to_str())
@@ -379,7 +347,6 @@ fn file_name(file: &Path) -> Result<&str, HostError> {
         .ok_or_else(|| HostError::Refused(format!("{} has no asset name", file.display())))
 }
 
-/// Whether `name` is one plain file name `dir.join` keeps inside `dir`.
 fn plain_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
@@ -388,10 +355,8 @@ fn plain_name(name: &str) -> bool {
         && !name.ends_with(PART)
 }
 
-/// The suffix of a download's part file.
 const PART: &str = ".atpkg-part";
 
-/// A REST failure as the trait reads one (the module's rule).
 fn host_error(e: &RestError) -> HostError {
     match e {
         RestError::Status { status: 404, .. } => HostError::NotFound,
@@ -403,7 +368,6 @@ fn host_error(e: &RestError) -> HostError {
     }
 }
 
-/// A release object as the trait's: its asset names in GitHub's order.
 fn release_of(object: &Value) -> Result<Release, HostError> {
     let unreadable = || {
         HostError::Unreachable(format!(
@@ -435,8 +399,6 @@ fn release_of(object: &Value) -> Result<Release, HostError> {
     })
 }
 
-/// The asset of `object` named `name`: its id and size; `NotFound` for none, `Refused` for
-/// several.
 fn asset_of(object: &Value, name: &str) -> Result<(u64, u64), HostError> {
     let named: Vec<&Value> = object["assets"]
         .as_array()
@@ -639,16 +601,12 @@ impl ReleaseHost for RestHost {
         self.retry_pause
     }
 
-    /// No non-empty token file: the head is read where a client reads it, never through
-    /// an identity this host does not have.
     fn reads_anonymously(&self) -> bool {
         self.token_file
             .as_ref()
             .is_none_or(|f| !std::fs::metadata(f).is_ok_and(|m| m.len() > 0))
     }
 
-    /// `git fetch` of the slug's URL (never the clone's `origin`, which may name an ssh
-    /// remote and its ambient key) as this identity.
     fn fetch_repo(&self, slug: &Slug, dir: &Path) -> Result<(), HostError> {
         let mut args: Vec<OsString> = vec!["-C".into(), dir.as_os_str().to_owned()];
         args.extend(
@@ -668,7 +626,6 @@ impl ReleaseHost for RestHost {
 }
 
 impl RestHost {
-    /// The download host's URL of one asset: the web origin's, as every client fetches it.
     fn public_url(&self, slug: &Slug, tag: &str, asset: &str) -> String {
         format!(
             "{}/{}/{}/releases/download/{tag}/{asset}",
@@ -715,7 +672,6 @@ mod tests {
         s.to_string_lossy().into_owned()
     }
 
-    /// Each argument and each variable `cmd` sets that holds `secret`.
     fn shows(cmd: &Command, secret: &str) -> Vec<String> {
         let mut found: Vec<String> = cmd
             .get_args()

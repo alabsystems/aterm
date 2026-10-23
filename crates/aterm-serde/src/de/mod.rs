@@ -6,8 +6,6 @@
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
 //! Generic data structure deserialization framework.
-//!
-//! Data structures implement [`Deserialize`] and data formats implement [`Deserializer`].
 
 use crate::lib::*;
 
@@ -28,7 +26,6 @@ macro_rules! declare_error_trait {
             message = "the trait bound `{Self}: serde::de::Error` is not satisfied",
         )]
         pub trait Error: Sized $(+ $($supertrait)::+)* {
-            /// Construct a general error when deserializing a type.
             fn custom<T>(msg: T) -> Self
             where
                 T: Display;
@@ -815,9 +812,8 @@ pub trait MapAccess<'de> {
     where
         K: DeserializeSeed<'de>;
 
-    /// Deserialize the next value in the map using `seed`. Must be preceded by [`next_key_seed`](Self::next_key_seed).
+    /// Deserialize the next value in the map using `seed`.
     /// # Panics
-    ///
     /// Calling `next_value_seed` before `next_key_seed` is incorrect and is
     /// allowed to panic or return bogus results.
     fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
@@ -854,9 +850,8 @@ pub trait MapAccess<'de> {
         self.next_key_seed(PhantomData)
     }
 
-    /// Deserialize the next value in the map. Must be preceded by [`next_key`](Self::next_key).
+    /// Deserialize the next value in the map.
     /// # Panics
-    ///
     /// Calling `next_value` before `next_key` is incorrect and is allowed to
     /// panic or return bogus results.
     #[inline]
@@ -1024,7 +1019,6 @@ pub trait IntoDeserializer<'de, E: Error = value::Error> {
     fn into_deserializer(self) -> Self::Deserializer;
 }
 
-/// Used in error messages.
 struct OneOf {
     names: &'static [&'static str],
 }

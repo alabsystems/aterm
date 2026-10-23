@@ -1177,3 +1177,46 @@ fn the_row_names_the_executable_not_its_cut_short_name() {
         wire(&v, "b51")
     );
 }
+
+#[test]
+fn an_agent_calls_class_is_the_command_its_join_names_never_its_shell_wrapper() {
+    let quick = |w: &mut World, leader: u32, command: Option<&str>| {
+        let mut h = hint(leader, Consumer::AgentBg, None, None);
+        h.command = command.map(str::to_owned);
+        w.call(1, 300, leader, spinner(leader + 1, "cargo"), Some(h));
+        run_to(w, 20_000, |w, _| w.call_file(leader).size += 40);
+        w.exit(leader + 1, false);
+        w.exit(leader, false);
+        run_to(w, TICK_MS, |_, _| {});
+    };
+    let mut w = World::new();
+    for n in 0..3 {
+        quick(&mut w, 400 + 10 * n, None);
+        quick(&mut w, 500 + 10 * n, Some("cargo test -p aterm-vitals"));
+    }
+    let (wrapper, unnamed) = (
+        command_class("zsh", JobKind::AgentCall),
+        command_class("", JobKind::AgentCall),
+    );
+    assert_eq!(
+        (w.jobs.classes().mu(&wrapper), w.jobs.classes().mu(&unnamed)),
+        (None, None),
+        "calls no join names teach no class"
+    );
+    assert!(
+        w.jobs
+            .classes()
+            .mu(&command_class("cargo test", JobKind::AgentCall))
+            .is_some(),
+        "a joined command teaches its own"
+    );
+    for _ in 0..3 {
+        w.jobs.learn(&wrapper, 10_000);
+        w.jobs.learn(&unnamed, 10_000);
+    }
+    w.call(1, 300, 600, sleeper(601, "sleep"), None);
+    let v = run_to(&mut w, 240_000, |_, _| {});
+    let row = v.row("a600").expect("the sleep");
+    assert_eq!(row.mu_from, Some(MuFrom::Prior), "{}", row.wire());
+    assert!(!row.no_progress, "{}", row.wire());
+}

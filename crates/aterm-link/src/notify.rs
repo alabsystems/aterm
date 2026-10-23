@@ -1305,27 +1305,33 @@ thread_local! {
 }
 
 const USAGE: &str = "\
-aterm-link notify — run a command when the fabric needs a human
+aterm link notify — run a command when the fabric needs a human
 
-  aterm-link notify --fleet <F> --broker <socket> --cap-file <path>...
+  aterm link notify --fleet <F> --broker <socket> --cap-file <path>...
                     --on <attention|ask:<person>|halt>,... --exec <cmd> [options]
 
-  --on <sel>,...         selectors to watch (repeatable):
-                         - `attention`: presence row raising `attention=` (`node.cap`)
-                         - `ask:<person>`: ask addressed to `<person>` (`aterm fabric mint-for <person>`)
-                         - `halt`: fleet halt coming on (`node.cap`)
-                         Refuses (exit 2) if no `--cap-file` grants a selector.
-  --exec <cmd>           run `/bin/sh -c <cmd>`; record facts arrive in `$ATERM_NOTIFY_*`
-  --rate <n>/<window>    rate budget, e.g. `10/1m`, `1/30s`, `40/1h` (default `10/1m`)
-  --since head|start|<n> initial scan offset when a selector has no cursor (default `head`)
-  --once                 catch up to the head and exit
-  --exec-timeout <ms>    command timeout before SIGKILL (default `30000`)
-  --state <dir>          state dir (`<dir>/notify/` holds cursors and journal)
+  --on <sel>,...         what to watch (repeatable):
+                         - `attention`: a presence row raising `attention=` (node.cap)
+                         - `ask:<person>`: an ask addressed to <person> (that person's own
+                           cap, from `aterm fabric mint-for <person>`)
+                         - `halt`: a fleet halt coming on (node.cap)
+                         Exits 2 when the broker refuses a selector's read: no --cap-file
+                         grants it.
+  --exec <cmd>           run `/bin/sh -c <cmd>` per record, its facts in `$ATERM_NOTIFY_*`
+                         (FLEET ON OFFSET SUBJECT NODE WHO SID TEXT DUP SUPPRESSED)
+  --rate <n>/<window>    at most <n> runs per window, e.g. `10/1m`, `1/30s`, `40/1h`
+                         (default `10/1m`); a record over it is dropped and counted in the
+                         next command's `$ATERM_NOTIFY_SUPPRESSED`
+  --since head|start|<n> where a selector with no cursor starts (default `head`)
+  --once                 catch up to the head, then exit
+  --exec-timeout <ms>    SIGKILL a command still running after this (default `30000`)
+  --state <dir>          state dir (`<dir>/notify/` holds cursors and the journal)
 
-Deduplicated across restarts by offset, and for `attention` by standing value per
-subject (clearing and re-raising pages again; crashes during `--exec` re-fire with
-`ATERM_NOTIFY_DUP=1`). On an `ordered` broker, records wait until durable (`--once`
-leaves non-durable records for the next run).
+Dedups across restarts by offset, and `attention` by each subject's standing value
+(clearing it and raising it again pages again); a crash mid-`--exec` runs it again with
+`ATERM_NOTIFY_DUP=1`. On an `ordered` broker a record waits until it is durable; `--once`
+leaves one not yet durable for the next run. Prints `notify: fired= dup= skipped=
+dropped= suppressed= standing=` on exit.
 ";
 
 /// `aterm-link notify`.

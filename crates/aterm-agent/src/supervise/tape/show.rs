@@ -28,9 +28,7 @@ pub struct Tape {
 }
 
 /// Parses a binary or text tape from `bytes`, optionally salvaging frames before damage.
-///
 /// # Errors
-///
 /// Returns an error if `bytes` is damaged (without `salvage`), unsupported, or malformed.
 pub fn open(bytes: &[u8], salvage: bool) -> Result<Tape, String> {
     if let Some(text) = bytes
@@ -95,9 +93,7 @@ pub fn shown(text: &str) -> String {
     out
 }
 
-/// A body as one short line: its length and its first characters, a
-/// newline shown as `⏎` and any other control character written out
-/// ([`shown`]).
+/// A body as one short line ([`shown`]).
 fn brief(bytes: &[u8]) -> String {
     const SHOWN: usize = 72;
     let text = String::from_utf8_lossy(bytes);
@@ -109,12 +105,10 @@ fn brief(bytes: &[u8]) -> String {
     format!("{} B {out}", bytes.len())
 }
 
-/// A control round trip's reply, read back as the recorder wrote it.
 fn reply_of(bytes: &[u8]) -> Result<Result<CtlReply, String>, codec::CodecError> {
     <Result<CtlReply, String> as TapeValue>::from_tape(bytes)
 }
 
-/// A control reply as one short line.
 fn reply_brief(reply: &Result<CtlReply, String>) -> String {
     match reply {
         Ok(r) => {
@@ -312,8 +306,6 @@ pub fn decisions(tape: &Tape) -> Vec<Decision> {
     out
 }
 
-/// The rows of the screen a control round trip's reply carries, if it is a
-/// screen read.
 fn screen_rows(item: &Item) -> Option<Vec<String>> {
     let EffectRecord::Exchange { door, reply, .. } = item.record()? else {
         return None;
@@ -327,7 +319,7 @@ fn screen_rows(item: &Item) -> Option<Vec<String>> {
         .map(|s| s.rows)
 }
 
-/// `decisions` as text: what `tape show --decisions` prints.
+/// `decisions` as text.
 #[must_use]
 pub fn render_decisions(decisions: &[Decision]) -> String {
     if decisions.is_empty() {
@@ -467,7 +459,7 @@ pub fn stats(tape: &Tape) -> Stats {
     }
 }
 
-/// `stats` as text: what `tape stats` prints.
+/// `stats` as text.
 #[must_use]
 pub fn render_stats(stats: &Stats) -> String {
     let mut out = format!("bytes {}", stats.bytes);

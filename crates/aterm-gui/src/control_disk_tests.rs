@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `await sys` on a board of the test's own ([`Shelf::new`]), with scripted readers: no test
-//! reaches a real volume.
+//! Tests for `await sys` on [`Shelf::new`] with scripted volume readers.
 
 use super::*;
 use std::sync::Arc;
@@ -10,8 +9,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const GIB: u64 = 1 << 30;
 
-/// The `/`-rooted path `p`, absolute here (a drive on Windows, where a path
-/// with no prefix is not): what `vol=` takes.
+/// Absolute `/`-rooted path `p` (prefixed with `C:` on Windows).
 fn abs(p: &str) -> String {
     if cfg!(windows) {
         format!("C:{p}")
@@ -50,8 +48,7 @@ fn home_row(free: u64) -> VolumeRow {
     }
 }
 
-/// A board holding the home row at `free`, session 7 mapped to it, the
-/// watch running.
+/// Board holding the home row at `free`, with session 7 mapped and the watch running.
 fn shelf_at(free: u64) -> Shelf {
     let shelf = Shelf::new();
     shelf.publish(|b| {
@@ -78,8 +75,7 @@ fn owner() -> Who {
     }
 }
 
-/// The scripted world: every read answers the board's free figure at
-/// `free`, pokes are counted, settings are on.
+/// Scripted world returning `free` bytes and counting pokes.
 struct World {
     free: AtomicU64,
     pokes: AtomicU32,
@@ -120,10 +116,6 @@ fn run_in(shelf: &Shelf, wait: &str, who: &Who, world: &World) -> String {
     run(shelf, &w, who, &env)
 }
 
-/// THE WAIT THE ONE GRAMMAR HANDS OVER (`aterm_vitals::sys::predicate`
-/// holds the grammar and its table): its terms with the watch's levels, its
-/// `vol=` decoded, and `timeout=` the family's. A `vol=` that is not absolute
-/// is the usage line.
 #[test]
 fn the_grammar_hands_over_terms_levels_and_an_absolute_volume() {
     let w = parse("sys free>=5GiB").expect("a size");
@@ -165,8 +157,6 @@ fn the_grammar_hands_over_terms_levels_and_an_absolute_volume() {
     assert_eq!(parse("sys free>=1GB vol=").err().as_deref(), Some(USAGE));
 }
 
-/// LATCHED: a condition already true answers at once, with no demand and no
-/// poke; `room` reads the volume's room.
 #[test]
 fn a_condition_already_true_answers_at_once() {
     let shelf = shelf_at(500 * GIB);
@@ -184,10 +174,6 @@ fn a_condition_already_true_answers_at_once() {
     assert!(reply.starts_with("OK sys "), "{reply}");
 }
 
-/// At arm time: a need more than a quarter of the volume beyond what is free
-/// is `too-large`; a
-/// volume aterm removes nothing on is `not-reclaimed`; the owner's
-/// `auto_free_gib = 0` is `cleanup-off`. None registers a demand.
 #[test]
 fn arm_time_refusals_register_no_demand() {
     let shelf = shelf_at(20 * GIB);
@@ -226,11 +212,6 @@ fn arm_time_refusals_register_no_demand() {
     assert_eq!(world.pokes.load(Ordering::SeqCst), 0);
 }
 
-/// THE DEMAND: an owner-class wait below its need registers a demand and
-/// pokes the watch; a pass that frees enough (published by a stand-in watch)
-/// latches it, its counted bytes in `freed_bytes=`, and the demand leaves the
-/// board. NEGATIVE CONTROL: an edge-scoped caller's same wait registers no
-/// demand and pokes nothing (it times out on the unchanged volume).
 #[test]
 fn a_demand_is_registered_poked_and_met_by_a_pass() {
     let shelf = Arc::new(shelf_at(20 * GIB));
@@ -293,9 +274,6 @@ fn a_demand_is_registered_poked_and_met_by_a_pass() {
     );
 }
 
-/// A pass for the demand that spent every tier it may and left free space
-/// below the need answers `ERR unmet why=spent`, counts not paths; and a new
-/// wait for the same need within the minute is answered at arm time.
 #[test]
 fn a_spent_pass_answers_unmet_with_counts_not_paths() {
     let shelf = Arc::new(shelf_at(20 * GIB));
@@ -351,9 +329,6 @@ fn a_spent_pass_answers_unmet_with_counts_not_paths() {
     assert!(again.contains(" why=spent "), "at arm time: {again}");
 }
 
-/// THE HANG DETECTOR: a wait holding a demand answers `watch-stalled` once the
-/// running watch's beat is a minute old — and not while the host is
-/// suspended, where the same wait times out.
 #[test]
 fn a_stalled_watch_is_reported_only_while_it_runs() {
     let shelf = shelf_at(20 * GIB);
@@ -372,8 +347,6 @@ fn a_stalled_watch_is_reported_only_while_it_runs() {
     assert_eq!(reply, "OK timeout\n");
 }
 
-/// The reader a wait takes itself: an unreadable volume (remote, refused) is
-/// `ERR unavailable free why=<word>` at arm time.
 #[test]
 fn an_unreadable_volume_is_unavailable() {
     let shelf = Shelf::new();
@@ -393,11 +366,6 @@ fn an_unreadable_volume_is_unavailable() {
     );
 }
 
-/// NO DISK WATCH in this process (`[harness]` off): a wait that would register
-/// a demand answers `why=no-watch` at once, registering and poking nothing — no
-/// pass would ever adopt it. A wait that holds no demand (a `disk=` term) is a
-/// plain wait still. NEGATIVE CONTROL: with the watch on, the same wait
-/// registers its demand (`a_demand_is_registered_poked_and_met_by_a_pass`).
 #[test]
 fn a_demand_with_no_watch_is_unavailable() {
     let shelf = shelf_at(20 * GIB);
@@ -411,10 +379,6 @@ fn a_demand_with_no_watch_is_unavailable() {
     assert_eq!(reply, "OK timeout\n");
 }
 
-/// A `room` on a volume whose room is not known (only a wait measured it, or
-/// the harness state was missing) is `why=room-unknown` — never a need of 0
-/// met at once. NEGATIVE CONTROL: with its room known the same wait is met
-/// (`a_condition_already_true_answers_at_once`).
 #[test]
 fn a_room_that_is_not_known_is_unavailable() {
     let shelf = shelf_at(500 * GIB);
@@ -426,9 +390,6 @@ fn a_room_that_is_not_known_is_unavailable() {
     assert!(reply.starts_with("OK sys "), "{reply}");
 }
 
-/// A volume the watch's look left off the board (no session works there now)
-/// is read by the parked wait itself, which goes on — never `why=unreadable`
-/// while the volume reads — its row carrying the owner's lines and no room.
 #[test]
 fn a_wait_whose_row_a_look_dropped_reads_the_volume_itself() {
     let data = abs("/System/Volumes/Data");
@@ -556,12 +517,6 @@ fn a_wait_whose_row_a_look_dropped_reads_the_volume_itself() {
     assert!(reply.starts_with("OK sys free_bytes="), "{reply}");
 }
 
-/// A WAIT SPELLS ONLY A TAB THE BOARD PLACES NOWHERE (rev6-l-2): before it
-/// asks the board, a wait from a tab that reports 8.3 short names spells
-/// them long ([`spell_owed`]) only while no look mapped the tab and no long
-/// spelling of that very spelling is kept for it — one kept that places on
-/// no row yet included. A tab a look mapped reads its row's mount, as it
-/// did before spellings were kept, and costs its wait no file-system call.
 #[test]
 fn a_wait_spells_only_a_tab_the_board_places_nowhere() {
     let (short, moved, long) = if cfg!(windows) {

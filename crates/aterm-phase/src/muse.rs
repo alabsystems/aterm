@@ -10,7 +10,7 @@ use crate::text::blank;
 use crate::turn::{CardPlace, LaunchCard};
 use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
-/// Version of the Muse Code (`muse`) harness, tracked independently per harness starting at `"0.1"`.
+/// Version of the Muse Code.
 pub const HARNESS_VERSION: &str = "0.1";
 
 #[derive(Debug, Clone, Copy)]
@@ -476,9 +476,6 @@ fn interrupting(rows: &[String], f: Frame) -> bool {
     footer_says(rows, f, const { anchor_text("muse.footer.interrupting") })
 }
 
-/// The footer says the run goes on with the next prompt queued under it (`◆ Queued input`),
-/// though the reply is drawn whole and the status row is gone (I4 of
-/// `docs/measured/idle-no-evidence-2026-10-22.md`).
 fn steering(rows: &[String], f: Frame) -> bool {
     [
         anchor_text("muse.footer.steering"),
@@ -497,9 +494,7 @@ fn footer_says(rows: &[String], f: Frame, said: &str) -> bool {
     })
 }
 
-/// The window title says a run is active: a frame of the spinner (`muse.title.spinner`), a
-/// blank, then the title (`⠙ proj`); at rest the title alone. It turns through the end-of-turn
-/// review, which the screen does not show (`docs/measured/idle-no-evidence-2026-10-22.md` I2).
+/// The window title says a run is active: a frame of the spinner.
 #[must_use]
 pub fn title_runs(title: &str) -> bool {
     let mut chars = title.chars();
@@ -550,7 +545,7 @@ fn work(rows: &[String]) -> Option<&'static str> {
     named(WORK_RUNNING).or_else(|| named(MONITOR_WATCHING))
 }
 
-/// Returns the background-work kind (`"work"` or `"bg"`) when a turn is over and background tasks run.
+/// Returns the background-work kind.
 #[must_use]
 pub fn background_wait(rows: &[String]) -> Option<&'static str> {
     let what = work(rows)?;
@@ -637,7 +632,7 @@ fn rests_on(rows: &[String]) -> Option<Rest> {
     }
 }
 
-/// Returns whether the session rests at a completed turn hidden beneath `/status` or `/usage` cards.
+/// Returns whether the session rests at a completed turn beneath `/status` or `/usage` cards.
 #[must_use]
 pub fn end_hidden(rows: &[String]) -> bool {
     phase(rows) == (Phase::Idle, true)
@@ -671,13 +666,7 @@ fn tool_row(head: &str) -> bool {
         || bare_tool_row(head)
 }
 
-/// What follows `Ran ` on a shell row of Muse Code's: the command and its
-/// outcome after ` — ` ([`own_tail`]: `Ran ls — failed`, `Ran touch probe.txt
-/// — denied`), or what ran (a command, `command · <description>`, `<n>
-/// commands · …`) and then ` · ` parts ending in a duration and the expander
-/// (`Ran ls · ✓ · 0.2s · ctrl+o`, `Ran 2 commands · … · 18s · ctrl+o`), every
-/// shell row measured on 1.4.9, 1.4.10 and 1.4.12. A reply that opens with
-/// `Ran ` ends in neither.
+/// What follows `Ran ` on a shell row of Muse Code's ([`own_tail`]).
 fn ran_tail(rest: &str) -> bool {
     let outcome = rest
         .rfind(" — ")
@@ -689,9 +678,6 @@ fn ran_tail(rest: &str) -> bool {
     outcome || timed
 }
 
-/// A run's duration as Muse Code draws it on a shell row: one or more
-/// space-separated amounts, each digits with an optional fraction and a
-/// unit (`0.2s`, `44s`, `1m`).
 fn duration(text: &str) -> bool {
     text.split(' ').all(|part| {
         let unit = part.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
@@ -703,10 +689,7 @@ fn duration(text: &str) -> bool {
     })
 }
 
-/// Muse Code's tool rows that draw no outcome branch, measured on 1.4.10 (`◆ Fetched <url> —
-/// denied`, `◆ Fetched <url> — 404`, `◆ Invalid work ID — rejected · ctrl+o`): `Fetched`, a
-/// blank, a URL, then only the row's own tail (whose outcome may be a three-digit HTTP status);
-/// or `Invalid work ID` and only its own tail. Each is one row ([`tool_block`]).
+/// Muse Code's tool rows that draw no outcome branch ([`tool_block`]).
 fn bare_tool_row(head: &str) -> bool {
     head.strip_prefix(const { anchor_text("muse.tool.fetched") })
         .and_then(|rest| rest.strip_prefix(' '))
@@ -719,7 +702,6 @@ fn bare_tool_row(head: &str) -> bool {
             .is_some_and(|tail| own_tail(tail, false))
 }
 
-/// `<scheme>://<more>`: every URL a measured `Fetched` row names.
 fn is_url(token: &str) -> bool {
     token.split_once("://").is_some_and(|(scheme, rest)| {
         !rest.is_empty()
@@ -730,8 +712,7 @@ fn is_url(token: &str) -> bool {
     })
 }
 
-/// A block whose first line `lines[0]` is a tool row of Muse Code's, not the agent's words. A
-/// row of [`bare_tool_row`]'s stands alone: with lines under it, the block is a reply.
+/// A block whose first line `lines[0]` is a tool row of Muse Code's ([`bare_tool_row`]).
 fn tool_block(lines: &[&str]) -> bool {
     lines
         .first()
@@ -745,9 +726,7 @@ fn names_a_path(rest: &str) -> bool {
     !token.is_empty() && own_tail(&rest[token.len()..], false)
 }
 
-/// A tool row's own tail after its name, each part optional and in order: the diff's count
-/// (` (+1 −1)`), an outcome after ` — ` ([`TOOL_OUTCOMES`]; with `status`, also a three-digit
-/// HTTP status), the expander (` · ctrl+o`); nothing else.
+/// A tool row's own tail after its name, each part optional and in order ([`TOOL_OUTCOMES`]).
 fn own_tail(tail: &str, status: bool) -> bool {
     let mut tail = tail;
     if let Some(r) = tail.strip_prefix(" (") {
@@ -803,7 +782,7 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// Returns whether the reply returned by [`said_tail`] has its opening `◆` header visible on `rows`.
+/// Returns whether the reply from [`said_tail`] has its opening `◆` header visible on `rows`.
 #[must_use]
 pub fn said_whole(rows: &[String]) -> bool {
     said_tail(rows).is_some()
@@ -817,7 +796,7 @@ pub fn turn_said_before(rows: &[String]) -> Option<String> {
     (!said.is_empty()).then(|| said.join("\n\n"))
 }
 
-/// Returns whether the entire last turn (from the user's `❯` message through [`said_tail`]) fits on `rows`.
+/// Returns whether the entire last turn ([`said_tail`]).
 #[must_use]
 pub fn turn_whole(rows: &[String]) -> bool {
     turn_before(rows).is_some_and(|(opened, _)| opened)
@@ -1597,7 +1576,6 @@ fn question_prompt(rows: &[String], q: Question) -> PromptV2 {
         } else if is_note_row(row) {
             // Note row: not part of an option label.
         } else if !described && let Some(o) = options.last_mut() {
-            // A wrapped label; under a described option, the description's.
             o.label = format!("{} {}", o.label, crate::text::trim(row));
         }
     }

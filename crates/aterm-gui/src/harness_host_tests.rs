@@ -15590,7 +15590,11 @@ fn a_workers_canary_reads_its_own_sessions_stuck_call_from_the_jobs_board() {
         BackgroundEvidence::NoProgress { worst } => {
             assert_eq!(
                 (worst.pid, worst.exe.as_str(), worst.quiet_min()),
-                (27098, "aterm_gui-e0964a", 31)
+                (
+                    27098,
+                    &"aterm_gui-e0964a"[..crate::vitals_jobs::COMM_BYTES],
+                    31
+                )
             );
         }
         other => panic!("the hung call is named: {other:?}"),

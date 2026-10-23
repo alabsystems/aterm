@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE K CLOCK (`docs/DESIGN-harness-occupancy-2026-10-20.md` §5, "a due line lost to a
-//! pre-empting writer"; the slice-2 plan's D2): how many looks a due line has gone untold, and
-//! the one raise past [`K_LOOKS`] that becomes the tab's `ready-idle` Entry.
-//!
-//! Pure and clockless, generic over the key (the loop keys it by a hold rule's episode, the
-//! window's host by a wake's). A key's clock starts the first time it is seen due and runs while
-//! it stays due, whichever guard holds it: a guard that changes its word never restarts it. A key
-//! no longer due (told, lapsed, closed) is forgotten. A key held by a person never raises, and
-//! one whose holder passes from a person to another guard past K raises at once.
+//! Tracks how many looks a due line has gone untold and raises [`ReadyIdle`] past [`K_LOOKS`].
 
 use std::collections::BTreeMap;
 
@@ -19,7 +11,7 @@ use crate::supervise::Guard;
 /// Looks a due line stands untold before it is the tab's `ready-idle` Entry.
 pub const K_LOOKS: i64 = 10;
 
-/// ONE KEY'S CLOCK.
+/// Per-key clock tracking how long a due line has stood untold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Due {
     /// When it was first seen due, unix ms (or seeded from a predecessor's rows).
@@ -32,7 +24,7 @@ pub struct Due {
     pub raised: bool,
 }
 
-/// A KEY PAST K, raised: what the Entry carries (closed words and numbers).
+/// A key that has stood due past `k` looks and raised its `ready-idle` entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadyIdle<K> {
     /// The key.
@@ -43,7 +35,7 @@ pub struct ReadyIdle<K> {
     pub since_ms: i64,
 }
 
-/// THE CLOCKS OF THE KEYS DUE NOW ([module docs](self)).
+/// Clocks of the keys currently due.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueClock<K: Ord + Copy> {
     keys: BTreeMap<K, Due>,
@@ -58,9 +50,7 @@ impl<K: Ord + Copy> Default for DueClock<K> {
 }
 
 impl<K: Ord + Copy> DueClock<K> {
-    /// A successor's clock for `key` from its predecessor's rows: due since `since_ms` (the
-    /// earliest of the episode's held or would rows), kept by the next [`Self::observe`] that
-    /// names it as due. An earlier seed or clock stands.
+    /// Seeds `key`'s clock from predecessor ledger rows if not already tracked.
     pub fn seed(&mut self, key: K, since_ms: i64) {
         use super::fault::{Fault, armed};
         if armed(Fault::KUnseeded) {
@@ -75,8 +65,7 @@ impl<K: Ord + Copy> DueClock<K> {
         due.since_ms = due.since_ms.min(since_ms);
     }
 
-    /// THE KEYS DUE AT `now_ms`, each with the guard holding it: a new key's clock starts now,
-    /// a known one's runs on whatever its guard, and a key not named is forgotten.
+    /// Updates clocks for the keys due at `now_ms` and forgets keys no longer due.
     pub fn observe(&mut self, due: &[(K, Option<Guard>)], now_ms: i64) {
         use super::fault::{Fault, armed};
         self.keys
@@ -110,9 +99,7 @@ impl<K: Ord + Copy> DueClock<K> {
         self.keys.get(key)
     }
 
-    /// THE KEYS RAISED AT `now_ms`: each key that has stood due `k` looks or more raises once,
-    /// unless a person holds it now, and stays raised while it stays due. Answers every key
-    /// raised, lowest key first.
+    /// Returns keys due for at least `k` looks at `now_ms` that are not held by a person.
     pub fn sample(&mut self, k: i64, now_ms: i64) -> Vec<ReadyIdle<K>> {
         use super::fault::{Fault, armed};
         let late = i64::from(armed(Fault::LateRaise));

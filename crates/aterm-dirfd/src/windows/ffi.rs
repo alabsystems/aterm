@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows half's FFI, every declaration in this one file: kernel32 (`QueryDosDeviceW` and `CreateFileW` for a volume root, the by-handle information calls, `GetFinalPathNameByHandleW` for a handle's volume, `SetThreadErrorMode`, `DeviceIoControl` to read a junction's target and, for the test seam only, to set one), ntdll (`NtCreateFile` relative to a directory handle, `RtlNtStatusToDosError`, this thread's cloud-placeholder mode), both system DLLs std already links, and advapi32 (a handle's owner, the process token's user: the disk reclaim's other-user fence), a system DLL every Windows process maps; for the test seam only, cldapi (a scratch cloud sync root and its placeholders, the Cloud Files API's system DLL since Windows 10 1709).
+//! Windows FFI declarations for `kernel32`, `ntdll`, `advapi32`, and test-only `cldapi`.
 
 #![allow(
     non_snake_case,
@@ -38,7 +38,7 @@ pub(crate) const FILE_GENERIC_READ: u32 = 0x0012_0089;
 /// `FILE_GENERIC_WRITE`: `STANDARD_RIGHTS_WRITE | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | FILE_APPEND_DATA | SYNCHRONIZE`.
 pub(crate) const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
 
-/// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`: every handle this crate opens shares everything, so holding one never makes another process's open, rename or delete fail.
+/// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`.
 pub(crate) const FILE_SHARE_ALL: u32 = 0x7;
 
 /// `CreateDisposition`: open what exists, fail otherwise.
@@ -50,14 +50,14 @@ pub(crate) const FILE_OPEN_IF: u32 = 3;
 
 /// `CreateOptions`: the name must be a directory (`STATUS_NOT_A_DIRECTORY` otherwise).
 pub(crate) const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
-/// `CreateOptions`: synchronous I/O, not alertable, so `std::fs::File` reads, writes and `LockFileEx` complete in the call.
+/// `CreateOptions`: non-alertable synchronous I/O.
 pub(crate) const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
-/// `CreateOptions`: open a reparse point AS ITSELF instead of reparsing it (`FILE_FLAG_OPEN_REPARSE_POINT`).
+/// `CreateOptions`: open a reparse point itself (`FILE_FLAG_OPEN_REPARSE_POINT`).
 pub(crate) const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
-/// `OBJECT_ATTRIBUTES.Attributes`: case-insensitive name lookup, what `CreateFileW` always passes (a case-sensitive directory stays sensitive).
+/// `OBJECT_ATTRIBUTES.Attributes`: case-insensitive name lookup.
 pub(crate) const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
-/// `OBJECT_ATTRIBUTES.Attributes`: fail rather than reparse at ANY component (Windows 10 1709 and later; an older kernel answers `STATUS_INVALID_PARAMETER`, see `windows::nt_open`).
+/// `OBJECT_ATTRIBUTES.Attributes`: fail rather than reparse at any component (Windows 10 1709+).
 pub(crate) const OBJ_DONT_REPARSE: u32 = 0x0000_1000;
 
 /// `dwCreationDisposition`: open what exists.
@@ -72,10 +72,10 @@ pub(crate) const SEM_FAILCRITICALERRORS: u32 = 0x0001;
 /// `SetThreadErrorMode`: no open-file error box either.
 pub(crate) const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
 
-/// `GetFinalPathNameByHandleW`'s `dwFlags`: the path through the volume's GUID name (`\\?\Volume{…}\…`), never a drive letter or a mount folder (`VOLUME_NAME_GUID`; `FILE_NAME_NORMALIZED`, 0, is the rest).
+/// `GetFinalPathNameByHandleW` flag returning the volume GUID path (`\\?\Volume{…}\…`).
 pub(crate) const VOLUME_NAME_GUID: u32 = 0x1;
 
-/// `PHCM_EXPOSE_PLACEHOLDERS`: this thread sees a Cloud Files placeholder as what it is — a reparse point with its cloud tag — where the default, `PHCM_DISGUISE_PLACEHOLDER` (1), shows a placeholder inside a sync root as a plain file or folder (`windows::ExposedPlaceholders`).
+/// `PHCM_EXPOSE_PLACEHOLDERS`: expose Cloud Files placeholders as reparse points on this thread.
 pub(crate) const PHCM_EXPOSE_PLACEHOLDERS: i8 = 2;
 
 /// `FILE_ATTRIBUTE_READONLY`.
@@ -84,9 +84,9 @@ pub(crate) const FILE_ATTRIBUTE_READONLY: u32 = 0x0001;
 pub(crate) const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
 /// `FILE_ATTRIBUTE_REPARSE_POINT`.
 pub(crate) const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-/// `IsReparseTagNameSurrogate`'s bit: the tag names ANOTHER entity — a symbolic link, a junction or volume mount point, a WSL symlink.
+/// `IsReparseTagNameSurrogate` bit: tag names another entity (symlink, junction, or mount point).
 pub(crate) const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
-/// `IO_REPARSE_TAG_MOUNT_POINT`: a junction AND a volume mount point — one tag, told apart only by the target its data names.
+/// `IO_REPARSE_TAG_MOUNT_POINT`: junction or volume mount point tag.
 pub(crate) const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 
 pub(crate) const FileBasicInfo: i32 = 0;
@@ -103,16 +103,16 @@ pub(crate) const FileDispositionInfoEx: i32 = 21;
 
 /// `FILE_DISPOSITION_INFO_EX.Flags`: delete.
 pub(crate) const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0001;
-/// `FILE_DISPOSITION_INFO_EX.Flags`: unlink the name NOW, as `unlink(2)` does, while other handles stay open (they keep the file, not the name).
+/// `FILE_DISPOSITION_INFO_EX.Flags`: unlink immediately with POSIX semantics while handles remain.
 pub(crate) const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0002;
 /// `FILE_DISPOSITION_INFO_EX.Flags`: delete a read-only file too.
 pub(crate) const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0010;
 
 /// `STATUS_INVALID_PARAMETER`: also an older kernel's answer to `OBJ_DONT_REPARSE`.
 pub(crate) const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-/// `STATUS_DELETE_PENDING`, which `RtlNtStatusToDosError` would flatten into `ERROR_ACCESS_DENIED`.
+/// `STATUS_DELETE_PENDING` (flattened to `ERROR_ACCESS_DENIED` by `RtlNtStatusToDosError`).
 pub(crate) const STATUS_DELETE_PENDING: u32 = 0xC000_0056;
-/// `STATUS_FILE_IS_A_DIRECTORY`, which `RtlNtStatusToDosError` would flatten into `ERROR_ACCESS_DENIED`.
+/// `STATUS_FILE_IS_A_DIRECTORY` (flattened to `ERROR_ACCESS_DENIED` by `RtlNtStatusToDosError`).
 pub(crate) const STATUS_FILE_IS_A_DIRECTORY: u32 = 0xC000_00BA;
 
 /// `SE_OBJECT_TYPE::SE_FILE_OBJECT`: `GetSecurityInfo` on a file handle.
@@ -151,7 +151,7 @@ pub(crate) struct UNICODE_STRING {
     pub Buffer: *mut u16,
 }
 
-/// `OBJECT_ATTRIBUTES`: the name, the directory handle it is relative to, and the `OBJ_*` attributes.
+/// `OBJECT_ATTRIBUTES`: object name, root directory handle, and `OBJ_*` attributes.
 #[repr(C)]
 pub(crate) struct OBJECT_ATTRIBUTES {
     pub Length: u32,
@@ -198,14 +198,14 @@ pub(crate) struct FILE_ATTRIBUTE_TAG_INFO {
     pub ReparseTag: u32,
 }
 
-/// `FILE_ID_INFO`: the 64-bit volume serial number and the 128-bit file id (`FILE_ID_128`, an opaque 16-byte identifier).
+/// `FILE_ID_INFO`: 64-bit volume serial number and 128-bit file ID (`FILE_ID_128`).
 #[repr(C)]
 pub(crate) struct FILE_ID_INFO {
     pub VolumeSerialNumber: u64,
     pub FileId: [u8; 16],
 }
 
-/// `FILE_NAME_INFO`: the open file's path within its volume (`\` for the volume's root), `FileNameLength` BYTES of UTF-16 from `FileName` on, not NUL-terminated.
+/// `FILE_NAME_INFO`: volume-relative UTF-16 path (`FileNameLength` bytes, not NUL-terminated).
 #[repr(C)]
 pub(crate) struct FILE_NAME_INFO {
     pub FileNameLength: u32,
@@ -219,7 +219,7 @@ pub(crate) struct FILE_DISPOSITION_INFO {
     pub DeleteFile: u8,
 }
 
-/// `FILE_DISPOSITION_INFO_EX`: the disposition with flags (Windows 10 1607; `IGNORE_READONLY_ATTRIBUTE` from 1809).
+/// `FILE_DISPOSITION_INFO_EX`: extended delete disposition flags.
 #[repr(C)]
 pub(crate) struct FILE_DISPOSITION_INFO_EX {
     pub Flags: u32,
@@ -272,7 +272,7 @@ pub(crate) struct SID_AND_ATTRIBUTES {
     pub Attributes: u32,
 }
 
-/// `TOKEN_USER`: `GetTokenInformation(TokenUser)`'s answer, the SID it points at following it in the same buffer.
+/// `TOKEN_USER`: `GetTokenInformation(TokenUser)` result header followed by its SID.
 #[repr(C)]
 pub(crate) struct TOKEN_USER {
     pub User: SID_AND_ATTRIBUTES,
@@ -331,13 +331,13 @@ const _: () = {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    /// The object-manager target of the DOS device `lpDeviceName` (`C:`, `Volume{…}`): NUL-terminated strings, the current target first, ended by an extra NUL.
+    /// Queries the object-manager target of DOS device `lpDeviceName` (`C:`, `Volume{…}`).
     pub(crate) fn QueryDosDeviceW(
         lpDeviceName: *const u16,
         lpTargetPath: *mut u16,
         ucchMax: u32,
     ) -> u32;
-    /// Opens a volume root by its verbatim (`\\?\`) spelling — the one absolute-path open this crate makes.
+    /// Opens a volume root by its verbatim (`\\?\`) path.
     pub(crate) fn CreateFileW(
         lpFileName: *const u16,
         dwDesiredAccess: u32,
@@ -363,7 +363,7 @@ unsafe extern "system" {
     ) -> i32;
     /// This thread's critical-error mode; returns a `BOOL`, the old mode in `lpOldMode`.
     pub(crate) fn SetThreadErrorMode(dwNewMode: u32, lpOldMode: *mut u32) -> i32;
-    /// The path of the file `hFile` is open on, spelled as `dwFlags` says (here through its volume's GUID name).
+    /// Queries the final path of `hFile` formatted according to `dwFlags`.
     pub(crate) fn GetFinalPathNameByHandleW(
         hFile: HANDLE,
         lpszFilePath: *mut u16,
@@ -378,7 +378,7 @@ unsafe extern "system" {
 
 #[link(name = "advapi32")]
 unsafe extern "system" {
-    /// The parts `SecurityInfo` names of the security descriptor of the object `handle` is open on (it needs `READ_CONTROL`): here the owner, as a pointer into the descriptor returned in `ppSecurityDescriptor`, which the caller frees with `LocalFree`.
+    /// Reads `SecurityInfo` fields of `handle`'s security descriptor (freed with `LocalFree`).
     pub(crate) fn GetSecurityInfo(
         handle: HANDLE,
         ObjectType: u32,
@@ -395,7 +395,7 @@ unsafe extern "system" {
         DesiredAccess: u32,
         TokenHandle: *mut HANDLE,
     ) -> i32;
-    /// One class of a token's facts into `TokenInformation`; with a buffer too small, fails with `ERROR_INSUFFICIENT_BUFFER` and the length wanted in `ReturnLength`.
+    /// Queries `TokenInformationClass` from `TokenHandle` into `TokenInformation`.
     pub(crate) fn GetTokenInformation(
         TokenHandle: HANDLE,
         TokenInformationClass: i32,
@@ -411,7 +411,7 @@ unsafe extern "system" {
 
 #[link(name = "ntdll")]
 unsafe extern "system" {
-    /// Opens (or creates) `ObjectName` relative to `RootDirectory` — the handle-relative open Win32 has no call for.
+    /// Opens or creates `ObjectName` relative to `RootDirectory`.
     pub(crate) fn NtCreateFile(
         FileHandle: *mut HANDLE,
         DesiredAccess: u32,
@@ -427,19 +427,19 @@ unsafe extern "system" {
     ) -> NTSTATUS;
     /// The Win32 error code an NTSTATUS maps to.
     pub(crate) fn RtlNtStatusToDosError(Status: NTSTATUS) -> u32;
-    /// Sets this thread's cloud-placeholder mode (a `PHCM_*` value, a C `CHAR`) and returns the previous one, or a negative `PHCM_ERROR_*` (an invalid mode; a thread with no TEB) having changed nothing.
+    /// Sets this thread's `PHCM_*` cloud-placeholder mode and returns the previous mode.
     pub(crate) fn RtlSetThreadPlaceholderCompatibilityMode(Mode: i8) -> i8;
-    /// This thread's cloud-placeholder mode: `PHCM_APPLICATION_DEFAULT` (0, the process's mode applies) or the one it set.
+    /// Returns this thread's `PHCM_*` cloud-placeholder mode.
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn RtlQueryThreadPlaceholderCompatibilityMode() -> i8;
 }
 
-/// `FSCTL_GET_REPARSE_POINT` (winioctl.h): a reparse point's data, read through a handle opened on it as itself (`FILE_ANY_ACCESS`).
+/// `FSCTL_GET_REPARSE_POINT` control code.
 pub(crate) const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
 /// `MAXIMUM_REPARSE_DATA_BUFFER_SIZE` (winnt.h): no reparse point's data is longer.
 pub(crate) const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
 
-/// `REPARSE_DATA_BUFFER` (ntifs.h) up to `MountPointReparseBuffer.PathBuffer`: what an `IO_REPARSE_TAG_MOUNT_POINT` reparse point's data starts with.
+/// `REPARSE_DATA_BUFFER` prefix up to `MountPointReparseBuffer.PathBuffer`.
 #[repr(C)]
 pub(crate) struct MOUNT_POINT_REPARSE_HEADER {
     pub ReparseTag: u32,
@@ -464,7 +464,7 @@ const _: () = {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    /// Sends a control code to the file `hDevice` is open on, synchronously: `FSCTL_GET_REPARSE_POINT` (and, for the test seam only, `FSCTL_SET_REPARSE_POINT`).
+    /// Sends a synchronous control code (`FSCTL_GET_REPARSE_POINT` / `FSCTL_SET_REPARSE_POINT`).
     pub(crate) fn DeviceIoControl(
         hDevice: HANDLE,
         dwIoControlCode: u32,
@@ -481,7 +481,7 @@ unsafe extern "system" {
 #[cfg(any(test, debug_assertions))]
 pub(crate) const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
 
-/// `REPARSE_GUID_DATA_BUFFER` up to its data (winnt.h's `REPARSE_GUID_DATA_BUFFER_HEADER_SIZE`): what a third party's reparse point carries ahead of its payload.
+/// `REPARSE_GUID_DATA_BUFFER` header preceding a third-party reparse point's payload.
 #[cfg(any(test, debug_assertions))]
 #[repr(C)]
 pub(crate) struct REPARSE_GUID_DATA_BUFFER {
@@ -519,7 +519,7 @@ pub(crate) struct CF_SYNC_REGISTRATION {
     pub ProviderId: [u32; 4],
 }
 
-/// `CF_SYNC_POLICIES`: how the platform treats the root's placeholders — each policy an enum or a pair of `USHORT`s (`CF_HYDRATION_POLICY`, `CF_POPULATION_POLICY`: primary, then modifier).
+/// `CF_SYNC_POLICIES`: hydration, population, and management policies for a sync root.
 #[cfg(any(test, debug_assertions))]
 #[repr(C)]
 pub(crate) struct CF_SYNC_POLICIES {
@@ -536,10 +536,10 @@ pub(crate) struct CF_SYNC_POLICIES {
 /// `CF_HYDRATION_POLICY_FULL`: a placeholder is hydrated whole when read.
 #[cfg(any(test, debug_assertions))]
 pub(crate) const CF_HYDRATION_POLICY_FULL: u16 = 2;
-/// `CF_POPULATION_POLICY_ALWAYS_FULL`: every folder is whole on disk, so a listing never asks a provider for its entries (none is connected).
+/// `CF_POPULATION_POLICY_ALWAYS_FULL`: directories are fully populated on disk.
 #[cfg(any(test, debug_assertions))]
 pub(crate) const CF_POPULATION_POLICY_ALWAYS_FULL: u16 = 3;
-/// `CF_CONVERT_FLAG_MARK_IN_SYNC`: the converted placeholder is in sync, its data local (a hydrated placeholder, as a synced file is).
+/// `CF_CONVERT_FLAG_MARK_IN_SYNC`: mark the converted placeholder as in sync.
 #[cfg(any(test, debug_assertions))]
 pub(crate) const CF_CONVERT_FLAG_MARK_IN_SYNC: u32 = 0x1;
 
@@ -561,16 +561,16 @@ const _: () = {
 #[cfg(any(test, debug_assertions))]
 #[link(name = "cldapi")]
 unsafe extern "system" {
-    /// Registers the folder `SyncRootPath` as a cloud sync root (per user; no administrator, no registry entry — measured 2026-10-20): the folder becomes a reparse point of the cloud tag, and files under it may be made placeholders.
+    /// Registers `SyncRootPath` as a per-user Cloud Files sync root.
     pub(crate) fn CfRegisterSyncRoot(
         SyncRootPath: *const u16,
         Registration: *const CF_SYNC_REGISTRATION,
         Policies: *const CF_SYNC_POLICIES,
         RegisterFlags: u32,
     ) -> HRESULT;
-    /// Unregisters the sync root at `SyncRootPath`: the folder and every placeholder under it read as plain files and folders again (measured 2026-10-20).
+    /// Unregisters the Cloud Files sync root at `SyncRootPath`.
     pub(crate) fn CfUnregisterSyncRoot(SyncRootPath: *const u16) -> HRESULT;
-    /// Makes the file or folder `FileHandle` is open on (with write access) a placeholder of its sync root, as a sync client does once it has uploaded it.
+    /// Converts the open `FileHandle` into a Cloud Files placeholder.
     pub(crate) fn CfConvertToPlaceholder(
         FileHandle: HANDLE,
         FileIdentity: *const c_void,

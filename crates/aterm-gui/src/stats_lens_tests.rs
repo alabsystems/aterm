@@ -643,8 +643,6 @@ fn each_lens_shows_its_sections() {
     let m = FaceMetrics::helvetica_neue();
     let grows = |snap: &Snapshot| cpu_doc(two_columns(snap, &m)).sections[0].forms[0].grow;
     assert!(grows(&snap), "with no Why now, v2's Cores grows");
-    // Where Why now is not placed, Cores grows as v2's, whose Why now is not
-    // built: at 640 × 114 pt the right column fits only without Over max.
     let placed = |snap: &Snapshot| {
         let input = input(snap, dark_inks());
         let cpu = pinned(Instrument::Cpu);
@@ -732,13 +730,10 @@ fn how_to_read_draws_the_cause_mark_in_words2() {
     );
 }
 
-/// RD's 10:32 moment as the cause engine reads it (`sys why`'s Example A).
 fn engine_1032() -> Snapshot {
     engine(fixtures::spotlight_1032())
 }
 
-/// The cause engine's snapshot after three of `scene`'s windows over the
-/// calm Mac's memory and thermal state, the cores easing.
 fn engine(scene: fixtures::Scene) -> Snapshot {
     let calm = fixtures::calm_1510();
     let scene = fixtures::Scene {
@@ -753,20 +748,16 @@ fn engine(scene: fixtures::Scene) -> Snapshot {
     s
 }
 
-/// The engine's snapshot after `windows` of `scene`'s windows.
 fn read(scene: &fixtures::Scene, windows: u64) -> Snapshot {
     let mut v = aterm_vitals::Vitals::new();
     let mut snaps: Vec<Snapshot> = scene.series(windows).iter().map(|r| v.absorb(r)).collect();
     snaps.pop().expect("the scene's readings")
 }
 
-/// The CPU lens on `snap` at 1024 × 250 for the tab whose sessions are
-/// `panes` (the focused first), labelled Tab 1, laid out.
 fn cpu_for(snap: &Snapshot, panes: &[u64]) -> LensLaid {
     cpu_lens(snap, panes, 1024.0, false)
 }
 
-/// [`cpu_for`] on a shell `lw` pt wide, drawn where `draw`.
 fn cpu_lens(snap: &Snapshot, panes: &[u64], lw: f64, draw: bool) -> LensLaid {
     let input = DeckInput {
         tab_key: panes.first().copied(),
@@ -783,8 +774,6 @@ fn cpu_lens(snap: &Snapshot, panes: &[u64], lw: f64, draw: bool) -> LensLaid {
     )
 }
 
-/// The CPU lens's context on `snap` in two columns at 1024 pt, for Tab 1,
-/// the one session 1.
 fn two_columns<'d>(snap: &'d Snapshot, m: &'d FaceMetrics) -> Ctx<'d> {
     Ctx {
         snap,
@@ -799,10 +788,6 @@ fn two_columns<'d>(snap: &'d Snapshot, m: &'d FaceMetrics) -> Ctx<'d> {
     }
 }
 
-/// Why now (RD §4.2) words the account `sys why cpu` prints at 10:32
-/// (Example A: Spotlight, after start-up, covers 1,420 of 3,300 mc; the
-/// split is 200 + 200 + 730 + 2,170 + 0; the tab is minor at 61 ‰; `do
-/// class=none`): its rows, largest part first, and its sub-heading.
 #[test]
 fn why_now_says_what_sys_why_says() {
     let snap = engine_1032();
@@ -841,10 +826,6 @@ fn why_now_says_what_sys_why_says() {
     );
 }
 
-/// The split's parts round as a set, so on glass they add up to the busy
-/// figure as they do in millicores: 2,175 + 735 + 200 + 190 + 0 = 3,300 mc
-/// reads 2.18 + 0.73 + 0.20 + 0.19 = 3.30, where each on its own would read
-/// 3.29; a negative residual keeps its sign.
 #[test]
 fn why_nows_split_adds_up_to_its_busy_figure() {
     assert_eq!(
@@ -858,8 +839,6 @@ fn why_nows_split_adds_up_to_its_busy_figure() {
     assert_eq!([cents(217), cents(-5), cents(0)], ["2.17", "-0.05", "0.00"]);
 }
 
-/// On the narrowest two-column shell, 640 pt, the whole split does not fit:
-/// row 2 drops the tab's part, then the residual, never cutting a figure.
 #[test]
 fn why_nows_split_keeps_whole_figures_when_narrow() {
     let snap = engine_1032();
@@ -880,10 +859,6 @@ fn why_nows_split_keeps_whole_figures_when_narrow() {
     );
 }
 
-/// "This tab" is every pane of the front tab, as `sys why`'s caller tab is:
-/// the split keys a tab split into panes by one of them, so a focused pane
-/// whose key is not that one reads the tab through its other panes, and
-/// alone it is not read (never a 0).
 #[test]
 fn why_now_reads_this_tab_by_all_its_panes() {
     let snap = engine_1032();
@@ -901,11 +876,6 @@ fn why_now_reads_this_tab_by_all_its_panes() {
     );
 }
 
-/// Why now shows only while a covering episode is open, on fresh facts:
-/// not with no facts, not on a calm Mac's, not on a cold window's whose
-/// cause holds but has not opened (`sys why` prints it with no `opened=`),
-/// not with the lane off (no episode opens), and not on facts older than
-/// the Deck's clause may ride.
 #[test]
 fn why_now_shows_only_while_a_cause_is_open() {
     let shown = |snap: &Snapshot| {
@@ -939,11 +909,6 @@ fn why_now_shows_only_while_a_cause_is_open() {
     assert!(!shown(&off));
 }
 
-/// RD's 10:32 moment for three windows, then `more` on which `mds`'s QoS
-/// buckets run past its CPU time, so Spotlight's members run under half
-/// deferred and it fails its terms (`conformance_explain.rs`'
-/// `terms_failing_1032`): the cause engine's snapshot over the calm Mac's
-/// memory and thermal state.
 fn spotlight_failing(more: u64) -> Snapshot {
     let calm = fixtures::calm_1510();
     let scene = fixtures::Scene {
@@ -972,12 +937,6 @@ fn spotlight_failing(more: u64) -> Snapshot {
         .expect("the readings")
 }
 
-/// An episode stays open for 30 s after its cause fails a window, and the
-/// Deck's clause with it, so Why now stays too: row 1 names the episode with
-/// the figure it last covered, and Cores keeps the fixed form it takes under
-/// Why now rather than growing back for one window. The services Spotlight
-/// covered hold `unexplained` from that window, but row 1 names it only
-/// once its episode opens, a window later.
 #[test]
 fn why_now_stays_while_its_episode_is_open_failing() {
     let failing = spotlight_failing(1);
@@ -1016,14 +975,6 @@ fn why_now_stays_while_its_episode_is_open_failing() {
     );
 }
 
-/// Why now's rows on the fixtures that reach each branch: a build's
-/// finished work leaves the tab's part a floor (`at least`) and its role
-/// unread, words that say so; a coalition reaped and one made inside the
-/// window leave a positive residual and a tab read past aterm's coalition a
-/// negative one; the parts go largest first; row 1 names the user's app by
-/// its voucher, a tab's work by its label and aterm's own; and row 3 says
-/// the building tab is the main cause, and part of it once the services
-/// outrun it.
 #[test]
 fn why_now_bounds_the_tab_and_orders_the_split() {
     let mut aterm = fixtures::calm_1510();
@@ -1106,13 +1057,9 @@ fn why_now_bounds_the_tab_and_orders_the_split() {
     }
 }
 
-/// Why now's full form at the owner's shell draws ∵ as three words2 dots
-/// before a cause aterm names, and none before `unexplained`'s words (the
-/// liar's Spotlight daemons are not vouched for, so no activity holds).
 #[test]
 fn why_nows_full_form_marks_only_a_cause_aterm_names() {
     let inks = dark_inks();
-    // Each prim between the last text before `words` and `words`: a dot's ink.
     let marks = |snap: &Snapshot, words: &str| -> Vec<Option<Rgba>> {
         let prims = cpu_lens(snap, &[1], 1024.0, true).prims;
         let text = |p: &DrawPrim| matches!(p, DrawPrim::Text { .. });
@@ -1140,8 +1087,6 @@ fn why_nows_full_form_marks_only_a_cause_aterm_names() {
     assert!(unexplained.is_empty(), "{unexplained:?}");
 }
 
-/// Why now's one-line form draws ∵ as three dots in words2 between its
-/// label and its words, whose last clause is the `why` sentence's tab clause.
 #[test]
 fn why_nows_one_line_form_draws_the_cause_mark() {
     let snap = engine_1032();

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Conformance tests for `AutopilotTimer` against `aterm_models_gui::autopilot_timer_model`.
+//! TIER-1 FOR `AutopilotTimer`.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -13,15 +13,10 @@ use super::set_fake_clocks;
 use crate::App;
 use crate::session_timeline::MetaField;
 
-/// One model minute of the wall and the monotonic clock, in ms.
 const MINUTE: i64 = 60_000;
 
-/// The wall clock's origin, unix ms (2026-10-16T19:00:00Z): a whole second.
 const WALL0: i64 = 1_792_177_200_000;
 
-/// The REAL parts of the timer, driven step by step, with the model's view
-/// of what the code does not keep (the clocks it reads, the held wake, the
-/// leaf a successor owes, the ghosts).
 struct TimerDrive {
     app: App,
     host: crate::harness_host::HostHandle,
@@ -35,8 +30,7 @@ struct TimerDrive {
     wall: i64,
     /// A wire write's `MetaChanged`, posted and not yet handled.
     wake: bool,
-    /// The leaf a successor owes the session: `(word, land_at)` as the model
-    /// counts them.
+    /// The leaf a successor owes the session: `(word, land_at)` as the model counts them.
     leaf: Option<(i64, i64)>,
     hand: i64,
     fires: i64,
@@ -44,7 +38,6 @@ struct TimerDrive {
     early: i64,
 }
 
-/// A test App with a host, so the harness carries a mode.
 fn hosted() -> (App, crate::harness_host::HostHandle) {
     let mut app = App::headless_for_test();
     let host = crate::harness_host::HostHandle::for_supervised_test(
@@ -55,7 +48,6 @@ fn hosted() -> (App, crate::harness_host::HostHandle) {
     (app, host)
 }
 
-/// The model's number for a stored word.
 fn word_number(word: Option<Autopilot>) -> i64 {
     match word {
         None => 0,
@@ -65,7 +57,6 @@ fn word_number(word: Option<Autopilot>) -> i64 {
     }
 }
 
-/// The model's minute for a stored instant.
 fn minute_of(ms: Option<i64>) -> i64 {
     ms.map_or(0, |ms| (ms - WALL0) / MINUTE)
 }
@@ -108,7 +99,6 @@ impl TimerDrive {
         self.app.pool.get(self.session).map(|s| s.ctx.clone())
     }
 
-    /// The real state, projected onto the model's variables.
     fn state(&self) -> BTreeMap<&'static str, i64> {
         let (word, land_at, bit) = self.ctx().map_or((0, 0, 0), |ctx| {
             let meta = ctx.meta.lock().unwrap();
@@ -154,9 +144,6 @@ impl TimerDrive {
         ])
     }
 
-    /// Run `act` on the real code and validate the observed transition
-    /// against `action` (both tiers), then every invariant; a step that moves
-    /// nothing is a stutter. The model must enable `action` first.
     fn step(&mut self, action: &str, act: impl FnOnce(&mut Self)) {
         let before = self.state();
         assert!(
@@ -187,8 +174,6 @@ impl TimerDrive {
         }
     }
 
-    /// The wire's `meta` on the session, as the dispatch arm runs it; its
-    /// `MetaChanged` is held (`wake`) until [`Self::apply_wake`].
     fn wire(&mut self, rest: &str) -> String {
         let session = self.app.pool.get(self.session).unwrap();
         let (term, ctx) = (session.term.clone(), session.ctx.clone());
@@ -254,8 +239,6 @@ impl TimerDrive {
         self.step("ClockBack", |d| d.wall -= 1);
     }
 
-    /// The real fire, observed: a Land it wrote is counted against the arm,
-    /// and against a stored hand write or a wall short of the instant.
     fn fire(&mut self) {
         let before = self.state();
         self.step("Fire", |d| {
@@ -280,8 +263,6 @@ impl TimerDrive {
         self.step("WallMoved", |d| d.app.on_wall_moved());
     }
 
-    /// The restore leaf the capture writes for the session now
-    /// (`SessionMeta::sanitized`, the capture's own), in the model's numbers.
     fn capture(&self) -> crate::restore::TerminalLeafRestore {
         let meta = self.ctx().unwrap().meta.lock().unwrap().sanitized();
         crate::restore::TerminalLeafRestore {
@@ -310,8 +291,6 @@ impl TimerDrive {
         }
     }
 
-    /// A new process stands in for this one (a fresh App and host, the
-    /// session its window's bootstrap), the old one shut down.
     fn new_process(&mut self, successor: bool) {
         let (mut app, host) = hosted();
         if successor {
@@ -325,9 +304,6 @@ impl TimerDrive {
         self.wake = false;
     }
 
-    /// aterm quits and comes back: the leaf captured at the quit is seeded
-    /// onto the new process's session and indexed (`graft_restored_user_meta`,
-    /// the path window 0's bootstrap takes).
     fn close_and_restore(&mut self) {
         self.step("CloseAndRestore", |d| {
             let leaf = d.capture();
@@ -336,8 +312,6 @@ impl TimerDrive {
         });
     }
 
-    /// A seamless update: the successor adopts the session with a fresh store
-    /// and owes it the leaf.
     fn handoff_start(&mut self) {
         self.step("HandoffStart", |d| {
             let leaf = d.capture();
@@ -349,7 +323,6 @@ impl TimerDrive {
         });
     }
 
-    /// The live graft of the leaf the successor owes.
     fn graft(&mut self) {
         self.step("Graft", |d| d.graft_now());
     }
@@ -367,11 +340,6 @@ impl TimerDrive {
         self.app.graft_restored_user_meta(self.session, &leaf);
     }
 
-    /// The Commit: `Wake::ActivateCommittedHandoff` lifts the gate, and the
-    /// park after it settles the index the Commit owes
-    /// (`App::settle_autopilot_commit`, the first step of every
-    /// `expire_autopilot_timers`) — driven here apart from that park's fire,
-    /// which the model counts as its own `Fire`.
     fn commit(&mut self) {
         self.step("HandoffCommit", |d| {
             d.app.incoming_handoff_pending = false;
@@ -393,8 +361,6 @@ impl TimerDrive {
         });
     }
 
-    /// `mutant` applied to a copy of the real state must be refused as
-    /// `action` by the model.
     fn refuses(
         &self,
         before: &BTreeMap<&'static str, i64>,
@@ -414,14 +380,6 @@ impl TimerDrive {
     }
 }
 
-/// THE BIND: every lane of §9.3.6 driven through the real code and held to
-/// the model — the window's arm and its fire; the wire's arm, its wake and the
-/// fire; a stored Off racing an armed entry; the same word cancelling; the
-/// clock set back at the fire; asleep through the time and the wall's
-/// re-derivation; a cold restore across the instant; a seamless update whose
-/// wire write lands before the Commit, a driver's write winning over the
-/// graft, and the Commit's rebuild; and a close with a timer armed. Then the
-/// four negative controls, each refused by the same model.
 #[test]
 fn the_real_timer_conforms_to_its_model() {
     let mut d = TimerDrive::new();

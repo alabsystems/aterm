@@ -169,10 +169,8 @@ pub trait ReleaseHost {
     /// Why the edit failed.
     fn publish_draft(&self, slug: &Slug, tag: &str) -> Result<(), HostError>;
 
-    /// Probes the anonymous download host for one asset without following redirects.
     fn probe_public(&self, slug: &Slug, tag: &str, asset: &str) -> Probe;
 
-    /// Fetches one asset from the download host into `dest`, up to `cap` bytes.
     fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Probe;
 
     /// Clone `slug` into `dest` (the lanes' scratch clones of the program repos).
@@ -182,12 +180,10 @@ pub trait ReleaseHost {
     /// Why the clone failed.
     fn clone_repo(&self, slug: &Slug, dest: &Path) -> Result<(), HostError>;
 
-    /// Pause duration before retrying an [`HostError::Unreachable`] operation.
     fn retry_pause(&self) -> Duration {
         Duration::ZERO
     }
 
-    /// Returns whether this identity reads without credentials.
     fn reads_anonymously(&self) -> bool {
         false
     }

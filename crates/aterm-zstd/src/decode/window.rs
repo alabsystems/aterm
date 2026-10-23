@@ -1,22 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The window: what a match may copy from.
+//! The window.
 
 use super::error::DecodeError;
 
 /// Bytes a [`BlockBuf`] keeps past the block's maximum for chunked copies to overshoot into.
 pub(crate) const SLACK: usize = 32;
 
-/// The unit of a chunked copy.
 const CHUNK: usize = 16;
 
-/// The bounds a caller checked did not hold. Reaching this is a decoder bug,
-/// reported as an error rather than a panic.
 const OUT_OF_BOUNDS: DecodeError = DecodeError::Corrupt("copy out of bounds");
 
-/// Copies `buf[from..from + 16]` to `buf[to..to + 16]` through a register:
-/// a constant-size load and store, where `copy_within` would call `memmove`.
+/// Copies `buf[from..from + 16]` to `buf[to..to + 16]` through a register.
 #[inline(always)]
 fn copy_chunk(buf: &mut [u8], from: usize, to: usize) -> Result<(), DecodeError> {
     let chunk = *buf
@@ -29,9 +25,9 @@ fn copy_chunk(buf: &mut [u8], from: usize, to: usize) -> Result<(), DecodeError>
     Ok(())
 }
 
-/// Writes `src[from..from + n]` to `dst[to..]` in 16-byte chunks while both
-/// slices hold a whole chunk at the cursor (reading and writing up to 15
-/// bytes past the copy, into room the callers keep), then the rest exactly.
+/// Writes `src[from..from + n]` to `dst[to..]` in 16-byte chunks while both slices hold a whole
+/// chunk at the cursor (reading and writing up to 15 bytes past the copy, into room the callers
+/// keep).
 #[inline(always)]
 fn wild_copy(
     dst: &mut [u8],
@@ -66,8 +62,7 @@ pub(crate) struct Window {
     /// Grows to `cap` bytes, then wraps.
     ring: Vec<u8>,
     cap: usize,
-    /// Where the next byte goes: `ring.len()` while growing, then the
-    /// oldest byte's index.
+    /// Where the next byte goes: `ring.len()` while growing, then the oldest byte's index.
     head: usize,
 }
 
@@ -116,9 +111,6 @@ impl Window {
         }
     }
 
-    /// Writes to `dst[to..to + n]` the `n` bytes that start `back` bytes
-    /// before the end of the history, where `n <= back <= self.len()`. May
-    /// write up to 15 bytes past them (see [`wild_copy`]).
     fn copy_into(
         &self,
         dst: &mut [u8],
@@ -268,8 +260,6 @@ impl BlockBuf {
 mod tests {
     use super::{BlockBuf, SLACK, Window};
 
-    /// The reference: every byte copied one at a time from `offset` back in
-    /// the whole output.
     fn naive(all: &mut Vec<u8>, offset: usize, len: usize) {
         for _ in 0..len {
             all.push(all[all.len() - offset]);
@@ -308,8 +298,6 @@ mod tests {
         }
     }
 
-    /// Long periodic matches inside the block, every period up to past a
-    /// chunk, against the byte-by-byte copy.
     #[test]
     fn overlapping_matches_inside_the_block() {
         let seed: Vec<u8> = (0..40).map(|i| (i * 37 + 11) as u8).collect();

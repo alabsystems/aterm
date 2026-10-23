@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The facts the ancestry walk reads from the kernel: this process's uid, whether a path
-//! carries an extended access ACL ([`acl_rule`]), and the type of the filesystem it is on
-//! ([`filesystem_type`], [`remote_filesystem_type`]). Off Linux none is read, and each
-//! answers what grants no exemption.
+//! The facts the ancestry walk reads from the kernel.
 
 use std::ffi::CStr;
 use std::path::Path;
@@ -16,37 +13,28 @@ pub(crate) fn uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// The extended-ACL attributes Linux exposes: the POSIX access ACL, and the NFSv4 ACL an
-/// NFSv4 mount reads from its server.
+/// The extended-ACL attributes Linux exposes.
 pub const ACL_ATTRIBUTES: [&CStr; 2] = [c"system.posix_acl_access", c"system.nfs4_acl"];
 
-/// Linux's `ENODATA`: no such attribute. The rule is Linux's on every host.
 const ENODATA: i32 = 61;
 
-/// Linux's `ENOTSUP`, which is also its `EOPNOTSUPP`: the filesystem keeps no such
-/// attribute.
 const ENOTSUP: i32 = 95;
 
-/// Whether a file may carry an extended access ACL, POSIX or NFSv4, whose mask its group
-/// bits then are, from `answer`, each attribute's length query (`None` it succeeded, else
-/// its errno): only "no such attribute" and "this filesystem keeps none" from every
-/// attribute answer no. crates/aterm-uds/src/shared_write.rs `acl_carried` is the rule.
+/// Whether a file may carry an extended access ACL.
 pub fn acl_rule(mut answer: impl FnMut(&CStr) -> Option<i32>) -> bool {
     ACL_ATTRIBUTES
         .iter()
         .any(|name| !matches!(answer(name), Some(ENODATA | ENOTSUP)))
 }
 
-/// Whether what `path` itself names (a final symbolic link not followed) may carry an
-/// extended access ACL.
+/// Whether what `path` itself names (a final symbolic link not followed) may carry an extended
+/// access ACL.
 #[cfg(target_os = "linux")]
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn acl_carried(path: &Path) -> bool {
     use std::ffi::{c_char, c_void};
     use std::os::unix::ffi::OsStrExt as _;
     unsafe extern "C" {
-        /// `<sys/xattr.h>`: a path's attribute, a final symbolic link not followed; a zero
-        /// `size` asks only its length.
         fn lgetxattr(
             path: *const c_char,
             name: *const c_char,
@@ -58,8 +46,8 @@ pub(crate) fn acl_carried(path: &Path) -> bool {
         return true;
     };
     acl_rule(|name| {
-        // SAFETY: a NUL-terminated path and name; a null value with a zero size asks only
-        // the attribute's length, so nothing is written.
+        // SAFETY: a NUL-terminated path and name; a null value with a zero size asks only the
+        // attribute's length, so nothing is written.
         let ret = unsafe { lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
         if ret >= 0 {
             None
@@ -75,9 +63,7 @@ pub(crate) fn acl_carried(_path: &Path) -> bool {
     true
 }
 
-/// `statfs` `f_type` of the network and FUSE filesystems, where a server or daemon decides
-/// access: NFS, SMB/CIFS (two), Ceph, AFS (two), 9P, Lustre, GPFS, FUSE.
-/// crates/aterm-uds/src/shared_write.rs `REMOTE_FILESYSTEMS` is the list.
+/// `statfs` `f_type` of the network and FUSE filesystems.
 pub const REMOTE_FILESYSTEMS: [u32; 10] = [
     0x6969,
     0xFF53_4D42,
@@ -97,16 +83,14 @@ pub fn remote_filesystem_type(magic: u32) -> bool {
     REMOTE_FILESYSTEMS.contains(&magic)
 }
 
-/// The `f_type` of the filesystem `path` is on (`statfs`, a final symbolic link followed),
-/// or `None` when it cannot be read.
+/// The `f_type` of the filesystem `path` is on (`statfs`, a final symbolic link followed).
 #[cfg(target_os = "linux")]
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn filesystem_type(path: &Path) -> Option<u32> {
     use std::ffi::{c_char, c_int};
     use std::os::unix::ffi::OsStrExt as _;
-    /// `<sys/vfs.h>`'s `struct statfs` as glibc lays it out on x86_64 and aarch64:
-    /// `f_type`, a 64-bit `long`, first, then room for the fields after it.
+    /// `<sys/vfs.h>`'s `struct statfs` as glibc lays it out on x86_64 and aarch64.
     #[repr(C)]
     struct Statfs {
         f_type: i64,
@@ -120,8 +104,8 @@ pub fn filesystem_type(path: &Path) -> Option<u32> {
         f_type: 0,
         _room: [0; 31],
     };
-    // SAFETY: a NUL-terminated path and a live buffer larger than glibc's `struct statfs`,
-    // which the call only writes.
+    // SAFETY: a NUL-terminated path and a live buffer larger than glibc's `struct statfs`, which
+    // the call only writes.
     let ret = unsafe { statfs(path.as_ptr(), &raw mut buf) };
     (ret == 0).then(|| u32::try_from(buf.f_type & 0xFFFF_FFFF).ok())?
 }
@@ -142,8 +126,6 @@ pub(crate) fn remote_filesystem(path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    /// The ACL rule is the updater's on every pair of answers the two attributes' length
-    /// queries can give: it exists, `ENODATA`, `ENOTSUP`, another errno.
     #[test]
     fn the_acl_rule_is_the_updaters() {
         let outcomes = [None, Some(ENODATA), Some(ENOTSUP), Some(5)];
@@ -180,8 +162,7 @@ mod tests {
         }
     }
 
-    /// The type statfs reads is the updater's on this machine's paths, and none for a path
-    /// that does not exist.
+    /// The type statfs reads is the updater's on this machine's paths.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_filesystem_type_is_the_updaters_on_this_machine() {

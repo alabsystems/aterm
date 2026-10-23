@@ -8,7 +8,6 @@ use crate::native_app::{AppEvent, AppKind, AppViewState};
 use crate::{App, WindowId};
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
-/// Initial multi-line document for every table row.
 fn long() -> String {
     let mut text = String::from("alpha beta\ngamma\n");
     for line in 3..=40 {
@@ -17,7 +16,6 @@ fn long() -> String {
     text
 }
 
-/// Where every row's caret starts: the `b` of `beta`.
 const CARET: usize = 6;
 
 fn press(key: Key, mods: Modifiers) -> InputEvent {
@@ -30,7 +28,6 @@ fn press(key: Key, mods: Modifiers) -> InputEvent {
     }
 }
 
-/// A character press whose layout typed `text` (Shift+a types `A`).
 fn typed(character: char, mods: Modifiers, text: char) -> InputEvent {
     InputEvent::Key {
         key: Key::Character(character),
@@ -61,12 +58,10 @@ fn cmd(character: char) -> InputEvent {
     press(Key::Character(character), Modifiers::SUPER)
 }
 
-/// The chord that opens incremental search on this host.
 fn isearch() -> InputEvent {
     if cfg!(windows) { alt('s') } else { ctrl('s') }
 }
 
-/// One row: press `press` after `before` and read `expect`.
 struct Row {
     name: &'static str,
     before: Vec<InputEvent>,
@@ -88,7 +83,6 @@ fn row(
     }
 }
 
-/// A fresh Editor on [`long`] in window 0, caret at [`CARET`], focus on the buffer.
 fn editor(
     path: &std::path::Path,
 ) -> (
@@ -119,7 +113,6 @@ fn editor(
     (app, view, document)
 }
 
-/// How many whole document rows `app`'s editor shows.
 fn screen(app: &App) -> usize {
     let wid = WindowId(0);
     let (instance, _) = app.active_native_view(wid).expect("the editor tab");
@@ -134,7 +127,6 @@ fn screen(app: &App) -> usize {
     )
 }
 
-/// What the editor shows after a key, as one line ([`long`]).
 fn seen(
     app: &App,
     view: crate::tab_model::ViewId,
@@ -210,7 +202,6 @@ fn seen(
     out.join(" ")
 }
 
-/// The table, for an editor that shows `screen` whole rows ([`screen`]).
 fn rows(screen: usize) -> Vec<Row> {
     use NamedKey as N;
     let text = long();
@@ -866,7 +857,6 @@ fn rows(screen: usize) -> Vec<Row> {
     ]
 }
 
-/// Every row of the table, against a fresh editor each.
 #[test]
 fn editor_keys_do_what_the_table_says() {
     let dir = std::env::temp_dir().join(format!("aterm-editor-input-{}", std::process::id()));
@@ -905,9 +895,6 @@ fn editor_keys_do_what_the_table_says() {
     );
 }
 
-/// Escape, then a minibuffer opened by a button rather than a key (Find, Go
-/// to Line, Commands): the minibuffer takes the next keys. (A pending ESC,
-/// when a GUI's Escape was Meta, once held every key but C-g.)
 #[test]
 fn escape_then_find_still_types() {
     let dir = std::env::temp_dir().join(format!("aterm-editor-esc-find-{}", std::process::id()));
@@ -942,9 +929,6 @@ fn escape_then_find_still_types() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Tab in an Editor buffer indents to the next tab stop through the native
-/// input boundary, where it used to move focus to the toolbar; the workspace
-/// it reaches uses the GUI keymap of this platform.
 #[test]
 fn tab_indents_in_editor_buffer() {
     let dir = std::env::temp_dir().join(format!("aterm-editor-tab-{}", std::process::id()));
@@ -969,8 +953,6 @@ fn tab_indents_in_editor_buffer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// F6 and Shift+F6 walk keyboard focus through an Editor's controls in the
-/// compiled focus order, both ways and around, and never edit the buffer.
 #[test]
 fn f6_moves_native_focus() {
     let dir = std::env::temp_dir().join(format!("aterm-editor-f6-{}", std::process::id()));
@@ -1030,11 +1012,6 @@ fn f6_moves_native_focus() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Ctrl+Tab over an Editor is still the host's next tab
-/// (`keybinding.rs`'s `ctrl+tab = next_tab`): it switches tabs and never
-/// reaches the buffer, whose Tab now indents. Windows and Linux seed the
-/// binding; macOS's Next Tab is ⌘⇧], so there the row is the user's own,
-/// which wins over the Editor the same way.
 #[test]
 fn ctrl_tab_still_switches_tabs() {
     use aterm_window::event::{ElementState, KeyEvent};

@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Live Windows DXGI output enumeration tests against `user32`.
+//!
+//! STOCK EXCEPTION: Windows only, and Trust has no Windows std, so only stock Rust builds this (the
+//! Windows lane's guest pins its version: `aterm-lab/src/windows_guest.rs`).
 
 #![cfg(windows)]
 #![allow(non_snake_case)]

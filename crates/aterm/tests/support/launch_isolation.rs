@@ -24,7 +24,6 @@ pub fn control_sock(root: &Path) -> [std::ffi::OsString; 2] {
     ]
 }
 
-/// `sockaddr_un.sun_path` is ~104 bytes on macOS/BSD.
 const MAX_SOCK_PATH: usize = 100;
 
 /// Whether a unix socket at `sock` fits `sun_path` as a client dials it.
@@ -52,12 +51,11 @@ pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
                               [machine]\nuniversal_control = \"leave\"\n\
                               [harness]\nenabled = false\n";
 
-/// [`CONFIG_OFF`]'s last table: Settings ▸ Agents off.
+/// [`CONFIG_OFF`]'s last table.
 #[allow(dead_code)]
 pub const HARNESS_OFF: &str = "[harness]\nenabled = false\n";
 
 /// Arm `cmd`, a `--headless` launch, with a lifeline (`aterm_uds::lifeline`).
-///
 /// # Panics
 /// The lifeline's FIFO could not be created in `root`.
 #[cfg(unix)]
@@ -75,7 +73,6 @@ pub fn control_listening(sock: impl AsRef<Path>) -> bool {
 }
 
 /// A fresh private root for one launch ([`prepare`], [`control_sock`]), removed on drop.
-///
 /// # Panics
 /// The root could not be created or prepared: a broken fixture.
 #[allow(dead_code)]
@@ -93,7 +90,6 @@ pub fn scratch_root(label: &str) -> aterm_tempfile::TempDir {
 }
 
 /// Pin `path` in the login shell profiles under `root`'s scratch home.
-///
 /// # Errors
 /// A profile could not be read or written.
 #[cfg(unix)]
@@ -179,7 +175,6 @@ pub fn apply(cmd: &mut Command, root: &Path) {
         .collect();
     for name in names {
         let text = name.to_string_lossy();
-        // The verify run's mark is no authority and stays (`aterm_uds::process::VERIFY_RUN_VAR`).
         let stripped = text.starts_with("ATERM_")
             || text.starts_with("ATPKG_")
             || text.starts_with("__ATERM_");

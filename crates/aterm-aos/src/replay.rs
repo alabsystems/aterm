@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Deterministic [`replay`] of task steps into a [`Run`] stopping at the first
-//! [`StepRefusal`] ([`crate::effects::ShadowPort`]).
+//! Deterministic [`replay`] of task steps into a [`Run`] stopping at the first [`StepRefusal`].
 
 use core::fmt;
 

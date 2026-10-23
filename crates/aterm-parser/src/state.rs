@@ -8,47 +8,47 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum State {
-    /// Initial state, normal text processing
+    /// Initial state, normal text processing.
     #[default]
     Ground = 0,
 
-    /// After ESC, waiting for next byte
+    /// After ESC, waiting for next byte.
     Escape,
 
-    /// ESC followed by intermediate byte (0x20-0x2F)
+    /// ESC followed by intermediate byte (0x20-0x2F).
     EscapeIntermediate,
 
     /// After ESC [, start of CSI sequence
     CsiEntry,
 
-    /// Collecting CSI parameters (digits, semicolons)
+    /// Collecting CSI parameters (digits, semicolons).
     CsiParam,
 
-    /// CSI with intermediate bytes
+    /// CSI with intermediate bytes.
     CsiIntermediate,
 
-    /// Invalid CSI sequence, ignoring until final byte
+    /// Invalid CSI sequence, ignoring until final byte.
     CsiIgnore,
 
-    /// After ESC P, start of DCS sequence
+    /// After ESC P, start of DCS sequence.
     DcsEntry,
 
-    /// Collecting DCS parameters
+    /// Collecting DCS parameters.
     DcsParam,
 
-    /// DCS with intermediate bytes
+    /// DCS with intermediate bytes.
     DcsIntermediate,
 
-    /// Passing through DCS data
+    /// Passing through DCS data.
     DcsPassthrough,
 
-    /// Invalid DCS, ignoring
+    /// Invalid DCS, ignoring.
     DcsIgnore,
 
     /// Collecting OSC string (after ESC ])
     OscString,
 
-    /// SOS, PM, or APC string
+    /// SOS, PM, or APC string.
     SosPmApcString,
 }
 
@@ -74,9 +74,7 @@ impl State {
         State::SosPmApcString,
     ];
 
-    /// The state whose [`State::name`] is `name`, or `None`: how a state
-    /// crosses a text wire (the [`crate::ParserCarry`]) without a numeric
-    /// discriminant a later build might renumber.
+    /// The state whose [`State::name`] is `name`, or `None` ([`crate::ParserCarry`]).
     #[must_use]
     pub fn from_name(name: &str) -> Option<State> {
         State::ALL.into_iter().find(|state| state.name() == name)
@@ -88,8 +86,7 @@ impl State {
         matches!(self, State::Ground)
     }
 
-    /// The state's name (its `Debug` form) as a static string, so a caller
-    /// outside this crate can report a state without allocating.
+    /// The state's name.
     #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {

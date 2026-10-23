@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Ordered input log of a hosted task from a checkpoint onward ([`LOG_MAGIC`],
-//! [`EventLog::decode`], [`LogFull`], [`RangeFault::Broken`], [`IdentityMismatch`],
-//! [`Tail::Clean`], [`Tail::Torn`], [`Tail::Unsealed`], [`WireFault::Trailing`],
-//! [`LogFault::Kind`], [`LogFault::SealCount`], [`LogFault::SealDigest`],
-//! [`LogFault::Step`], [`LogFault::Ancestor`]).
+//! Ordered input log of a hosted task from a checkpoint onward.
 
 use core::fmt;
 
@@ -29,10 +25,8 @@ const KIND_HEADER: u8 = 0;
 const KIND_EVENT: u8 = 1;
 const KIND_SEAL: u8 = 2;
 
-/// Where a record's body starts, counted from the start of its frame.
 const BODY_OFFSET: usize = HEADER_SIZE + STEP_HEADER;
 
-/// The largest body a step record can carry.
 const MAX_BODY: usize = MAX_PAYLOAD_LEN - STEP_HEADER;
 
 /// The identity and place of one log epoch.
@@ -346,7 +340,6 @@ impl<S: Schema> fmt::Debug for EventLog<S> {
     }
 }
 
-/// What a decoded log says when its header carried the break flag.
 const DECODED_BREAK: &str = "the log was written with a recording break";
 
 impl<S: Schema> EventLog<S> {
@@ -443,8 +436,7 @@ impl<S: Schema> EventLog<S> {
             .saturating_add(len_u64(self.inputs.len()))
     }
 
-    /// The inputs at cursors `[from, to)`. Refused when the log is broken, the range is
-    /// inverted, or it reaches outside `[first_cursor, end_cursor]`.
+    /// The inputs in the cursor range `from..to`.
     pub fn range(&self, from: u64, to: u64) -> Result<&[S::Input], RangeFault> {
         if let Some(why) = self.broken {
             return Err(RangeFault::Broken(why));
@@ -473,7 +465,6 @@ impl<S: Schema> EventLog<S> {
         Ok(self.digest_inputs(schema, from, to, inputs))
     }
 
-    /// What the seal names.
     fn seal_digest(&self, schema: &S) -> Digest {
         let (from, to) = (self.header.first_cursor, self.end_cursor());
         self.digest_inputs(schema, from, to, &self.inputs)
@@ -639,7 +630,6 @@ fn put_record(out: &mut Vec<u8>, step: u64, body: &[u8]) -> Result<(), LogFault>
     Ok(())
 }
 
-/// Every accepted record's frame must end exactly where its body ends.
 fn check_layout(
     steps: &[(u64, core::ops::Range<usize>)],
     valid_len: usize,
@@ -696,7 +686,6 @@ fn read_header(body: &[u8]) -> Result<(LogHeader, bool), LogFault> {
     ))
 }
 
-/// The seal record at `step`: the event count it names and the digest.
 fn read_seal(step: u64, body: &[u8]) -> Result<(u64, Digest), LogFault> {
     let mut d = Dec::new(body);
     let version = d.u8("record.version")?;

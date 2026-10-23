@@ -9,10 +9,6 @@ use std::fmt::Display;
 use proc_macro::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
 
 /// One diagnostic: a message over the source from `start` to `end`.
-///
-/// Stable `proc_macro` cannot join two spans, so, as syn does, the emitted
-/// `compile_error!` puts its path at `start` and its message at `end`, and
-/// the compiler underlines from one to the other.
 #[derive(Debug)]
 pub struct Error {
     start: Span,
@@ -53,8 +49,7 @@ impl Error {
         &self.message
     }
 
-    /// `::core::compile_error! { "message" }`, spanned as described on
-    /// [`Error`].
+    /// Emits `::core::compile_error! { "message" }` spanned from `start` to `end`.
     #[must_use]
     pub fn to_compile_error(&self) -> TokenStream {
         let punct = |ch: char, spacing: Spacing| {
@@ -84,8 +79,7 @@ impl Error {
     }
 }
 
-/// Collects every error one expansion finds, so the user sees all of them at
-/// once rather than the first.
+/// Collects every error one expansion finds.
 #[derive(Default)]
 pub struct Errors {
     list: RefCell<Vec<Error>>,

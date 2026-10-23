@@ -15,7 +15,6 @@ thread_local! {
     static FRONT: Cell<i32> = const { Cell::new(-1) };
 }
 
-/// The injected probe.
 fn front(_master: i32) -> i32 {
     FRONT.with(Cell::get)
 }
@@ -33,7 +32,6 @@ struct Bed {
 }
 
 impl Bed {
-    /// A headless App whose front session's shell is in front and named.
     fn new() -> (Self, Instant) {
         let mut app = App::headless_for_test();
         app.session_factory.fg_probe = front;
@@ -88,7 +86,6 @@ impl Bed {
             .clone()
     }
 
-    /// Wait (a hang detector) until the resolver has named `want`.
     fn wait_named(&self, want: &str) {
         let named = aterm_spec::wait::within(
             aterm_spec::wait::MUST_HAPPEN,
@@ -98,7 +95,6 @@ impl Bed {
         assert!(named.is_some(), "never named {want}: {:?}", self.program());
     }
 
-    /// When the sweep last asked the resolver for this session.
     fn requested_at(&self) -> Option<Instant> {
         self.app
             .session_status
@@ -125,8 +121,6 @@ fn sweep_mut(bed: &mut Bed, now: Instant) -> Vec<u64> {
     bed.app.observe_session_statuses(now)
 }
 
-/// An edged session that is NOT due is visited on the next wake: the
-/// claude in front is asked for and named then, not at its next observation.
 #[test]
 fn an_edged_session_is_named_on_the_next_wake_due_or_not() {
     let (mut bed, t0) = Bed::new();
@@ -144,8 +138,6 @@ fn an_edged_session_is_named_on_the_next_wake_due_or_not() {
     );
 }
 
-/// NEGATIVE CONTROL: the same edge with no inbox push waits for the
-/// session's observation; nothing is asked on this wake.
 #[test]
 fn control_without_the_inbox_nothing_is_named_before_the_next_observation() {
     let (mut bed, t0) = Bed::new();
@@ -156,9 +148,6 @@ fn control_without_the_inbox_nothing_is_named_before_the_next_observation() {
     assert_eq!(bed.program().as_deref(), Some("zsh"));
 }
 
-/// A visit the PTY reader's hold refuses is pushed back for the next wake,
-/// and charges no interval; the next wake names it. NEGATIVE CONTROL: the
-/// same refusal of a due session that is not edged charges its interval.
 #[test]
 fn a_contended_edged_visit_is_retried_with_no_interval_charged() {
     let (mut bed, t0) = Bed::new();
@@ -190,11 +179,6 @@ fn a_contended_edged_visit_is_retried_with_no_interval_charged() {
     );
 }
 
-/// AN `exec` IN PLACE (`exec claude` at the prompt, a shim's `exec` of the
-/// store build): the group in front does not move, so only the edged visit
-/// owes the naming (`program_due(group_changed || edged)`). The shell's own
-/// group is named claude on this wake. NEGATIVE CONTROL: the same `exec`
-/// with no inbox push asks nothing on this wake.
 #[test]
 fn an_exec_in_place_is_named_on_the_next_wake() {
     let (mut bed, t0) = Bed::new();
@@ -219,11 +203,6 @@ fn an_exec_in_place_is_named_on_the_next_wake() {
     );
 }
 
-/// A REFUSED EDGED VISIT OF A DUE SESSION is charged as any refusal is (the
-/// pool walk tries it again): its owed instant moves an interval on, so the
-/// sweep's wake is never left in the past while the PTY reader's hold keeps
-/// winning (an event-loop-rate spin), and the edge stays queued for the next
-/// wake, which names it.
 #[test]
 fn a_refused_edged_visit_of_a_due_session_is_charged() {
     let (mut bed, _t0) = Bed::new();
@@ -255,8 +234,6 @@ fn a_refused_edged_visit_of_a_due_session_is_charged() {
     bed.wait_named("claude");
 }
 
-/// `tab_status = false`: the sweep reads nothing, and the readers' pushes
-/// are dropped on its next turn rather than kept for the life of the process.
 #[test]
 fn with_the_sweep_off_the_inbox_keeps_nothing() {
     let (mut bed, t0) = Bed::new();

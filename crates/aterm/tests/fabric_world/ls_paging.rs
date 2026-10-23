@@ -17,15 +17,12 @@ use astream_broker::proto::{
     Request, Response, decode_request, encode_response, read_frame, write_frame,
 };
 
-/// One scripted `Last` answer: the rows the page carries and the cursor that
-/// closes it. An empty `resume` says the walk is over.
 struct Page {
     rows: Vec<(u64, String, Vec<u8>)>,
     resume: String,
 }
 
 impl Page {
-    /// A page carrying one presence row.
     fn row(offset: u64, node: &str, sid: &str, body: &str, resume: &str) -> Self {
         Self {
             rows: vec![(
@@ -37,8 +34,6 @@ impl Page {
         }
     }
 
-    /// A page carrying NO rows and a cursor: the contract permits it, and it does
-    /// not mean "the fleet ends here".
     fn empty(resume: &str) -> Self {
         Self {
             rows: Vec::new(),
@@ -47,12 +42,6 @@ impl Page {
     }
 }
 
-/// `aterm link` with no rendezvous file to read: the child's `XDG_RUNTIME_DIR`
-/// is an empty scratch dir, so `ls` gets exactly the flags a test spells out.
-/// Against the real one, on a machine where `aterm fabric on` has written it,
-/// `ls` fills in its `--cap-file` and opens with the `Hello` an attach needs,
-/// which these stubs (they speak `Last` only) hang up on. The dir goes when the
-/// returned guard drops: hold it until the child has exited.
 fn aterm_link() -> (Command, aterm_tempfile::TempDir) {
     let runtime = aterm_tempfile::Builder::new()
         .prefix("atl-rt-")
@@ -64,8 +53,6 @@ fn aterm_link() -> (Command, aterm_tempfile::TempDir) {
     (c, runtime)
 }
 
-/// A socket path short enough for `sockaddr_un.sun_path` whatever `$TMPDIR` is, in a
-/// private directory under `/tmp` that goes when the guard drops.
 fn sock_path(tag: &str) -> (aterm_tempfile::TempDir, PathBuf) {
     let dir = aterm_tempfile::Builder::new()
         .prefix("atl-")
@@ -80,9 +67,6 @@ fn sock_path(tag: &str) -> (aterm_tempfile::TempDir, PathBuf) {
     (dir, p)
 }
 
-/// Answer every `Last` on one connection from `pages`, in order, repeating the
-/// LAST page once the script runs out — which is how the unbounded-walk case is
-/// scripted without a special stub.
 fn answer(mut s: UnixStream, pages: &[Page]) {
     let mut i = 0usize;
     while let Ok(Some(frame)) = read_frame(&mut s) {
@@ -114,8 +98,6 @@ fn answer(mut s: UnixStream, pages: &[Page]) {
     }
 }
 
-/// Run the real `aterm link ls` against a stub broker speaking `pages`.
-/// Answers `(stdout, stderr, success)`.
 fn ls(tag: &str, pages: Vec<Page>, extra: &[&str]) -> (String, String, bool) {
     let (_dir, path) = sock_path(tag);
     let listener = UnixListener::bind(&path).expect("bind the stub broker");
@@ -139,11 +121,6 @@ fn ls(tag: &str, pages: Vec<Page>, extra: &[&str]) -> (String, String, bool) {
     )
 }
 
-/// `--attention` PRINTS THE ESCALATING ROWS AND ONLY THEM, wherever the walk
-/// finds them: a quiet row first, then an empty page with a live cursor, then
-/// the node raising `attention=`. A filter that kept everything prints two
-/// lines; a walk that stopped at the empty page prints nothing and exits 0 —
-/// silence indistinguishable from "nobody needs you".
 #[test]
 fn ls_attention_prints_only_the_escalating_rows_past_an_empty_page() {
     let (stdout, stderr, ok) = ls(
@@ -170,7 +147,6 @@ fn ls_attention_prints_only_the_escalating_rows_past_an_empty_page() {
     );
 }
 
-/// A WALK THAT COULD NOT FINISH IS AN ERROR, NOT AN EMPTY FLEET.
 #[test]
 fn a_last_walk_that_never_ends_is_an_error_rather_than_a_short_roster() {
     let (stdout, stderr, ok) = ls("bnd", vec![Page::empty("/f/f1/pub/n-a/s-1/presence")], &[]);

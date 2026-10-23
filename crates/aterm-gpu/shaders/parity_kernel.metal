@@ -55,3 +55,33 @@ kernel void k_rain_parity(constant RainParityParams& p [[buffer(0)]],
                | (uint((p.cg * wt + 127) / 255) << 8)
                |  uint((p.cb * wt + 127) / 255);
 }
+
+// udiv_small (the glow ramp's and the fx sprite texel's divide) against the
+// integer divide: one thread per divisor d = d0 + gid.x, every quotient up to
+// q_max, and either every remainder (r_all) or the four where a float
+// estimate of n / d lands nearest the next quotient or the last: 0, 1, d - 2
+// and d - 1. Each thread writes how many cases disagreed and the first n.
+struct UdivParityParams { uint d0, q_max, r_all; };
+
+kernel void k_udiv_parity(constant UdivParityParams& p [[buffer(0)]],
+                          device uint* out_bad [[buffer(1)]],
+                          device uint* out_first [[buffer(2)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    uint d = p.d0 + gid.x;
+    uint bad = 0u;
+    uint first = 0xFFFFFFFFu;
+    for (uint q = 0u; q <= p.q_max; ++q) {
+        uint base = q * d;
+        uint edge[4] = { 0u, min(1u, d - 1u), d - min(2u, d), d - 1u };
+        uint count = p.r_all != 0u ? d : 4u;
+        for (uint k = 0u; k < count; ++k) {
+            uint n = base + (p.r_all != 0u ? k : edge[k]);
+            if (udiv_small(n, d) != n / d) {
+                first = bad == 0u ? n : first;
+                bad += 1u;
+            }
+        }
+    }
+    out_bad[gid.x] = bad;
+    out_first[gid.x] = first;
+}

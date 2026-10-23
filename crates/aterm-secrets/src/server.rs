@@ -302,6 +302,10 @@ struct Tuning {
     is_local: fn(IpAddr, Option<IpAddr>) -> bool,
     /// The keys no PUT is taken signed by, and the key a held signer among them gives way to.
     retired: fn() -> envelope::Retired,
+    /// Run by a PUT between its first judgment and the publish lock: the vault's store file
+    /// and the PUT's seq.
+    #[cfg(test)]
+    before_lock: fn(&Path, u64),
 }
 
 impl Default for Tuning {
@@ -318,6 +322,8 @@ impl Default for Tuning {
             now,
             is_local: this_machine,
             retired: envelope::Retired::compiled,
+            #[cfg(test)]
+            before_lock: |_, _| {},
         }
     }
 }
@@ -1367,6 +1373,7 @@ fn get_vault(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&str
         },
     };
     let mut state = shared.lock_server_state();
+    take_from_store(shared, &mut state, name);
     let Some(slot) = state.vaults.get(name) else {
         return Reply::text(404, format!("no vault named {name} here"));
     };
@@ -1382,6 +1389,7 @@ fn get_vault(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&str
     #[cfg(test)]
     shared.waiting.fetch_add(1, Ordering::SeqCst);
     loop {
+        take_from_store(shared, &mut state, name);
         let newer = state
             .vaults
             .get(name)
@@ -1458,45 +1466,54 @@ fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
         return Reply::text(403, e.0);
     }
     let mut state = shared.lock_server_state();
-    let mut pin = envelope::Pin::Same;
-    match state.vaults.get(name) {
-        Some(slot) => {
-            let held = &slot.held;
-            let followed: Vec<[u8; 32]> = held.handoff.iter().map(|(key, _)| *key).collect();
-            pin = match envelope.check_pin_with(&held.signer, &followed, &shared.retired) {
-                Ok(pin) => pin,
-                Err(e) => return Reply::text(403, e.0),
-            };
-            if !matches!(pin, envelope::Pin::Replaced(_)) {
-                if envelope.seq <= held.seq {
-                    if envelope.seq == held.seq && held.bytes.as_slice() == body {
-                        return Reply::empty(204);
-                    }
-                    return Reply::text(
-                        409,
-                        format!(
-                            "seq {} is not newer than seq {}, which this server holds",
-                            envelope.seq, held.seq
-                        ),
-                    );
-                }
-                if let Err(e) = envelope.check_extends(&held.signer, &held.handoff) {
-                    return Reply::text(403, e.0);
-                }
-            }
-        }
-        None => {
-            if let Some((_, configured)) = shared.pins.iter().find(|(pinned, _)| pinned == name) {
-                pin = match envelope.check_pin_with(configured, &[], &shared.retired) {
-                    Ok(pin) => pin,
-                    Err(e) => return Reply::text(403, e.0),
-                };
-            }
-            if let Some(reply) = refuse_unheld(shared, &state, name, local) {
-                return reply;
-            }
-        }
+    // Judged before the publish lock is taken, so a PUT this server refuses never holds it
+    // against one it would take.
+    match admit(shared, &mut state, name, &envelope, body, local) {
+        Ok(Some(_)) => {}
+        Ok(None) => return Reply::empty(204),
+        Err(reply) => return reply,
     }
+    #[cfg(test)]
+    (shared.tuning.before_lock)(&shared.vault_path(name), envelope.seq);
+    // Held from here to the rename, as a publish at the store path holds it, so neither
+    // writer renames over a version the other just wrote; judged again under it, since such
+    // a publish may have landed since.
+    #[cfg(unix)]
+    let _publishing =
+        match crate::transport::PublishLock::take_clearing_dead(&shared.vault_path(name)) {
+            Ok(lock) => lock,
+            // Only a sender of a version the server would take gets here (an admin, or a
+            // machine putting its copy back), so the lock is named to it, by its name in the
+            // store, which a client's 200-character quote keeps; the log has the whole path.
+            Err(crate::transport::NotTaken::Held { lock, holder }) => {
+                let held_by = crate::transport::held_by(&holder);
+                note(&format!(
+                    "{name}: refused seq {}: {} is held{held_by}",
+                    envelope.seq,
+                    lock.display()
+                ));
+                let file = lock.file_name().unwrap_or_default().to_string_lossy();
+                return Reply::text(
+                    409,
+                    format!(
+                        "a publish holds {file} in the server's store; if none is running there, \
+                         remove it and publish again{held_by}"
+                    ),
+                );
+            }
+            Err(crate::transport::NotTaken::Failed(e)) => {
+                note(&format!(
+                    "{name}: could not store seq {}: {e}",
+                    envelope.seq
+                ));
+                return Reply::text(500, "the server could not store the envelope");
+            }
+        };
+    let pin = match admit(shared, &mut state, name, &envelope, body, local) {
+        Ok(Some(pin)) => pin,
+        Ok(None) => return Reply::empty(204),
+        Err(reply) => return reply,
+    };
     if let Err(e) = fsx::write_atomic(&shared.vault_path(name), body, 0o600) {
         note(&format!(
             "{name}: could not store seq {}: {e}",
@@ -1535,6 +1552,107 @@ fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
         }
     ));
     Reply::empty(204)
+}
+
+/// Judge a PUT of `envelope` (its bytes `body`) against what the server holds, after the store
+/// file's newer version ([`take_from_store`]): the pin it is taken under, `None` when it is the
+/// version held, or the refusal.
+fn admit(
+    shared: &Shared,
+    state: &mut State,
+    name: &str,
+    envelope: &envelope::Envelope,
+    body: &[u8],
+    local: bool,
+) -> Result<Option<envelope::Pin>, Reply> {
+    take_from_store(shared, state, name);
+    if let Some(slot) = state.vaults.get(name) {
+        return takes_over(envelope, body, &slot.held, &shared.retired);
+    }
+    let mut pin = envelope::Pin::Same;
+    if let Some((_, configured)) = shared.pins.iter().find(|(pinned, _)| pinned == name) {
+        pin = envelope
+            .check_pin_with(configured, &[], &shared.retired)
+            .map_err(|e| Reply::text(403, e.0))?;
+    }
+    match refuse_unheld(shared, state, name, local) {
+        Some(reply) => Err(reply),
+        None => Ok(Some(pin)),
+    }
+}
+
+/// Whether `envelope` (its bytes `body`) takes over `held`: the rule a PUT and a version at the
+/// store file keep alike. The pin it is taken under, `None` when it is `held`, or the refusal.
+fn takes_over(
+    envelope: &envelope::Envelope,
+    body: &[u8],
+    held: &Held,
+    retired: &envelope::Retired,
+) -> Result<Option<envelope::Pin>, Reply> {
+    let followed: Vec<[u8; 32]> = held.handoff.iter().map(|(key, _)| *key).collect();
+    let pin = envelope
+        .check_pin_with(&held.signer, &followed, retired)
+        .map_err(|e| Reply::text(403, e.0))?;
+    if !matches!(pin, envelope::Pin::Replaced(_)) {
+        if envelope.seq <= held.seq {
+            if envelope.seq == held.seq && held.bytes.as_slice() == body {
+                return Ok(None);
+            }
+            return Err(Reply::text(
+                409,
+                format!(
+                    "seq {} is not newer than seq {}, which this server holds",
+                    envelope.seq, held.seq
+                ),
+            ));
+        }
+        envelope
+            .check_extends(&held.signer, &held.handoff)
+            .map_err(|e| Reply::text(403, e.0))?;
+    }
+    Ok(Some(pin))
+}
+
+/// Hold a newer version an admin published at the vault's store file itself (an admin whose
+/// vault is that path), read again at each read of the vault, each slice of a held long-poll
+/// and each PUT: the server reads its store at launch,
+/// and without this would serve the version before and write the next publish built on it
+/// over the path's, a revoke included. A version there is held only as a PUT of it would be
+/// ([`takes_over`]); any other file changes nothing.
+fn take_from_store(shared: &Shared, state: &mut State, name: &str) {
+    let Some(slot) = state.vaults.get_mut(name) else {
+        return;
+    };
+    let Ok(Some(bytes)) = fsx::read_owned(&shared.vault_path(name), MAX_ENVELOPE) else {
+        return;
+    };
+    if bytes.as_slice() == slot.held.bytes.as_slice() {
+        return;
+    }
+    let Ok(envelope) = envelope::parse(&bytes) else {
+        return;
+    };
+    let publishable = envelope.name == name
+        && envelope.verify_signature().is_ok()
+        && envelope.check_signer(&shared.retired).is_ok()
+        && matches!(
+            takes_over(&envelope, &bytes, &slot.held, &shared.retired),
+            Ok(Some(_))
+        );
+    if !publishable {
+        return;
+    }
+    note(&format!(
+        "{name}: holds seq {}, which an admin published at the store file",
+        envelope.seq
+    ));
+    slot.held = Held {
+        seq: envelope.seq,
+        signer: envelope.signer,
+        handoff: envelope.handoff.clone(),
+        bytes: Arc::new(bytes),
+    };
+    slot.wake.notify_all();
 }
 
 fn post_join(shared: &Shared, name: &str, body: &[u8], peer: IpAddr) -> Reply {
@@ -3509,6 +3627,163 @@ mod tests {
         let error = transport::publish(&other, &envelope_with(&OLD, 1, Vec::new(), "other"))
             .expect_err("unpinned");
         assert!(error.0.contains("403"), "{error}");
+        running.stop();
+    }
+
+    /// An admin whose vault is the store file itself publishes there: the server answers that
+    /// version from its next request on (a read, or a long-poll it holds), and refuses a
+    /// publish built on the copy it held before as not newer, not writing it over the path's;
+    /// a file holding an older version, or one another key signed, changes nothing.
+    #[test]
+    fn a_version_published_at_the_store_file_is_served_and_kept() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let tuning = Tuning {
+            liveness_every: Duration::from_millis(10),
+            ..Tuning::default()
+        };
+        let running = run_tuned(&options(&store, HANG_DETECTOR), tuning);
+        put(&running, &envelope(&OLD, 1)).expect("first");
+        let at_path = Source::Path(store.join("alab.vault"));
+        transport::publish(&at_path, &envelope(&OLD, 2)).expect("at the path");
+        let stale = sign(
+            &Unsigned {
+                time: 1,
+                ..unsigned(2, Vec::new(), "alab")
+            },
+            &OLD,
+        )
+        .expect("signed");
+        let error = put(&running, &stale).expect_err("built on seq 1");
+        assert!(error.0.contains("409"), "{error}");
+        assert!(
+            stored(&store) == Some(envelope(&OLD, 2)),
+            "the path's stays"
+        );
+        let served = |running: &Running| match get(running).expect("read") {
+            Fetched::Body(body) => body,
+            other => panic!("{other:?}"),
+        };
+        transport::publish(&at_path, &envelope(&OLD, 3)).expect("at the path again");
+        assert!(served(&running) == envelope(&OLD, 3), "the path's version");
+
+        let polled = source(&running);
+        let waiter = std::thread::spawn(move || transport::fetch(&polled, Some(3), HANG_DETECTOR));
+        until_waiting(&running, 1);
+        transport::publish(&at_path, &envelope(&OLD, 4)).expect("at the path a third time");
+        let woke = waiter.join().expect("joined").expect("held");
+        assert!(
+            matches!(&woke, Fetched::Body(body) if *body == envelope(&OLD, 4)),
+            "the held long-poll answers the path's next version"
+        );
+
+        // A chain naming the held key with no endorsement of it: a PUT's 403.
+        let old = signer_public(&OLD).expect("public");
+        let forged = crate::envelope::sign_unchecked(
+            &unsigned(5, vec![(old, [0u8; 64])], "alab"),
+            &STRANGER,
+        )
+        .expect("signed");
+        // The held key's own version with a byte of what it signed changed, and one of
+        // another vault.
+        let altered = String::from_utf8(envelope(&OLD, 5))
+            .expect("text")
+            .replacen("time: 1792530005\n", "time: 1792530006\n", 1)
+            .into_bytes();
+        let parsed = crate::envelope::parse(&altered).expect("parses");
+        assert!(parsed.verify_signature().is_err(), "altered");
+        let other_vault = envelope_with(&OLD, 5, Vec::new(), "other");
+        for other in [
+            forged,
+            altered,
+            other_vault,
+            envelope(&STRANGER, 5),
+            envelope(&OLD, 1),
+        ] {
+            std::fs::write(store.join("alab.vault"), &other).expect("written");
+            assert!(served(&running) == envelope(&OLD, 4), "nothing changes");
+        }
+        running.stop();
+    }
+
+    /// A publish at the store path that lands between a PUT's judgment and its lock.
+    fn publish_seq_3_at(path: &Path, seq: u64) {
+        if seq == 3 {
+            transport::publish(&Source::Path(path.to_owned()), &envelope(&OLD, 3))
+                .expect("at the path");
+        }
+    }
+
+    #[test]
+    fn a_put_is_judged_again_under_the_publish_lock() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let tuning = Tuning {
+            before_lock: publish_seq_3_at,
+            ..Tuning::default()
+        };
+        let running = run_tuned(&options(&store, HANG_DETECTOR), tuning);
+        put(&running, &envelope(&OLD, 1)).expect("first");
+        put(&running, &envelope(&OLD, 2)).expect("second");
+        let racing = sign(
+            &Unsigned {
+                time: 1,
+                ..unsigned(3, Vec::new(), "alab")
+            },
+            &OLD,
+        )
+        .expect("signed");
+        let error = put(&running, &racing).expect_err("the path's seq 3 came first");
+        assert!(error.0.contains("409"), "{error}");
+        assert!(
+            stored(&store) == Some(envelope(&OLD, 3)),
+            "the path's stays"
+        );
+        assert!(
+            get(&running).expect("read") == Fetched::Body(envelope(&OLD, 3)),
+            "and is served"
+        );
+        running.stop();
+    }
+
+    #[test]
+    fn a_put_is_refused_while_a_publish_holds_the_lock_and_clears_a_lock_its_dead_holder_left() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let running = run(&options(&store, HANG_DETECTOR));
+        put(&running, &envelope(&OLD, 1)).expect("first");
+        let lock = store.join("alab.vault.lock");
+        let host = aterm_uds::process::host_name().expect("a host name");
+        // This test's own process: a holder that runs.
+        std::fs::write(&lock, format!("{host} {}\n", std::process::id())).expect("locked");
+        let error = put(&running, &envelope(&OLD, 2)).expect_err("a publish runs");
+        assert!(
+            error.0.contains("409")
+                && error.0.contains(&format!(
+                    "a publish holds alab.vault.lock in the server's store; if none is running \
+                     there, remove it and publish again ({host} {})",
+                    std::process::id()
+                )),
+            "within what a client quotes: {error}"
+        );
+        let error = put(&running, &envelope(&STRANGER, 2)).expect_err("a stranger");
+        assert!(
+            error.0.contains("403") && !error.0.contains("lock"),
+            "judged before the lock: {error}"
+        );
+        assert!(stored(&store) == Some(envelope(&OLD, 1)), "unchanged");
+
+        // No process has pid i32::MAX; a lock naming another machine is never cleared.
+        for (holder, cleared) in [
+            (format!("elsewhere.invalid {}", i32::MAX), false),
+            (format!("{host} {}", i32::MAX), true),
+        ] {
+            std::fs::write(&lock, format!("{holder}\n")).expect("locked");
+            let taken = put(&running, &envelope(&OLD, 2));
+            assert_eq!(taken.is_ok(), cleared, "{holder}: {taken:?}");
+        }
+        assert!(stored(&store) == Some(envelope(&OLD, 2)), "taken");
+        assert!(!lock.exists(), "a PUT leaves no lock");
         running.stop();
     }
 

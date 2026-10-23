@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! THE HAND-WRITTEN SIBLING-BODY GATE.
-//!
-//! The C macros and `siginfo_t` accessors are the shim's only Rust bodies, and
-//! the generator emits one text per OS family. Each same-OS pair of cells must
-//! therefore carry a byte-identical body section. This is text, so it covers all
-//! four declaration cells on every box: it binds a cell no box hosts to the body
-//! its native sibling executes. It does not decide that cell.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -16,9 +10,7 @@ use std::path::Path;
 
 use crate::cells::{self, Os};
 
-/// Where a cell source's hand-written section starts: the first line of code
-/// the generator writes there (`regen::shim::bodies` writes it from this), never
-/// a comment, so pruning a cell source's comments cannot undefine the section.
+/// Where a cell source's hand-written section starts.
 pub const BODY_MARKER: &str = "type fd_word = ";
 
 /// A sibling-body defect.
@@ -71,7 +63,6 @@ impl fmt::Display for SiblingFinding {
 }
 
 /// The marker and everything after it, or how many markers there were.
-///
 /// # Errors
 /// The marker count, when it is not exactly one.
 pub fn body_section(source: &str) -> Result<&str, usize> {
@@ -82,8 +73,7 @@ pub fn body_section(source: &str) -> Result<&str, usize> {
     }
 }
 
-/// Every sibling finding over `sources` (cell source file name -> text). A cell
-/// absent from `sources` is a marker finding with a count of zero.
+/// Every sibling finding over `sources` (cell source file name -> text).
 #[must_use]
 pub fn compare(sources: &BTreeMap<&str, String>) -> Vec<SiblingFinding> {
     let section = |file: &str| -> Result<&str, SiblingFinding> {
@@ -124,7 +114,6 @@ pub fn compare(sources: &BTreeMap<&str, String>) -> Vec<SiblingFinding> {
 }
 
 /// Every cell source under `src` (`crates/aterm-libc/src`), by file name.
-///
 /// # Errors
 /// When a source cannot be read.
 pub fn read_sources(src: &Path) -> io::Result<BTreeMap<&'static str, String>> {

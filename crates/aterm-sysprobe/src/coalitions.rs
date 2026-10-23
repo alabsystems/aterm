@@ -24,7 +24,6 @@ pub const UNWRITTEN: u64 = u64::MAX;
 /// The thread QoS classes a coalition's CPU time is split by (`COALITION_NUM_THREAD_QOS_TYPES`).
 pub const QOS_CLASSES: usize = 7;
 
-/// `COALITION_TYPE_RESOURCE` (`bsd/sys/coalition.h`).
 const TYPE_RESOURCE: u32 = 0;
 
 const TASKS_STARTED: usize = 0;
@@ -161,22 +160,17 @@ mod imp {
 
     use super::{CoalitionRead, LIST_ENTRY, UNWRITTEN, USAGE_WORDS};
 
-    /// `PROC_PIDCOALITIONINFO` (`bsd/sys/proc_info.h`).
     const PROC_PIDCOALITIONINFO: c_int = 20;
-    /// `LISTCOALITIONS_SINGLE_TYPE` (`bsd/sys/proc_info.h`): the coalitions of one type.
     const LISTCOALITIONS_SINGLE_TYPE: c_int = 2;
-    /// The type listed: [`super::TYPE_RESOURCE`].
     const RESOURCE: c_int = super::TYPE_RESOURCE as c_int;
 
     unsafe extern "C" {
-        /// `int proc_listcoalitions(int flavor, int coaltype, void *buffer, int buffersize)`.
         fn proc_listcoalitions(
             flavor: c_int,
             coaltype: c_int,
             buffer: *mut c_void,
             buffersize: c_int,
         ) -> c_int;
-        /// `int coalition_info_resource_usage(uint64_t cid, void *buffer, size_t bufsize);`
         fn coalition_info_resource_usage(cid: u64, cru: *mut c_void, sz: usize) -> c_int;
     }
 
@@ -221,13 +215,11 @@ mod imp {
         Some((super::decode_list(&buf[..n]), n))
     }
 
-    /// The resource list, and whether it filled its buffer.
     fn list() -> Option<(Vec<(u64, u32)>, bool)> {
         let room = super::list_room(i64::from(list_need()))?;
         list_in(room).map(|(list, wrote)| (list, wrote >= room * LIST_ENTRY))
     }
 
-    /// Coalition `id`'s raw usage record, each word the kernel did not write still [`UNWRITTEN`].
     fn raw_usage(id: u64) -> Option<[u64; USAGE_WORDS]> {
         let mut raw = [UNWRITTEN; USAGE_WORDS];
         // SAFETY: `raw` is writable for the size passed, and the kernel copies no more than that.

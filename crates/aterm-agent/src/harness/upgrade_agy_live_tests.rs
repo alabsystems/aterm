@@ -27,8 +27,7 @@ fn row(kind: &str, status: &str, at: &str, content: &str) -> String {
     )
 }
 
-/// A planner row calling `name` with `args`, each value JSON-in-a-string as
-/// agy keeps it.
+/// Planner row calling `name` with string-encoded JSON `args`.
 fn call(name: &str, args: &[(&str, &str)], at: &str) -> String {
     let args: Vec<String> = args
         .iter()
@@ -129,12 +128,6 @@ fn read_from() -> u64 {
     START_MS / 1000 - START_SLACK_S
 }
 
-/// G-A2(b), TASKS: a command task, a timer and a daemon task whose `RUNNING`
-/// row stands with no end hold the restart; each one's end row — the
-/// `SYSTEM_MESSAGE` its `sender=` names, or a `manage_task` kill's `Task
-/// "<id>" cancelled.` — ends it. NEGATIVE CONTROLS: another task's end ends
-/// nothing, and a LOW message of the cancelled task arriving later is no new
-/// task.
 #[test]
 fn a_background_task_holds_the_restart_until_its_end_row() {
     let running = log(&[turn(AT), task_started(4, "sleep 150; echo LAB-BG-DONE", AT)]);
@@ -191,11 +184,6 @@ fn a_background_task_holds_the_restart_until_its_end_row() {
     assert_eq!(open_work(&cancelled, read_from()), Ok(()));
 }
 
-/// A CRON runs on across its firings (each a `sender=` row, `(iteration N)`):
-/// with no `MaxIterations` it is never ended by one; with `MaxIterations` it
-/// is ended by that many; and a `manage_task` kill ends it whatever. Its
-/// schedule call is matched to its task by expression and prompt. NEGATIVE
-/// CONTROL: a timer's firing ends it at once.
 #[test]
 fn a_cron_holds_the_restart_until_its_last_firing() {
     let schedule = |max: Option<&str>| {
@@ -233,10 +221,6 @@ fn a_cron_holds_the_restart_until_its_last_firing() {
     );
 }
 
-/// G-A2(b), SUBAGENTS: a spawned subagent holds the restart until its `has
-/// gone idle` row, or a `manage_subagents` kill naming it (or `kill_all`)
-/// that says `Successfully killed`. NEGATIVE CONTROLS: a kill of another, a
-/// kill with no result row, and an idle row of another end nothing.
 #[test]
 fn a_subagent_holds_the_restart_until_idle_or_killed() {
     let spawn = spawned(SUB, AT);
@@ -282,11 +266,6 @@ fn a_subagent_holds_the_restart_until_idle_or_killed() {
     assert_eq!(open_work(&all, read_from()), Ok(()));
 }
 
-/// THE WINDOW: rows of an earlier process (a task its SIGTERM killed keeps
-/// its `RUNNING` row with no end, measured) are not this one's; a row inside
-/// the slack is. A torn line and a row with no time fail closed; no start
-/// read proves nothing, nor does a tail that does not reach back to the
-/// start.
 #[test]
 fn the_transcript_window_is_this_process_and_fails_closed() {
     let killed_before = log(&[
@@ -314,13 +293,6 @@ fn the_transcript_window_is_this_process_and_fails_closed() {
     assert_eq!(quiet_transcript(&reaches, true, START_MS), Ok(()));
 }
 
-/// G-A1 AND G-A2(c), THE SUMMARY: the conversation's row idle with nothing
-/// not fully idle and its subagents' rows idle (a killed one's too) lets it
-/// go; its row `RUNNING` (a turn, and a turn's end a moment after the screen
-/// reads it over) holds it as a turn, `not_fully_idle` as background work, a
-/// subagent's row `RUNNING` as a subagent. NEGATIVE CONTROLS: no row of its
-/// own proves nothing, and an answer of another shape, a row of another
-/// conversation or a flag of another spelling is no answer.
 #[test]
 fn the_summary_row_reads_the_turn_and_the_work() {
     let rows = |lines: &[&str]| summary_rows(CONV, &lines.join("\n"));
@@ -356,13 +328,6 @@ fn the_summary_row_reads_the_turn_and_the_work() {
     );
 }
 
-/// G-A2(e), THE WAKES: a waking message (HIGH, or a priority not known)
-/// `read.json` does not mark read holds the restart, and so does one marked
-/// read within the settle of its writing; a LOW one never (a cancelled
-/// task's end and the restart notice wait for the person's next message:
-/// measured, unread for good). NEGATIVE CONTROLS: an old message marked read
-/// holds nothing; a message or `read.json` that does not parse is no
-/// answer.
 #[test]
 fn a_waking_message_unread_or_just_written_holds_the_restart() {
     let now = 1_792_349_400_000;
@@ -399,8 +364,6 @@ fn a_waking_message_unread_or_just_written_holds_the_restart() {
     assert_eq!(wakes(Some("{"), &[old_high], now), Err(Unreadable));
 }
 
-/// THE ORDER: a newer `x.y.z` build moves, the same or an older never, nor
-/// across grammars; a record whose directory is another build is no version.
 #[test]
 fn the_order_reads_atpkgs_plain_versions() {
     assert!(moves_onto("1.4.0", "1.4.1"));
@@ -413,8 +376,6 @@ fn the_order_reads_atpkgs_plain_versions() {
     assert!(build_version("1.4.1", Some("1000001000004000000")).is_none());
 }
 
-/// THE GATE'S ORDER, one word each, and `Ok` only where every witness says
-/// the agy is idle with nothing running.
 #[test]
 fn the_gate_names_the_first_thing_that_holds_it() {
     let open = Look {
@@ -525,15 +486,6 @@ fn the_gate_names_the_first_thing_that_holds_it() {
     }
 }
 
-/// G-A4, A LAUNCH THAT SET ITS OWN ENVIRONMENT: a variable assigned ahead of
-/// agy on its own line (quoted, behind a `cd … &&`, through `env`, by a
-/// path, or out of a `$(…)`, `${…}` or backtick substitution), or an `env`
-/// that unsets one, is named — the relaunch line would lose it. NEGATIVE
-/// CONTROLS: a bare launch, the managed twin by its path, `HOME` alone (the
-/// relaunch carries it, so the line a restart typed is never refused next
-/// time), an `export` of its own command, a variable set for another command
-/// of the line, `env` (or `env --`) with nothing changed, a quoted separator
-/// kept in its word, and a line naming no agy.
 #[test]
 fn a_launch_that_set_its_own_environment_is_named() {
     for (line, want) in [

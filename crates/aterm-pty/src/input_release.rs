@@ -36,8 +36,7 @@ pub(crate) struct Registry<T> {
     writers: Mutex<Writers<T>>,
 }
 
-/// Remove a writer before its borrowed flags or thread handle can expire,
-/// including when the write callback unwinds.
+/// Removes a writer on drop, including when the write callback unwinds.
 struct Writing<'a, T: Blocked> {
     registry: &'a Registry<T>,
     id: u64,
@@ -49,8 +48,7 @@ impl<T: Blocked> Drop for Writing<'_, T> {
     }
 }
 
-/// A stop flag's identity in the registry: its address, live for as long as
-/// any write tagged with it (the write borrows the flag).
+/// A stop flag's address in the registry, live for as long as any write borrowing it.
 fn stop_tag(stop: &AtomicBool) -> usize {
     std::ptr::from_ref(stop) as usize
 }
@@ -158,7 +156,6 @@ mod tests {
     use std::sync::{Arc, Condvar};
     use std::thread;
 
-    /// The hang detector for a release that must happen.
     const HANG: Duration = Duration::from_secs(60);
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,9 +168,7 @@ mod tests {
         Cancelled,
     }
 
-    /// A stand-in for a writer thread: its "write" blocks until a cancel, and
-    /// a cancel succeeds only while it is blocked, as `CancelSynchronousIo`
-    /// does.
+    /// Writer thread stand-in whose write blocks until cancelled while inside it.
     #[derive(Clone)]
     struct Stand(Arc<StandState>);
 
@@ -193,7 +188,6 @@ mod tests {
             }))
         }
 
-        /// The blocking write: in until a cancel; answers 0, nothing written.
         fn block(&self) -> io::Result<usize> {
             let mut p = self.0.phase.lock_or_recover();
             *p = Phase::In;
@@ -262,9 +256,7 @@ mod tests {
         (stand, writer)
     }
 
-    /// A STOP RELEASES THE WRITE IT TAGS, AND ONLY THAT ONE. Two pastes block
-    /// in their writes on one session; stopping the first releases it, with
-    /// nothing written, and leaves the second blocked until its own stop.
+    /// Stopping a tag releases only the write tagged with it.
     #[test]
     fn a_stop_releases_only_the_write_it_tags() {
         let registry = Arc::new(Registry::new());
@@ -291,10 +283,7 @@ mod tests {
         assert_eq!(b_writer.join().expect("writer").expect("write"), 0);
     }
 
-    /// A SEVER RELEASES EVERY WRITE OF ITS SESSION AND BARS THE NEXT. Two
-    /// writes block on session 1 and one on session 2; the sever of session 1
-    /// releases both of its own, leaves session 2's, and a write that begins
-    /// on session 1 afterwards never reaches its call.
+    /// Severing a session releases all of its in-flight writes and bars subsequent ones.
     #[test]
     fn a_sever_releases_every_write_of_its_session_and_bars_later_ones() {
         let registry = Arc::new(Registry::new());
@@ -335,12 +324,7 @@ mod tests {
         assert_eq!(w3.join().expect("writer").expect("write"), 0);
     }
 
-    /// A CANCEL THAT COMES BEFORE THE WRITE IS BLOCKED IS TRIED AGAIN. The
-    /// writer has read its flags (clear) and is between that look and its
-    /// write when the stop comes: the first cancel finds nothing to cancel,
-    /// and the release keeps trying until the write it would have missed is
-    /// blocked, then cancels it. RED with one round instead of the retry: the
-    /// write blocks until the hang detector.
+    /// A cancel arriving between the flag check and the blocking write retries until it lands.
     #[test]
     fn a_cancel_that_comes_before_the_write_is_blocked_is_tried_again() {
         let registry = Arc::new(Registry::new());
@@ -408,10 +392,7 @@ mod tests {
         assert_eq!(writer.join().expect("writer").expect("write"), 0);
     }
 
-    /// A WRITE THAT REGISTERS AFTER ITS STOP WRITES NOTHING: the canceller
-    /// found no writer to cancel, so the writer's own look at its flags is
-    /// what keeps it out of a write nothing would release. RED without the
-    /// look: the write is made.
+    /// A writer registering after its stop flag is set exits without calling `write`.
     #[test]
     fn a_write_that_registers_after_its_stop_writes_nothing() {
         let registry: Registry<Stand> = Registry::new();
@@ -431,9 +412,7 @@ mod tests {
         assert_eq!(wrote.expect("write"), 3);
     }
 
-    /// A WRITER THAT LEFT IS NEVER CANCELLED: a release of a write that
-    /// already ended finds it gone and cancels nothing, so no later write of
-    /// that thread can be hit.
+    /// Releasing an already-completed or unwound write issues no cancel to its thread.
     #[test]
     fn a_writer_that_left_is_never_cancelled() {
         let registry: Registry<Stand> = Registry::new();

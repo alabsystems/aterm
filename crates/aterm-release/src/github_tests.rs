@@ -12,8 +12,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 const SLUG: &str = "fixture-rel/aterm";
 const LOGIN: &str = "fixture-rel-bot";
 
-/// One curl the lane started, as a process listing and its environment would show it, and
-/// what it was given on stdin.
+/// One curl the lane started.
 #[derive(Clone, Debug)]
 struct Spawned {
     program: String,
@@ -22,8 +21,7 @@ struct Spawned {
     stdin: Option<Vec<u8>>,
 }
 
-/// A [`Spawn`] that records each child, then (with `env`, to play a hostile environment)
-/// starts it as [`Direct`] does.
+/// A [`Spawn`] that records each child.
 #[derive(Default)]
 struct Recorder {
     spawned: Mutex<Vec<Spawned>>,
@@ -59,8 +57,6 @@ impl Spawn for Recorder {
     }
 }
 
-/// Where `secret` shows in what a process listing or an environment read would show: each
-/// argument and each environment value holding it.
 fn exposed(spawned: &Spawned, secret: &str) -> Vec<String> {
     let mut found: Vec<String> = spawned
         .args
@@ -78,8 +74,6 @@ fn exposed(spawned: &Spawned, secret: &str) -> Vec<String> {
     found
 }
 
-/// agh-fake with `LOGIN` holding push on the public `SLUG`, its token, and this thread's
-/// GitHub routed to it as that token (or anonymously) through `recorder`.
 struct World {
     fake: FakeGithub,
     secret: String,
@@ -112,7 +106,6 @@ fn scratch() -> aterm_tempfile::TempDir {
     aterm_tempfile::TempDir::new().unwrap()
 }
 
-/// The release-create POST for `tag`, sent once.
 fn create_draft(tag: &str) -> RunOut {
     let payload =
         aterm_json::to_vec(&aterm_json::json!({"tag_name": tag, "name": tag, "draft": true}))
@@ -121,7 +114,6 @@ fn create_draft(tag: &str) -> RunOut {
     run_once(prepare(OneShotUrl::Api(&path), Body::Json(&payload)).unwrap()).unwrap()
 }
 
-/// The asset upload POST of `file` as `name` onto release `id`, sent once.
 fn upload(id: u64, name: &str, file: &std::path::Path) -> RunOut {
     let path = format!("repos/{SLUG}/releases/{id}/assets?name={name}");
     run_once(prepare(OneShotUrl::Uploads(&path), Body::File(file)).unwrap()).unwrap()
@@ -413,9 +405,6 @@ fn rows_are_jqs_tsv() {
     assert_eq!(tostring(&aterm_json::json!("s")), aterm_json::json!("s"));
 }
 
-/// A [`crate::site::Launch`] that starts each child as it is and counts it. With `trip`, an
-/// interrupt (SIGTERM) arrives while the first one runs, after which, as under the release,
-/// nothing more starts.
 struct Tripwire {
     trip: bool,
     started: Arc<AtomicU32>,
@@ -496,18 +485,14 @@ fn a_launched_read_starts_each_curl_through_the_launch_and_none_once_interrupted
     );
 }
 
-/// The probe mode of [`a_real_sigterm_reaches_a_post_cut_reads_curl_and_nothing_more_is_asked`]:
-/// set (to a scratch directory), the test is the release itself (its own process, its own
-/// signal handlers).
+/// The probe mode of [`a_real_sigterm_reaches_a_post_cut_reads_curl_and_nothing_more_is_asked`].
 #[cfg(unix)]
 const SIGTERM_PROBE: &str = "ATERM_RELEASE_GITHUB_SIGTERM_PROBE";
 /// The probe's lane: `launched` (the release's `StepChildren`) or `direct` (the client's own).
 #[cfg(unix)]
 const SIGTERM_LANE: &str = "ATERM_RELEASE_GITHUB_SIGTERM_LANE";
 
-/// The probe: the release's handlers installed, one read of a release that agh-fake holds
-/// unanswered, `armed` written in `dir` once the fake has the request; then what was asked and
-/// how the read ended, on stdout.
+/// The probe.
 #[cfg(unix)]
 fn sigterm_probe(dir: &std::path::Path, launched: bool) -> ! {
     use std::time::{Duration, Instant};
@@ -547,8 +532,6 @@ fn sigterm_probe(dir: &std::path::Path, launched: bool) -> ! {
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            // The client's own curl takes no signal (the lane's point): once the release has
-            // the SIGTERM, the read ends as the hang running out would end it.
             while !launched && Instant::now() < bound {
                 if crate::interrupt::caught().is_some() {
                     fake.end_hangs();
@@ -567,9 +550,7 @@ fn sigterm_probe(dir: &std::path::Path, launched: bool) -> ! {
     std::process::exit(0);
 }
 
-/// A REAL INTERRUPT OF A POST-CUT READ. The release (this test binary re-run as the probe)
-/// reads through the release's child rules (`StepChildren`): a SIGTERM sent to the RELEASE
-/// alone is handed to the curl, which leads a session of its own, and nothing more is asked.
+/// A REAL INTERRUPT OF A POST-CUT READ.
 #[cfg(unix)]
 #[test]
 fn a_real_sigterm_reaches_a_post_cut_reads_curl_and_nothing_more_is_asked() {

@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::process::ExitCode;
 
 use crate::launchd::Startup;
-use crate::model::Mode;
+use crate::model::{Clocks, Mode};
 
 /// The usage text.
 pub const USAGE: &str = "\
@@ -147,19 +147,19 @@ pub fn usage_error(why: &str) -> String {
 /// What every command but help says off macOS.
 pub const MACOS_ONLY: &str = "aterm caffeine: macOS only";
 
-/// When `mode` ends, as `status` and `on` print it at `now`: `forever`, the deadline in Unix seconds, or `-` when off.
+/// When `mode` ends, as `status` and `on` print it at `now`: `forever`, the deadline in Unix seconds as the wall clock reads now ([`Clocks::wall_at`]), or `-` when off.
 #[must_use]
-pub fn until_word(mode: Mode, now: u64) -> String {
+pub fn until_word(mode: Mode, now: Clocks) -> String {
     match mode.settled(now) {
         Mode::Off => "-".to_string(),
         Mode::Forever => "forever".to_string(),
-        Mode::Until { deadline, .. } => deadline.to_string(),
+        Mode::Until { deadline, .. } => now.wall_at(deadline).to_string(),
     }
 }
 
 /// `on`'s asynchronous acknowledgment: the request is saved and a mug was found or its start requested, not proof that its activity has begun.
 #[must_use]
-pub fn on_line(mode: Mode, now: u64) -> String {
+pub fn on_line(mode: Mode, now: Clocks) -> String {
     format!("caffeine=requested until={}\n", until_word(mode, now))
 }
 
@@ -167,7 +167,7 @@ pub fn on_line(mode: Mode, now: u64) -> String {
 #[must_use]
 pub fn status_text(
     mode: Mode,
-    now: u64,
+    now: Clocks,
     menu_pid: Option<u32>,
     startup: Startup,
     label: &str,
@@ -256,7 +256,7 @@ mod mac {
     use crate::code;
     use crate::instance::{self, Instance};
     use crate::launchd::{self, JobState, Started};
-    use crate::model::Mode;
+    use crate::model::{Clocks, Mode};
     use crate::paths::Paths;
     use crate::state;
 
@@ -274,9 +274,11 @@ mod mac {
         aterm_uds::stdout::answer_exit(VERB, text, 0)
     }
 
-    /// The wall clock, in whole seconds.
-    fn now() -> Result<u64, String> {
-        aterm_time::unix_secs().ok_or_else(|| "the clock reads before 1970".to_string())
+    /// Both clocks, read now ([`state::clocks`]).
+    fn now() -> Result<Clocks, String> {
+        state::clocks().ok_or_else(|| {
+            "the clock reads before 1970, or the time since boot cannot be read".to_string()
+        })
     }
 
     /// Where a verb acts: the mug's files, this executable (canonical), and its job's label.
@@ -348,7 +350,7 @@ mod mac {
     }
 
     /// [`here`] and [`now`].
-    fn here_now() -> Result<(Here, u64), String> {
+    fn here_now() -> Result<(Here, Clocks), String> {
         Ok((here()?, now()?))
     }
 
@@ -940,9 +942,13 @@ mod tests {
         assert!(line.contains("aterm caffeine --help"), "{line}");
     }
 
+    const NOW: Clocks = Clocks {
+        since_boot: 300_000,
+        wall: 1_790_000_000,
+    };
+
     #[test]
     fn status_says_the_mode_the_mug_startup_and_label() {
-        const NOW: u64 = 1_790_000_000;
         assert_eq!(
             status_text(Mode::Off, NOW, None, Startup::Off, "l.x"),
             "caffeine=off\nuntil=-\nmenu=stopped\nstartup=off\nlabel=l.x\n"
@@ -960,13 +966,33 @@ mod tests {
             status_text(timed, NOW, Some(7), Startup::Off, "l.x"),
             format!(
                 "caffeine=on\nuntil={}\nmenu=running\npid=7\nstartup=off\nlabel=l.x\n",
-                NOW + HOUR
+                NOW.wall + HOUR
             )
         );
         assert_eq!(
             status_text(timed, NOW + HOUR, Some(7), Startup::Off, "l.x"),
             "caffeine=off\nuntil=-\nmenu=running\npid=7\nstartup=off\nlabel=l.x\n"
         );
+    }
+
+    /// Ten minutes into `on 1h`, the wall clock set back or forward a day: `status` says the
+    /// span is on and ends 50 minutes from the clock as it reads now.
+    #[test]
+    fn status_says_the_end_as_the_wall_clock_reads_now() {
+        let timed = Mode::activate(Some(HOUR), NOW);
+        for wall in [NOW.wall - 24 * HOUR + 600, NOW.wall + 24 * HOUR + 600] {
+            let later = Clocks {
+                since_boot: NOW.since_boot + 600,
+                wall,
+            };
+            assert_eq!(
+                status_text(timed, later, Some(7), Startup::Off, "l.x"),
+                format!(
+                    "caffeine=on\nuntil={}\nmenu=running\npid=7\nstartup=off\nlabel=l.x\n",
+                    wall + HOUR - 600
+                )
+            );
+        }
     }
 
     #[test]
@@ -998,14 +1024,13 @@ mod tests {
 
     #[test]
     fn on_and_startup_answer_in_one_line() {
-        const NOW: u64 = 1_790_000_000;
         assert_eq!(
             on_line(Mode::Forever, NOW),
             "caffeine=requested until=forever\n"
         );
         assert_eq!(
             on_line(Mode::activate(Some(60), NOW), NOW),
-            format!("caffeine=requested until={}\n", NOW + 60)
+            format!("caffeine=requested until={}\n", NOW.wall + 60)
         );
         assert_eq!(startup_line(Startup::On), "startup=on\n");
         assert_eq!(startup_line(Startup::Off), "startup=off\n");

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The vocabulary every half shares: what a probe read, what the plan is, what happened,
-//! and the report one agent run returns. A read, a probe, an outcome and a report row are
-//! the converge engine's (`aterm_converge`), re-exported here so the families name them
-//! as before.
+//! Shared domain types for `aterm-machines` probes, host facts, and agent reports.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -36,12 +33,7 @@ pub enum PValue {
 }
 
 impl PValue {
-    /// Whether `self` (what the host holds) already satisfies `wanted`.
-    ///
-    /// Dictionaries compare as key sets. A boolean is satisfied by the integer macOS's
-    /// own readers take for it (`boolForKey:` reads `1` as true): System Settings writes
-    /// some switches as integers, and rewriting an equivalent value would report a change
-    /// that changes nothing.
+    /// Whether `self` satisfies `wanted` (comparing dicts as key sets and `0`/`1` as `bool`).
     #[must_use]
     pub fn same(&self, wanted: &Self) -> bool {
         match (self, wanted) {
@@ -77,7 +69,6 @@ impl PValue {
 }
 
 impl fmt::Display for PValue {
-    /// The one-line form reports print: TOML-like scalars, `[…]` and `{k = v, …}`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Bool(b) => write!(f, "{b}"),
@@ -169,12 +160,10 @@ pub struct HostFacts {
     pub serial: String,
     /// `hw.model`, e.g. `Mac16,1`.
     pub model: String,
-    /// The model's marketing name, `MacBook Pro`, `Mac mini`, `Virtual Machine`
-    /// (`hardware::model_name`); empty when unknown.
+    /// Marketing name (`hardware::model_name`); empty when unknown.
     #[serde(default)]
     pub model_name: String,
-    /// The chip, `Apple M4 Max`, or an Intel processor's family, `Intel Core i7`
-    /// (`sysctl -n machdep.cpu.brand_string`); empty when unknown.
+    /// Chip or processor family (`sysctl -n machdep.cpu.brand_string`); empty when unknown.
     #[serde(default)]
     pub chip: String,
     /// An Intel processor's speed, `3.1 GHz`; empty on Apple silicon and when unknown.
@@ -183,8 +172,7 @@ pub struct HostFacts {
     /// Memory in bytes (`sysctl -n hw.memsize`); 0 when unknown.
     #[serde(default)]
     pub memory_bytes: u64,
-    /// The Mac's internal disk in bytes, the whole disk as `ioreg` lists it (the largest
-    /// internal one: `hardware::internal_disk`); 0 when unknown.
+    /// Largest internal disk size in bytes (`hardware::internal_disk`), or `0` when unknown.
     #[serde(default)]
     pub disk_bytes: u64,
     /// That disk is a hard disk (`Medium Type` `Rotational`), named by its decimal size.
@@ -208,22 +196,14 @@ pub struct HostFacts {
     /// Seconds since the last keyboard or mouse input (`HIDIdleTime`); `None` unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_secs: Option<u64>,
-    /// Commands run over SSH have Full Disk Access (Remote Login's "Allow full disk
-    /// access for remote users"): the system TCC database opened for reading.
+    /// Whether SSH sessions hold Full Disk Access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_full_disk_access: Option<bool>,
-    /// Whether the process running the items holds Full Disk Access (TCC's
-    /// `kTCCServiceSystemPolicyAllFiles`, held by the app responsible for it), measured once
-    /// per run without a prompt: the runner's measurement when it gave one
-    /// ([`crate::port::System::full_disk_access`]: `aterm init`, the doctor and System
-    /// State), else this process's own open of the system TCC database
-    /// ([`crate::facts::gather`]: the agent, root's grant, never aterm's). `None`, not
-    /// measured, counts as no grant. Only a grant lets an item read or write another app's
-    /// sandbox container ([`crate::items::defaults::withheld`]).
+    /// Whether the item runner holds Full Disk Access (`kTCCServiceSystemPolicyAllFiles`),
+    /// measured without a prompt ([`crate::port::System::full_disk_access`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_disk_access: Option<bool>,
-    /// Who owns `/dev/console` (absent at the login window). An owner that could not be
-    /// named reads `(uid <n>)` or `(unknown)` (`facts::CONSOLE_UNKNOWN`), never absent.
+    /// Owner of `/dev/console` (`None` at the login window; `(uid <n>)` or `(unknown)` if unnamed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console_user: Option<String>,
     /// Local accounts with a uid ≥ 501.
@@ -236,7 +216,7 @@ pub struct HostFacts {
     pub agent_version: String,
 }
 
-/// What one agent run returns (design §9).
+/// Report returned by one agent run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostReport {
     /// [`crate::SCHEMA`].
@@ -265,7 +245,7 @@ pub struct HostReport {
 }
 
 impl HostReport {
-    /// Whether this run's exit status is nonzero (design §9).
+    /// Whether this run's exit status is nonzero.
     #[inline]
     #[must_use]
     pub fn failed(&self) -> bool {

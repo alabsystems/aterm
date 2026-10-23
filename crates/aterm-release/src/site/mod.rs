@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `ship site`: synchronizes alab.systems (`/terminal`, [`pages::linux_install_command`], `/install.sh`, `/releases`) with each release.
+//! `ship site`: synchronizes alab.systems (`/terminal`, `/install.sh`, `/releases`) on release.
 mod diff;
 pub mod engine;
 pub mod linux;
@@ -171,8 +171,7 @@ pub fn parse_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Option<
     Ok(Some(o))
 }
 
-/// This machine's site settings, `publish/site.toml` — kept in the never-exported
-/// publish/ because they are this machine's paths and accounts, not product source.
+/// Local site settings loaded from `publish/site.toml`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
@@ -228,8 +227,7 @@ pub struct Env {
     pub git_env: Vec<(String, String)>,
 }
 
-/// `publish/site.toml` under `repo`: none is no settings; one that does not parse (a
-/// typo'd key among them) is an error naming the file, never silently no settings.
+/// Loads `publish/site.toml` under `repo`, or defaults when absent.
 ///
 /// # Errors
 /// The file exists and cannot be read or parsed.
@@ -369,7 +367,7 @@ pub fn output(launch: &dyn Launch, cmd: &mut Command) -> std::io::Result<std::pr
 pub trait World {
     /// Returns the [`Launch`] implementation for child processes.
     fn launch(&self) -> Rc<dyn Launch>;
-    /// The JSON GitHub's REST API answers at `path`; with `paginate`, the whole listing as one array, read through `Link` pagination to its end.
+    /// Reads GitHub REST API JSON at `path` (following `Link` pagination when `paginate` is set).
     ///
     /// # Errors
     /// What GitHub or curl said when it could not answer, or an incomplete listing.
@@ -384,7 +382,7 @@ pub trait World {
     /// # Errors
     /// Returns an error if the fetch fails.
     fn live(&mut self, url: &str) -> Result<Vec<u8>, String>;
-    /// Builds `aterm_wasm.wasm` in `clone` for wasm32 with `pin`'s stock cargo (a STOCK EXCEPTION: Trust ships only its host std).
+    /// Builds `aterm_wasm.wasm` in `clone` for wasm32 with `pin`'s stock cargo (STOCK EXCEPTION).
     ///
     /// # Errors
     /// Returns an error for a missing tool (`wasm-opt` is asked before the build), or if the
@@ -396,7 +394,7 @@ pub trait World {
         rustflags: &[String],
         out: &mut dyn Write,
     ) -> Result<Vec<u8>, String>;
-    /// Runs the shipping `wasm-opt` pass (`aterm_verify::wasm_glue::WASM_OPT_FLAGS`) on `wasm` in place.
+    /// Runs the shipping `wasm-opt` pass (`WASM_OPT_FLAGS`) on `wasm` in place.
     ///
     /// # Errors
     /// Returns an error if `wasm-opt` fails.
@@ -551,7 +549,6 @@ fn fail<T>(kind: Refusal, msg: impl Into<String>) -> Result<T, Failure> {
     Err(refusal(kind, msg))
 }
 
-/// A refusal of `kind`, said as `why`.
 fn refusal(kind: Refusal, why: impl Into<String>) -> Failure {
     Failure::Refused {
         kind,
@@ -559,7 +556,6 @@ fn refusal(kind: Refusal, why: impl Into<String>) -> Failure {
     }
 }
 
-/// The child `child` failed, as `said`.
 fn child_failed(child: &'static str, said: impl Into<String>) -> Failure {
     Failure::Child {
         child,
@@ -1237,10 +1233,6 @@ fn steps(
     );
     planned.insert("public/install.sh", served);
 
-    // The /terminal engine — the sync's first write into the checkout, so a real run marks
-    // itself in flight first (until its commit) — is built here (engine.rs) on the wasm32
-    // pin publish/config.sh names (a STOCK EXCEPTION: Trust ships only its host std),
-    // else on rustup's stable.
     if !dry {
         std::fs::write(&in_flight, format!("{commit}\n")).map_err(|e| {
             refusal(
@@ -1890,7 +1882,6 @@ mod tests {
         assert!(parse_args(["--bogus"]).is_err());
     }
 
-    /// A local release list plans; a real run never commits or deploys from one.
     #[test]
     fn a_local_release_list_is_for_a_dry_run_only() {
         let why = parse_args(["--latest", "--releases", "/l.json"]).unwrap_err();
@@ -1901,8 +1892,6 @@ mod tests {
         assert_eq!(o.releases.as_deref(), Some(Path::new("/l.json")));
     }
 
-    /// No publish/site.toml is no settings; one that does not parse — a typo'd key — is
-    /// an error naming the file and the key, never silently "no site configured".
     #[test]
     fn a_site_toml_that_does_not_parse_is_named_never_ignored() {
         let dir = aterm_tempfile::Builder::new()
@@ -1921,7 +1910,6 @@ mod tests {
         assert!(Env::from_process(dir.path(), None).is_err());
     }
 
-    /// Scratch names never collide inside one process, however close together.
     #[test]
     fn private_dirs_are_distinct_and_private() {
         let made: Vec<PathBuf> = (0..8)

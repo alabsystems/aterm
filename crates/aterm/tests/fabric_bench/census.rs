@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE LOG HOLDS.
+//! Log record census for fabric benchmarks.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;

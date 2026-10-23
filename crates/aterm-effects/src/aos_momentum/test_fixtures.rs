@@ -5,12 +5,18 @@
 
 use std::time::Duration;
 
+use aterm_aos::contract::{Contract, Verdict};
 use aterm_aos::effects::NoEffects;
 use aterm_aos::replay::{Run, replay};
+use aterm_aos::task::state_digest;
 use aterm_render::GlowQuad;
 use aterm_time::Instant;
 
-use super::{HostMode, Hosted, MomentumCode, MomentumHost, MomentumSchema, PrebuiltMomentum};
+use super::corpus::SplitMix;
+use super::{
+    HostMode, Hosted, MOMENTUM_MAX_EVENTS, MOMENTUM_QUEUE_CAP, MomentumCode, MomentumHost,
+    MomentumSchema, NoStrandedLight, PrebuiltMomentum, Sched,
+};
 use crate::cursor_glow::Geom;
 use crate::cursor_momentum::{
     MOMENTUM_GLOW_RADIUS_CELLS, MOMENTUM_GLOW_TAU_S, MomentumGlow, MomentumGlowConfig,
@@ -76,30 +82,25 @@ pub(super) fn cfg(dark: bool) -> MomentumGlowConfig {
     }
 }
 
-/// splitmix64: deterministic, seedable, no dependency.
-pub(super) struct Rng(u64);
+/// splitmix64 over [`SplitMix`]: deterministic, seedable, no dependency.
+pub(super) struct Rng(SplitMix);
 
 impl Rng {
     pub(super) fn new(seed: u64) -> Self {
-        Rng(seed)
+        Rng(SplitMix::new(seed))
     }
 
     pub(super) fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        self.0.next_u64()
     }
 
     /// Uniform in `0..n` (`n > 0`).
     pub(super) fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
+        self.0.below(n)
     }
 
     pub(super) fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
-        let i = usize::try_from(self.below(xs.len() as u64)).unwrap_or(0);
-        xs[i]
+        self.0.pick(xs).expect("fixture: a non-empty table")
     }
 }
 
@@ -437,6 +438,38 @@ pub(super) fn run_lane(
     }
 }
 
+/// Types into `host` (attached at `t0` under a code that forgets the settle forecast) until its lane strands a lit glow; returns the host, park instant and caret.
+pub(super) fn strand(
+    mut host: MomentumHost,
+    t0: Instant,
+    dark: bool,
+) -> (MomentumHost, Instant, (u16, u16)) {
+    let c = cfg(dark);
+    let mut seen = Vec::new();
+    let (last, cell) = burst(&mut host, t0, 24, &c, &mut seen);
+    let parked = run_lane(&mut host, last, LANE, cell, &c, &mut seen);
+    assert!(
+        parked.stranded,
+        "fixture: the demonstration fault parks a hot glow"
+    );
+    assert!(host.settling(), "fixture: parked while settling");
+    assert_eq!(
+        host.next_change_deadline(parked.at, LANE),
+        None,
+        "the fault names no wake"
+    );
+    match parked.last {
+        Some(Seen::Frame { frame, out, under }) => {
+            assert!(
+                frame.hot && out.len() + under.len() > 0,
+                "fixture: light on glass"
+            );
+        }
+        _ => panic!("fixture: the lane drew"),
+    }
+    (host, parked.at, cell)
+}
+
 /// The attached task inside a host.
 pub(super) fn hosted(h: &MomentumHost) -> &Hosted {
     match &h.mode {
@@ -476,4 +509,35 @@ pub(super) fn attached(epoch: Instant, code: MomentumCode) -> MomentumHost {
     let mut h = MomentumHost::default();
     h.aos_attach(epoch, code, BUILD, 1);
     h
+}
+
+/// A host attached at `t0` running `sched` with one log epoch for a whole lane run, so its log replayed from the attach checkpoint is the whole run.
+pub(super) fn attached_for_lane(t0: Instant, sched: Sched) -> MomentumHost {
+    let mut h = MomentumHost::default();
+    h.attach_sched(t0, sched, BUILD, 1, MOMENTUM_QUEUE_CAP, MOMENTUM_MAX_EVENTS);
+    h
+}
+
+/// `NoStrandedLight`'s verdict on the host's live code replayed over its log from its ancestor checkpoint, and whether that replay reached the live state and chain.
+pub(super) fn judged_log(h: &MomentumHost) -> (Verdict, bool) {
+    let hd = hosted(h);
+    let b = &hd.boundary;
+    let checkpoint = b.checkpoint().expect("fixture: attached");
+    let log = b.log().expect("fixture: attached");
+    let start = checkpoint
+        .restore(b.schema(), b.identity())
+        .expect("the ancestor restores");
+    let run = replay(
+        b.schema(),
+        &b.pair().code,
+        start,
+        log.inputs(),
+        log.header().first_cursor,
+        &mut NoEffects,
+    );
+    let reproduced = run.refused.is_none()
+        && run.observation_chain == hd.live_chain()
+        && run.state_digest == state_digest(b.schema(), hd.state());
+    let verdict = NoStrandedLight::new().judge(b.schema(), log.inputs(), &run);
+    (verdict, reproduced)
 }

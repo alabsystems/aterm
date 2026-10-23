@@ -105,7 +105,6 @@ pub enum GeneralCategory {
 }
 
 impl GeneralCategory {
-    /// Every value, in discriminant order (the generator's order).
     const ALL: [GeneralCategory; 30] = [
         Self::UppercaseLetter,
         Self::LowercaseLetter,
@@ -249,9 +248,6 @@ mod tests {
         assert!(G::ModifierLetter.is_letter() && !G::LetterNumber.is_letter());
     }
 
-    /// [`script_runs`] is [`script`] run by run: every code point of a run,
-    /// both ends included, has the run's script, and runs are contiguous from
-    /// U+0000.
     #[test]
     fn script_runs_answer_what_script_answers() {
         let runs: Vec<(u32, Script)> = script_runs().collect();
@@ -267,8 +263,6 @@ mod tests {
         assert_eq!(checked, 0x11_0000 - 0x800, "every scalar value, once");
     }
 
-    /// Every run table is sorted by start, its first run starts at U+0000, and
-    /// every value names an entry: the binary search above relies on all three.
     #[test]
     fn run_tables_are_well_formed() {
         for (runs, values) in [

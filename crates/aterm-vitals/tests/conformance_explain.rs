@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `ExplainHonesty` (`aterm_models_misc::explain_honesty_model`): each scene of the
-//! cause engine's tests (`aterm_vitals::explain::fixtures`) is read through the real
-//! `Vitals::absorb` (the split, `detect`, the episodes and the clause) and `explain::account`, and
-//! projected onto the model.
+//! Tier-1 for `ExplainHonesty` (`aterm_models_misc::explain_honesty_model`).
 
 use std::collections::BTreeMap;
 
@@ -45,11 +42,6 @@ struct Truth {
     settled: i64,
 }
 
-/// The 10:32 moment's facts: Spotlight's two coalitions are Apple's, hold
-/// their terms (1420 mc, 722 ‰ deferred) over the floor, and are led by
-/// processes born in start-up's first second; tab 1's 0.20 is under the
-/// floor and minor whatever finished; `logd` (357) and `mds` (387) were
-/// born together.
 const T1032: Truth = Truth {
     claims: 1,
     vouched: 1,
@@ -68,9 +60,6 @@ const T1032: Truth = Truth {
     settled: 0,
 };
 
-/// The calm Mac's facts: nothing holds its terms or the floor, userspace is
-/// 4 h 41 min old, WindowServer was born half a second after `logd` and
-/// `mds`, and memory and the thermal state read settled.
 const T1510: Truth = Truth {
     terms: 0,
     above: 0,
@@ -80,8 +69,6 @@ const T1510: Truth = Truth {
     ..T1032
 };
 
-/// Tab 2's build with `mds` at 0.60, 80 % deferred: over 500 mc, under a
-/// tenth of the 8.50 busy.
 fn tab2_build_mds_1048() -> Scene {
     let mut scene = tab2_build_1048();
     scene.busy_mc += 300;
@@ -96,9 +83,6 @@ fn tab2_build_mds_1048() -> Scene {
     scene
 }
 
-/// The 10:32 moment with `mds`'s QoS buckets 640 mc past its CPU time:
-/// Spotlight's members cover 1420 mc, over the floor, but run 498 ‰
-/// deferred, under its terms' 500.
 fn terms_failing_1032() -> Scene {
     let mut scene = spotlight_1032();
     for c in scene.coalitions.iter_mut().filter(|c| c.id == 307) {
@@ -107,7 +91,6 @@ fn terms_failing_1032() -> Scene {
     scene
 }
 
-/// `scene` with the calm Mac's memory and thermal readings.
 fn read_calm(scene: Scene) -> Scene {
     let calm = calm_1510();
     Scene {
@@ -117,7 +100,6 @@ fn read_calm(scene: Scene) -> Scene {
     }
 }
 
-/// The scenes: name, the readings, the caller's tab, the facts.
 fn cases() -> Vec<(&'static str, Vec<Sample>, u64, Truth)> {
     let window = |scene: Scene| scene.samples().to_vec();
     let mut cut = spotlight_1032().samples();
@@ -216,7 +198,6 @@ fn cases() -> Vec<(&'static str, Vec<Sample>, u64, Truth)> {
     ]
 }
 
-/// The last snapshot of `samples`, read through a model with `fault`.
 fn read(samples: &[Sample], fault: Option<Fault>) -> Snapshot {
     let mut v = match fault {
         Some(f) => Vitals::new().with_fault(f),
@@ -241,8 +222,6 @@ fn role(r: Role) -> i64 {
     }
 }
 
-/// A birth's rank against the truth's two: 0 the first, 1 the later, 2
-/// not read, 3 neither.
 fn rank(at: Option<i64>, t: Truth) -> i64 {
     let (first, later) = (t.lowpid_ms.min(t.other_ms), t.lowpid_ms.max(t.other_ms));
     match at {
@@ -253,7 +232,6 @@ fn rank(at: Option<i64>, t: Truth) -> i64 {
     }
 }
 
-/// The states before `Detect`, after it, and after `Attach`.
 fn project(m: &Model, t: Truth, snap: &Snapshot, tab: u64) -> [S; 3] {
     let facts = snap.why.as_ref().expect("a window's facts");
     let held = |id: CauseId| facts.causes.iter().find(|c| c.id == id);
@@ -301,8 +279,6 @@ fn project(m: &Model, t: Truth, snap: &Snapshot, tab: u64) -> [S; 3] {
     [pre, mid, post]
 }
 
-/// Whether `m` takes `states` through `steps`; the laws a state on the way
-/// breaks.
 fn replay(m: &Model, states: &[S], steps: &[&str]) -> Result<Vec<&'static str>, String> {
     for (pair, step) in states.windows(2).zip(steps) {
         if interp::admits(m, &pair[0], &pair[1]) != Some(*step) {
@@ -339,7 +315,6 @@ fn every_scene_is_a_run_of_the_model() {
     );
 }
 
-/// Activities matched by signing id alone: the liar reads as Spotlight.
 #[test]
 fn a_signing_id_matched_alone_is_caught_by_claim_never_vouches() {
     let (_, samples, tab, truth) = cases()
@@ -360,8 +335,6 @@ fn a_signing_id_matched_alone_is_caught_by_claim_never_vouches() {
     assert_eq!(broken, ["ClaimNeverVouches"]);
 }
 
-/// `unexplained` blind to the residual: the calm Mac whose reaped coalition
-/// left 1.50 cores no coalition held reads "nothing needed".
 #[test]
 fn a_residual_left_uncovered_is_caught_by_lost_work_never_nothing_needed() {
     let (_, samples, tab, truth) = cases()
@@ -382,8 +355,6 @@ fn a_residual_left_uncovered_is_caught_by_lost_work_never_nothing_needed() {
     assert_eq!(broken, ["LostWorkNeverNothingNeeded"]);
 }
 
-/// One clause tick in the model's terms: whether the candidate held, and
-/// whether the clause showed.
 fn clause_states(m: &Model, ticks: &[(bool, bool)]) -> (Vec<S>, Vec<&'static str>) {
     let mut states = vec![m.init_state()];
     let mut steps = Vec::new();
@@ -418,9 +389,6 @@ fn clause_states(m: &Model, ticks: &[(bool, bool)]) -> (Vec<S>, Vec<&'static str
     (states, steps)
 }
 
-/// Spotlight's moment over five windows: the episode opens on the second
-/// split tick, so the clause's candidate holds from then on (written from
-/// the scene); the clause each tick is the real Deck's.
 fn spotlight_ticks(fault: Option<Fault>) -> Vec<(bool, bool)> {
     let mut v = match fault {
         Some(f) => Vitals::new().with_fault(f),
@@ -453,8 +421,6 @@ fn the_clause_over_spotlights_split_ticks_is_a_run_of_the_model() {
     assert_eq!(replay(&m, &states, &steps), Ok(vec![]));
 }
 
-/// The real `ClauseHold` over a scripted run: Spotlight's candidate holds
-/// four 5 s ticks, fails seven (30 s), and holds once more.
 #[test]
 fn the_clause_failing_for_thirty_seconds_is_a_run_of_the_model() {
     let split = CoalSplit {
@@ -492,7 +458,6 @@ fn the_clause_failing_for_thirty_seconds_is_a_run_of_the_model() {
     assert_eq!(replay(&m, &states, &steps), Ok(vec![]));
 }
 
-/// The clause with no hold: it shows the tick Spotlight's episode opens.
 #[test]
 fn a_clause_with_no_hold_is_caught_by_clause_never_flickers() {
     let model = explain_honesty_model();

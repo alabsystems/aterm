@@ -81,6 +81,7 @@ fn an_artifact_digest_changes_with_every_declared_field() {
     let base = ArtifactId::new(ArtifactKind::Code, "demo", 3, b"build=1");
     for other in [
         ArtifactId::new(ArtifactKind::Contract, "demo", 3, b"build=1"),
+        ArtifactId::new(ArtifactKind::Policy, "demo", 3, b"build=1"),
         ArtifactId::new(ArtifactKind::Code, "demO", 3, b"build=1"),
         ArtifactId::new(ArtifactKind::Code, "demo", 4, b"build=1"),
         ArtifactId::new(ArtifactKind::Code, "demo", 3, b"build=2"),

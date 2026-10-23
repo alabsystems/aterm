@@ -81,7 +81,7 @@ pub(super) fn lay_link(dir: &Path, rel: &str, target: &str) {
     std::os::unix::fs::symlink(target, p).unwrap();
 }
 
-/// `chmod +a <ace> <path>`: add an ACL entry, which std has no call for.
+/// `chmod +a <ace> <path>`.
 #[cfg(target_os = "macos")]
 pub(super) fn add_acl(path: &Path, ace: &str) {
     let out = aterm_uds::spawnfd::command("/bin/chmod")
@@ -99,8 +99,7 @@ pub(super) fn add_acl(path: &Path, ace: &str) {
     );
 }
 
-/// Whether `path` carries an ACL entry: `ls -led` lists each one on a line of its own (`  0:
-/// group:everyone allow write`) after the entry's.
+/// Whether `path` carries an ACL entry.
 #[cfg(target_os = "macos")]
 pub(super) fn has_acl(path: &Path) -> bool {
     let out = aterm_uds::spawnfd::command("/bin/ls")
@@ -121,9 +120,7 @@ pub(super) fn has_acl(path: &Path) -> bool {
         .any(|line| line.trim_start().starts_with("0:"))
 }
 
-/// `Foo.app` laid at `src` as an image's root: an executable, two internal symlinks, one of them a
-/// `..` climb to the stage root and back, and the modes and ACL AT3 is about, beside the usual
-/// `Applications` link and a README.
+/// `Foo.app` laid at `src` as an image's root.
 #[cfg(target_os = "macos")]
 pub(super) fn foo_app_image(
     d: &Path,
@@ -132,11 +129,8 @@ pub(super) fn foo_app_image(
     make: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
 ) -> std::io::Result<Artifact> {
     use std::os::unix::fs::PermissionsExt as _;
-    /// Resources -> Contents -> Foo.app -> the stage root, then back down to the binary.
     const UP: &str = "../../../Foo.app/Contents/MacOS/foo";
-    /// The ACL entry the image's `acl` file carries, also used as its contents.
     const ACE: &str = "everyone allow write";
-    /// `(path, contents, mode on the image, mode staged)`.
     const FILES: &[(&str, &[u8], u32, u32)] = &[
         (
             "Foo.app/Contents/MacOS/foo",
@@ -161,7 +155,6 @@ pub(super) fn foo_app_image(
             0o755,
         ),
     ];
-    /// `(directory, mode on the image)`; every one is staged `0755`.
     const DIRS: &[(&str, u32)] = &[
         ("Foo.app/Contents/Plugins", 0o777),
         ("Foo.app/Contents", 0o775),
@@ -198,8 +191,7 @@ pub(super) fn foo_app_image(
     Ok(art)
 }
 
-/// Detaches every disk image attached from under `dir` when it goes out of scope —
-/// on EVERY path out of a test: an early `return`, an assertion panic, or success.
+/// Detaches every disk image attached from under `dir` when it goes out of scope.
 #[cfg(all(debug_assertions, target_os = "macos"))]
 struct DetachAll {
     prefixes: Vec<PathBuf>,
@@ -207,9 +199,6 @@ struct DetachAll {
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
 impl DetachAll {
-    /// Guard everything attached from under `dir` — by the path as spelled and as
-    /// resolved, since `/var/folders/…` and `/private/var/folders/…` are the same
-    /// directory and `hdiutil` echoes whichever spelling it was handed.
     fn over(dir: &Path) -> Self {
         let mut prefixes = vec![dir.to_path_buf()];
         match dir.canonicalize() {
@@ -219,9 +208,6 @@ impl DetachAll {
         Self { prefixes }
     }
 
-    /// The device nodes of every image `hdiutil info` still lists from under the
-    /// guarded directory. Never panics: it runs from `Drop`, which may itself be
-    /// running because an assertion already failed.
     fn leaked(&self) -> std::io::Result<Vec<PathBuf>> {
         let out = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
             .arg("info")
@@ -256,8 +242,7 @@ impl Drop for DetachAll {
     }
 }
 
-/// Create one image for this acceptance row. Setup is attempted once; an unavailable
-/// disk-image service retains its actual error in COULD NOT RUN.
+/// Create one image for this acceptance row.
 #[cfg(all(debug_assertions, target_os = "macos"))]
 fn create_image(src: &Path, image: &Path) -> std::io::Result<()> {
     let out = aterm_uds::spawnfd::command("/usr/bin/hdiutil")

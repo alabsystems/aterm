@@ -138,10 +138,23 @@ pub const SECRET_SUBDIRS: &[&str] = &[
     ".docker",
     ".config/gcloud",
     ".azure",
+    // The release signing identity the secrets vault fills on every Mac (Developer ID key).
+    ".aterm/apple",
 ];
 
-/// Credential files under `$HOME` denied as `literal` paths for read and write.
-pub const SECRET_LITERAL_FILES: &[&str] = &[".netrc", ".git-credentials", ".npmrc", ".pypirc"];
+/// Credential files under `$HOME` denied as `literal` paths for read and write, with their
+/// transient siblings ([`push_siblings_clause`]): git's two `store` files (the secrets vault
+/// writes the XDG one), and the release signing key and profile the vault fills beside
+/// `~/.aterm/shell.d`, which tabs must still read.
+pub const SECRET_LITERAL_FILES: &[&str] = &[
+    ".netrc",
+    ".git-credentials",
+    ".config/git/credentials",
+    ".npmrc",
+    ".pypirc",
+    ".aterm/machine.key",
+    ".aterm/release-credentials.toml",
+];
 
 /// TCC-protected and sensitive user-data subdirectories under `$HOME` denied for read and write.
 pub const PRIVATE_SUBDIRS: &[&str] = &[
@@ -222,6 +235,7 @@ fn profile_scoped(
     }
     for file in SECRET_LITERAL_FILES {
         push_resolved_clause(&mut clauses, &canon_home, file, push_literal_clause);
+        push_resolved_clause(&mut clauses, &canon_home, file, push_siblings_clause);
     }
     if tmp_only {
         for sub in PRIVATE_SUBDIRS {
@@ -357,11 +371,49 @@ fn push_literal_clause(out: &mut String, path: &Path) {
     out.push_str("\")");
 }
 
+/// Append ` (regex "^<dir>/\.?<name>\.")` for the transient siblings of the file at `path`:
+/// a writer's temp (`aterm_uds::atomic_file`'s `.<name>.tmp.<pid>.<hex>`, atpkg-keys'
+/// `<name>.atpkg-keys.<pid>.<seq>.tmp`) or lock (git's `<name>.lock`), each holding the
+/// file's whole value while it is written. Seatbelt judges a path only at open, so a process
+/// that opened one reads the value through it once it is renamed onto the denied name.
+fn push_siblings_clause(out: &mut String, path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let mut pattern = String::from("^");
+    push_regex_escaped(&mut pattern, &dir.to_string_lossy());
+    pattern.push_str("/\\.?");
+    push_regex_escaped(&mut pattern, &name.to_string_lossy());
+    pattern.push_str("\\.");
+    out.push_str(" (regex \"");
+    push_sbpl_escaped_str(out, &pattern);
+    out.push_str("\")");
+}
+
+/// Append `text` to `out` with each regular-expression metacharacter backslash-escaped, so
+/// it matches only itself.
+fn push_regex_escaped(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        if matches!(
+            ch,
+            '\\' | '.' | '^' | '$' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+}
+
 /// Append `path` to `out` as the inside of an SBPL string literal, backslash-
 /// escaping `\` and `"` so the emitted `"…"` is always well-formed regardless of
 /// the home path.
 fn push_sbpl_escaped(out: &mut String, path: &Path) {
-    for ch in path.to_string_lossy().chars() {
+    push_sbpl_escaped_str(out, &path.to_string_lossy());
+}
+
+/// [`push_sbpl_escaped`] for text.
+fn push_sbpl_escaped_str(out: &mut String, text: &str) {
+    for ch in text.chars() {
         match ch {
             '\\' | '"' => {
                 out.push('\\');

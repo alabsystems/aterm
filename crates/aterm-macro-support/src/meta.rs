@@ -37,8 +37,7 @@ pub enum MetaKind {
 }
 
 impl Meta {
-    /// Whether the key is the single segment `name`, with no `::` before it
-    /// (`::name` is another key).
+    /// Whether the key is the single segment `name`.
     #[inline]
     #[must_use]
     pub fn is(&self, name: &str) -> bool {
@@ -96,10 +95,9 @@ impl Meta {
 }
 
 /// Parses the items inside `group`, the `(...)` of a list attribute.
-///
 /// # Errors
-/// An item that does not start with a path, or that is followed by anything
-/// but `=`, `(...)`, `,` or the end.
+/// An item that does not start with a path, or that is followed by anything but `=`, `(...)`, `,`
+/// or the end.
 pub fn parse_list(group: &Group) -> Result<Vec<Meta>, Error> {
     let mut c = Cursor::of_group(group);
     let mut items = Vec::new();
@@ -141,9 +139,7 @@ pub fn parse_list(group: &Group) -> Result<Vec<Meta>, Error> {
     Ok(items)
 }
 
-/// A value's string literal and its span, None-groups unwrapped (a `$lit`
-/// fragment arrives in one). `None` when the value is not one string
-/// literal.
+/// A value's string literal and its span.
 #[must_use]
 pub fn value_str(value: &[TokenTree]) -> Option<(StrLit, Span)> {
     let mut tokens = value.to_vec();

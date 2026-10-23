@@ -60,8 +60,8 @@ mod renderer;
 #[cfg(not(target_arch = "wasm32"))]
 pub use renderer::WindowTarget;
 pub use renderer::{
-    DropOverlay, FrameShape, GpuRenderer, GpuSurface, PresentCrop, SurfacePresentFailure, TrayQuad,
-    TrayScrim, UnormAblation, WindowGpu,
+    DropOverlay, FetchProbe, FetchStage, FrameShape, GpuRenderer, GpuSurface, PresentCrop,
+    SurfacePresentFailure, TrayQuad, TrayScrim, UnormAblation, UnormRoute, WindowGpu,
 };
 /// Demand-built effect pipeline identifiers and names (`renderer::EffectPipelines`).
 pub use renderer::{

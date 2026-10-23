@@ -111,6 +111,8 @@ pub enum ArtifactKind {
     Schema = 4,
     /// The execution profile: admission bounds and the numerical host profile.
     Profile = 5,
+    /// An acceptance policy: the rules a candidate is evaluated and selected under, which no [`TaskIdentity`] slot holds.
+    Policy = 6,
 }
 
 impl ArtifactKind {
@@ -131,6 +133,7 @@ impl ArtifactKind {
             3 => Some(ArtifactKind::Contract),
             4 => Some(ArtifactKind::Schema),
             5 => Some(ArtifactKind::Profile),
+            6 => Some(ArtifactKind::Policy),
             _ => None,
         }
     }

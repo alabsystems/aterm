@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `cat` lane (ARENA-CAT, the D1 run): `cat` 150 MB of ascii and 150 MB
-//! of mixed-language unicode through each terminal, aterm against the pinned
-//! ghostty tip, interleaved A/B with the order rotated per trial.
-//!
-//! The PTY-drain method: the terminal runs the in-terminal half
-//! ([`super::inner`]), which stamps a start time once it is up, `cat`s the
-//! pre-generated corpus and reports the elapsed time. The PTY backpressures
-//! `cat` at the terminal's consume rate, so that time is the ingest time with
-//! startup excluded.
+//! The `cat` arena lane (`ARENA-CAT`) via [`super::inner`].
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -42,7 +34,6 @@ impl Corpus {
         }
     }
 
-    /// The repeated unit; a corpus is whole units up to the target size.
     const fn unit(self) -> &'static str {
         match self {
             Corpus::Ascii => "the quick brown fox jumps over the lazy dog 0123456789\r\n",
@@ -150,8 +141,6 @@ pub(crate) fn run_in(
         }
         Term::Ghostty => {
             live::opening(&ghostty.app);
-            // Arguments, not environment: variables do not survive `open -na`,
-            // and ghostty refuses a direct CLI launch.
             let status = command(aterm_uds::os_path!("open"))
                 .arg("-na")
                 .arg(&ghostty.app)
@@ -201,7 +190,6 @@ pub(crate) fn parse_drain(report: &str) -> Result<f64, String> {
     }
 }
 
-/// A hung drain is called after this long.
 const DRAIN_CEILING: Duration = Duration::from_secs(450);
 const CORPUS_MB: u64 = 150;
 
@@ -244,7 +232,6 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
                         term.name()
                     ),
                 }
-                // The cooldown between competitors is the protocol (rule zero §2).
                 std::thread::sleep(COOLDOWN);
             }
         }

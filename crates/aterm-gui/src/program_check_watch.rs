@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Background watcher for macOS `syspolicyd` worker pool saturation, and a development build's stand-ins for it and for a program it holds.
+//! Background watcher for macOS `syspolicyd` worker pool saturation and its dev stand-ins.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -17,12 +17,9 @@ use crate::harness_host::HostNote;
 pub(crate) struct Board {
     judge: Judge,
     last: Option<Reading>,
-    /// Whether the window was told the check is not stuck since it was last
-    /// stuck (or ever): the first answering reading tells it, so a row an
-    /// earlier process raised ends too.
+    /// Whether the window has been notified that the check is not stuck.
     told_unstuck: bool,
-    /// The figures the stuck edge told (threads, limit), told again at
-    /// each look while it stands: the same words each time.
+    /// `(workers, limit)` reported at the stuck edge and repeated while stuck.
     told_stuck: Option<(u64, Option<u64>)>,
 }
 
@@ -41,28 +38,21 @@ impl Board {
 /// Process-wide `syspolicyd` check board.
 pub(crate) static BOARD: Mutex<Board> = Mutex::new(Board::new());
 
-/// Whether this build stands a full reading in ([`cmd`]): a development
-/// build only.
+/// Whether development stand-ins are enabled in this build.
 const STAND_IN_ENABLED: bool = cfg!(any(debug_assertions, feature = "dev-seams"));
 
-/// Whether this process runs the watch ([`start`]'s macOS arm): a
-/// stand-in nothing would read is refused.
+/// Whether the background watcher thread is running.
 static WATCHING: AtomicBool = AtomicBool::new(false);
 
-/// Whether `program-check full` stands ([`cmd`]): each look then takes the
-/// daemon's reading as full ([`stood_in`]).
+/// Whether `program-check full` overrides daemon readings as saturated.
 static FULL_STAND_IN: AtomicBool = AtomicBool::new(false);
 
-/// The pid `program-check held <pid>` stands in as held at macOS's program
-/// check ([`held_stand_in`]); 0 for none.
+/// PID stood in by `program-check held <pid>`, or 0 for none.
 static HELD_STAND_IN: AtomicU32 = AtomicU32::new(0);
 
-/// The verb's usage line.
 const USAGE: &str = "usage: program-check [full|live|held <pid>|held -]";
 
-/// The pid the jobs pass reads as held at macOS's program check wherever it
-/// reads a start (`program-check held <pid>`, a development build's); `None`
-/// in every other build, or once `program-check held -` ended it.
+/// Returns the PID stood in as held at macOS's program check, if any.
 pub(crate) fn held_stand_in() -> Option<u32> {
     if !STAND_IN_ENABLED {
         return None;
@@ -73,7 +63,7 @@ pub(crate) fn held_stand_in() -> Option<u32> {
     }
 }
 
-/// The milliseconds the judge reads, from the watch's first reading.
+/// Milliseconds elapsed since the watcher's first reading.
 fn now_ms() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -129,10 +119,7 @@ pub(crate) fn step(board: &mut Board, at_ms: u64, look: Look) -> Option<HostNote
     }
 }
 
-/// `look` as the watch takes it: while `full` stands, a reading of the
-/// daemon is held at the kernel's limit (the flag set, its threads no fewer
-/// than the limit), so the judge sees the same daemon stand there; no
-/// daemon, or an unread table, stays as read.
+/// Overrides a live daemon reading as at-limit when `full` is active.
 fn stood_in(look: Look, full: bool) -> Look {
     match look {
         Look::Read(reading) if full => Look::Read(Reading {
@@ -157,8 +144,7 @@ enum Ask {
     Held(Option<u32>),
 }
 
-/// The verb's ask, refused where this build does not stand one in or no look
-/// would read it. Pure.
+/// Parses `program-check` arguments and validates build/platform gates.
 fn parse(rest: &str, injection: bool, watching: bool) -> Result<Ask, &'static str> {
     let ask = match rest.split_whitespace().collect::<Vec<_>>().as_slice() {
         [] => return Ok(Ask::Read),
@@ -233,11 +219,7 @@ pub(crate) fn status_fields() -> String {
     )
 }
 
-/// How often the watch reads: the disk watch's tick
-/// ([`crate::harness_host::DISK_TICK`]), at production in every build, as the disk
-/// watch's own is. `ATERM_DEV_FAST_TIMERS` would make it a `ps` every 60 ms in each
-/// live test instance and buy nothing: the judge's five minutes run on the real clock,
-/// and `program-check full` is how a development build reaches them.
+/// Uses the production disk tick regardless of `ATERM_DEV_FAST_TIMERS` to avoid `ps` storms.
 const fn every() -> std::time::Duration {
     crate::harness_host::DISK_TICK
 }
@@ -366,8 +348,7 @@ mod tests {
         );
     }
 
-    /// The alert ends as [`stuck`] does: a stuck daemon replaced by one
-    /// judged afresh, or gone with none in its place.
+    /// Replacing or stopping a stuck daemon clears the alert.
     #[test]
     fn the_alert_ends_when_the_stuck_daemon_does() {
         let again = Daemon {
@@ -398,9 +379,7 @@ mod tests {
         assert!(s.contains(" syspolicyd_full_ms="), "{s}");
     }
 
-    /// The stand-in holds a healthy daemon's reading at the limit, so the
-    /// board turns stuck after five minutes of it and `live` ends the alert;
-    /// with no daemon, or the table unread, it stands nothing in.
+    /// The `full` stand-in drives a healthy reading to stuck, and `live` clears it.
     #[test]
     fn the_full_stand_in_drives_the_alert_and_live_ends_it() {
         let healthy = reading(2, false);

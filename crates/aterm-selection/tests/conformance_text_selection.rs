@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `TextSelectionLifecycle` (`aterm_models_core::text_selection_lifecycle_model`): the
-//! REAL `TextSelection` calls, driven from every state the model reaches, against the model's
-//! transitions.
+//! Conformance tests for `TextSelectionLifecycle`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,20 +15,14 @@ use aterm_spec::verify;
 type State = BTreeMap<&'static str, i64>;
 type StateKey = Vec<(&'static str, i64)>;
 
-/// Where `Start` presses (`end == 0`), `Update` drags to (`end == 1`) and
-/// `Extend` shift-clicks (`end == 2`): `(row, col, side)`.
 const PRESS: (i32, u16, SelectionSide) = (0, 0, SelectionSide::Left);
 const DRAG: (i32, u16, SelectionSide) = (1, 3, SelectionSide::Right);
 const SHIFT_CLICK: (i32, u16, SelectionSide) = (2, 5, SelectionSide::Right);
 
-/// The model's actions, each bound to one real call by [`call`].
 const ALPHABET: [&str; 5] = ["Start", "Update", "Complete", "Extend", "Clear"];
 
-/// Bounded depth: every reachable model state is within four calls of Init,
-/// and one more call takes each out of it.
 const MAX_DEPTH: usize = 6;
 
-/// Make the real call the model action names.
 fn call(selection: &mut TextSelection, action: &str) {
     match action {
         "Start" => selection.start_selection(PRESS.0, PRESS.1, PRESS.2, SelectionType::Simple),
@@ -50,8 +42,6 @@ fn phase(selection: &TextSelection) -> i64 {
     }
 }
 
-/// Which driver point the far anchor holds; a fresh selection's anchors sit
-/// at the origin, which is [`PRESS`].
 fn end(anchor: SelectionAnchor) -> i64 {
     match (anchor.row, anchor.col) {
         (row, col) if (row, col) == (PRESS.0, PRESS.1) => 0,
@@ -85,8 +75,6 @@ pub fn project(selection: &TextSelection, step: Option<(&TextSelection, &str)>) 
     ])
 }
 
-/// Every action sequence up to [`MAX_DEPTH`] on the real selection in lockstep
-/// with the model: the projection equals the model state after every call.
 fn lockstep(model: &Model) -> Vec<(State, State, &'static str)> {
     fn walk(
         model: &Model,
@@ -134,11 +122,6 @@ fn validate(model: &Model, prev: &State, next: &State, action: &str) -> (bool, S
     )
 }
 
-/// Tier-1: every call from every reachable state, on the real selection in
-/// lockstep with the model, and every distinct real transition judged by the
-/// tiered validator (the interpreter, and `ty` where installed). The walk
-/// reaches the model's whole reachable space — checked against the
-/// interpreter's own count, so a state the driver cannot produce is a failure.
 #[test]
 fn real_calls_conform_to_the_lifecycle_model() {
     let model = text_selection_lifecycle_model();
@@ -185,10 +168,6 @@ fn real_calls_conform_to_the_lifecycle_model() {
     );
 }
 
-/// NEGATIVE CONTROLS: each phase check the model's `Buggy` branch drops, as a
-/// real transition would show it, is rejected — a drag that moves the far
-/// anchor after the release, a release that completes nothing, a shift-click
-/// during a drag, and a clear that spares a completed selection.
 #[test]
 fn a_dropped_phase_check_is_rejected() {
     let model = text_selection_lifecycle_model();

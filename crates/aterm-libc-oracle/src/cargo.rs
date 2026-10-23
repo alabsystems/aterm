@@ -102,8 +102,7 @@ impl Diagnostic {
         })
     }
 
-    /// Whether `ident` appears as a whole identifier in the message, a label or
-    /// the source the error points at.
+    /// Whether `ident` appears as a whole identifier in the message, a label, or a snippet.
     #[must_use]
     pub fn names(&self, ident: &str) -> bool {
         std::iter::once(&self.message)
@@ -412,8 +411,7 @@ impl<'t> Workspace<'t> {
         self.run(&args)
     }
 
-    /// Document one crate as rustdoc JSON; the path is where it landed when the
-    /// outcome succeeded.
+    /// Document one crate as rustdoc JSON and return the output path.
     ///
     /// # Errors
     /// When targo cannot be started.

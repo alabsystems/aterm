@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: a scripted CPU presenter, so a headless `App` runs the real
-//! redraw path (compose, damage consume, CPU present, dropped-present re-arm,
-//! bounded retry) and a test reads back exactly what reached the glass.
-//!
-//! In a test build [`super::CpuSurface`] is [`TestCpuSurface`]: the platform
-//! presenter (what `CpuPresenter::new` builds) or a [`ScriptedPresenter`] a
-//! test installs directly, with no `winit` window and no WindowServer.
-//!
-//! The scripted glass models a retaining surface: after a successful commit the
-//! next acquisition returns a buffer of `age() == 1` that still holds what the
-//! glass shows, and a failed commit discards what was painted into it. A retry
-//! that trusted a stale renderer cache over such a buffer would copy nothing and
-//! leave the dropped frame off the glass.
+//! Test-only scripted CPU presenter for headless redraw and retained-buffer tests.
 
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -79,10 +67,7 @@ impl ScriptedPresenter {
         self.commits
     }
 
-    /// The window gains `rows` its last commit never reached, as Windows
-    /// grows a window under a present: the glass there holds the window
-    /// system's white, and the surface owes a repaint until a commit draws
-    /// the frame it retains.
+    /// Fill `rows` on glass with white and mark the surface as owing a repaint.
     pub(crate) fn owe_repaint(&mut self, rows: std::ops::Range<usize>) {
         for row in rows {
             let at = row * self.width;
@@ -93,13 +78,7 @@ impl ScriptedPresenter {
         self.owed = true;
     }
 
-    /// The window system drops what the glass showed, as an X server does
-    /// before it sends an `Expose` (a VT switch, a video-memory purge): the
-    /// glass goes black, and the surface owes nothing it knows of. The retained
-    /// buffer goes black too, though its age still says it holds the last
-    /// present: a scripted commit copies the whole buffer, so this stands for
-    /// a surface that sends only the damage it is given (X11's ShmPutImage per
-    /// rectangle), where only a full copy puts the frame back.
+    /// Clear glass and retained buffer without raising `owed`.
     #[cfg(target_os = "linux")]
     pub(crate) fn lose_glass(&mut self) {
         self.glass.fill(0);
@@ -236,8 +215,6 @@ impl TestCpuFrame<'_> {
     fn commit_scripted(s: &mut ScriptedPresenter) -> Result<(), TestSurfaceError> {
         if s.script.front() == Some(&ScriptedOutcome::FailCommit) {
             s.script.pop_front();
-            // What was painted never reached glass; the retained buffer is
-            // still the glass the surface shows.
             s.back.clone_from(&s.glass);
             return Err(wrap(ScriptedError));
         }

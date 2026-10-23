@@ -36,13 +36,13 @@ pub fn key_bytes(b64: &str) -> Option<Vec<u8>> {
         .filter(|k| k.len() == 32)
 }
 
-/// A key's short fingerprint for display: its first 12 base64 characters.
+/// A key's short fingerprint for display.
 #[must_use]
 pub fn fingerprint(b64: &str) -> String {
     b64.trim().chars().take(12).collect()
 }
 
-/// A signature file's 64 bytes: raw, or base64 text (what `aterm ai fleet sign` writes).
+/// A signature file's 64 bytes.
 #[must_use]
 pub fn sig_bytes(raw: &[u8]) -> Option<Vec<u8>> {
     if raw.len() == 64 {
@@ -55,9 +55,7 @@ pub fn sig_bytes(raw: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Verifies `doc` under the pinned `key` against `sig` (raw or base64).
-///
 /// # Errors
-///
 /// Why it does not verify, in one closed phrase.
 pub fn verify(doc: &[u8], sig: &[u8], key: &str) -> Result<(), String> {
     if key_bytes(key).is_none() {
@@ -70,9 +68,7 @@ pub fn verify(doc: &[u8], sig: &[u8], key: &str) -> Result<(), String> {
 }
 
 /// Reads top-level `seq` and `valid_until` metadata from a fleet TOML document.
-///
 /// # Errors
-///
 /// Why they cannot be read.
 pub fn meta(text: &str) -> Result<(Option<i64>, Option<i64>), String> {
     let doc =
@@ -183,9 +179,7 @@ pub fn held_state(ai_dir: &Path) -> Option<Held> {
 }
 
 /// The held document of `url` under `key`, verified again and within its `valid_until`.
-///
 /// # Errors
-///
 /// Why there is none to use: not fetched yet, tampered with, or expired.
 pub fn held(ai_dir: &Path, url: &str, key: &str, now: i64) -> Result<String, String> {
     let state = held_state(ai_dir)
@@ -216,7 +210,7 @@ pub enum Fetched {
     Fresh(i64),
     /// The served document is the one held.
     Same(i64),
-    /// A fetch was made within [`FETCH_EVERY_S`]; nothing was asked.
+    /// A fetch was made within [`FETCH_EVERY_S`].
     NotDue,
     /// The served document was refused, and the held one stands; why.
     Refused(String),
@@ -238,17 +232,15 @@ impl Fetched {
     }
 }
 
-/// Gets a URL's bytes, capped. Injected: tests reach no network.
+/// Gets a URL's bytes, capped.
 pub trait Fetcher {
     /// The body of `url`, at most `max` bytes.
-    ///
     /// # Errors
-    ///
     /// Why it could not be fetched.
     fn get(&self, url: &str, max: u64) -> Result<Vec<u8>, String>;
 }
 
-/// The shipped [`Fetcher`]: HTTPS only, size-capped, retried (the updater's own download).
+/// The shipped [`Fetcher`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LiveFetcher;
 
@@ -375,10 +367,8 @@ pub fn fetch(
     }
 }
 
-/// A new signing key: the secret key's PKCS#8 bytes and the public key in base64.
-///
+/// A new signing key.
 /// # Errors
-///
 /// Why no key could be made.
 pub fn keygen() -> Result<(Vec<u8>, String), String> {
     use ring::signature::KeyPair as _;
@@ -393,9 +383,7 @@ pub fn keygen() -> Result<(Vec<u8>, String), String> {
 }
 
 /// The public key of a secret key file's bytes, in base64.
-///
 /// # Errors
-///
 /// Why the bytes are no secret key.
 pub fn public_of(secret: &[u8]) -> Result<String, String> {
     use ring::signature::KeyPair as _;
@@ -406,9 +394,7 @@ pub fn public_of(secret: &[u8]) -> Result<String, String> {
 }
 
 /// The signature of `doc` under the secret key, as base64 text.
-///
 /// # Errors
-///
 /// Why the bytes are no secret key.
 pub fn sign(secret: &[u8], doc: &[u8]) -> Result<String, String> {
     let pair = ring::signature::Ed25519KeyPair::from_pkcs8(secret)

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WALKER SEAM of `sys disk` and `sys tab` (design §10.4, §10.5, §13.2, §13.6): what the disk
-//! walker knows of a scope's folders, as plain values the views print.
+//! Disk walker seam for `sys disk` and `sys tab`.
 
 use super::json::Jv;
 
@@ -33,15 +32,14 @@ pub enum RootSize {
     Walking {
         /// Entries the running walk has listed (0 while queued).
         walked_entries: u64,
-        /// Bytes the running walk has summed so far: a lower bound.
+        /// Bytes the running walk has summed so far.
         partial_alloc: Option<u64>,
         /// The last complete walk, when one exists.
         last: Option<RootSizes>,
     },
     /// The last walk reached its end.
     Complete(RootSizes),
-    /// Not measured, and why: one of the disk unavailable words (`protected`, `remote`,
-    /// `removable`, `dataless`, `other_user`, `too_broad`).
+    /// Not measured, and why.
     NotMeasured(&'static str),
 }
 
@@ -57,8 +55,7 @@ impl RootSize {
         }
     }
 
-    /// The sizes that speak for the root: the complete walk's, else the last complete one behind a
-    /// running walk.
+    /// The sizes that speak for the root.
     #[must_use]
     pub fn sizes(&self) -> Option<&RootSizes> {
         match self {
@@ -68,7 +65,6 @@ impl RootSize {
         }
     }
 
-    /// The word an unmeasured figure of this root carries.
     fn why(&self) -> &'static str {
         match self {
             Self::NotSampled => "not_sampled",
@@ -78,8 +74,7 @@ impl RootSize {
         }
     }
 
-    /// `alloc_bytes=` as a record value: bare when complete, `≥n` while a walk runs, else
-    /// `unavailable(<why>)`.
+    /// `alloc_bytes=` as a record value.
     #[must_use]
     pub fn alloc_text(&self) -> String {
         match self {
@@ -105,8 +100,6 @@ impl RootSize {
         }
     }
 
-    /// A complete figure of the root (`entries`, `logical_bytes`) as a record
-    /// value.
     fn figure_text(&self, f: impl Fn(&RootSizes) -> u64) -> String {
         match self {
             Self::Complete(s) => f(s).to_string(),
@@ -114,7 +107,6 @@ impl RootSize {
         }
     }
 
-    /// …and in JSON.
     fn figure_json(&self, f: impl Fn(&RootSizes) -> u64) -> Jv {
         match self {
             Self::Complete(s) => Jv::u(f(s)),
@@ -187,7 +179,7 @@ impl RootSize {
     }
 }
 
-/// One subtree inside a root: where the space is.
+/// One subtree inside a root.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DirSize {
     /// Its path relative to the root.
@@ -199,7 +191,7 @@ pub struct DirSize {
 }
 
 impl DirSize {
-    /// How deep it lies under its root: its path's component count.
+    /// How deep it lies under its root.
     #[must_use]
     pub fn depth(&self) -> usize {
         self.rel.split('/').filter(|c| !c.is_empty()).count()
@@ -217,8 +209,7 @@ pub struct HugeDirFact {
     pub root: Option<usize>,
 }
 
-/// A scope's disk balance from the walker: over the outermost roots, `total = exclusive + shared`,
-/// each folder once.
+/// A scope's disk balance from the walker.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DiskTotals {
     /// Bytes of the outermost roots.
@@ -227,7 +218,7 @@ pub struct DiskTotals {
     pub exclusive: u64,
     /// …that two or more tabs claim.
     pub shared: u64,
-    /// A walk is queued or running for one of them: the figures are lower bounds.
+    /// A walk is queued or running for one of them.
     pub walking: bool,
     /// Σ growth of the complete outermost roots, bytes per second.
     pub growth_bps: Option<i64>,
@@ -235,7 +226,7 @@ pub struct DiskTotals {
     pub warnings: Vec<HugeDirFact>,
 }
 
-/// Bytes as people read them, in decimal units: `15.3 GB`, `820 MB`.
+/// Bytes as people read them, in decimal units.
 #[must_use]
 pub fn bytes_word(b: u64) -> String {
     let f = b as f64;
@@ -252,8 +243,7 @@ pub fn bytes_word(b: u64) -> String {
     }
 }
 
-/// The scope's sentence clause for its roots' sizes: `15.3 GB exclusive · growing 7.4 MB/s`, `≥2.1
-/// GB exclusive (walking)`, or `sizes unavailable(not_sampled)` without a walker.
+/// The scope's sentence clause for its roots' sizes.
 #[must_use]
 pub fn totals_clause(totals: Option<&DiskTotals>, bps_word: impl Fn(f64) -> String) -> String {
     let Some(t) = totals else {

@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Signal interruption handling for long lab verbs ([`sleep`], [`Stopped`]).
-//! Hard-exit cleanup uses [`at_hard_exit`] over [`crate::sys::SignalPipe`].
+//! Signal interruption handling and hard-exit cleanup for long lab verbs.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// The signal that stopped the run (0: none yet).
 static STOPPED: AtomicI32 = AtomicI32::new(0);
 
 fn bell() -> &'static (Mutex<()>, Condvar) {
@@ -20,10 +18,8 @@ fn bell() -> &'static (Mutex<()>, Condvar) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stopped(pub i32);
 
-/// Whether the interrupt handler is in place.
 static CAUGHT: AtomicBool = AtomicBool::new(false);
 
-/// What a second interrupt runs before the process ends ([`at_hard_exit`]).
 static HARD_EXIT: Mutex<Option<fn()>> = Mutex::new(None);
 
 /// Run `undo` when a second interrupt ends the process at once, before it exits.
@@ -138,10 +134,8 @@ pub fn until(t: f64) -> Result<(), Stopped> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    /// The probe's mode, set on a re-run of this test binary.
     const PROBE: &str = "ATERM_LAB_STOP_PROBE";
 
-    /// This test binary re-run as `test` in probe `mode`: its status and stdout.
     fn probe(test: &str, mode: &str) -> (Option<i32>, String) {
         let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
         cmd.args(["--exact", test, "--nocapture", "--test-threads=1"])
@@ -163,9 +157,6 @@ mod tests {
         }
     }
 
-    /// `nohup` keeps a lab alive past a closed terminal: a hang-up the process
-    /// was started ignoring stays ignored, while TERM is caught as ever. The
-    /// control starts with HUP at its default, which the lab catches.
     #[test]
     fn a_hang_up_started_ignored_stays_ignored() {
         const TEST: &str = "stop::tests::a_hang_up_started_ignored_stays_ignored";
@@ -189,11 +180,6 @@ mod tests {
         let _ = crate::sys::write_all(1, b"PROBE the hard exit's act ran\n");
     }
 
-    /// A second interrupt ends the process at once, with 128 + the signal, and
-    /// runs the act a verb registered first, even while the main thread is
-    /// held where it can put nothing back itself (here a plain sleep, which no
-    /// interrupt cuts short). Without the second interrupt's exit the probe would
-    /// sleep out its minute and exit 0.
     #[test]
     fn a_second_interrupt_runs_the_hard_exit_act_and_ends_the_run() {
         const TEST: &str =

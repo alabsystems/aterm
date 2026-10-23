@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! A repository's history (design §10.1): commits, comparisons, branches, tags and trees.
+//! Repository git history: commits, comparisons, branches, tags, and trees.
 
 use aterm_json::Value;
 
@@ -17,7 +17,6 @@ use crate::path;
 use crate::policy::RouteTarget;
 use crate::slug::Slug;
 
-/// The most items GitHub sends on one page.
 const MAX_PER_PAGE: usize = 100;
 
 /// The git objects of one repository.
@@ -41,7 +40,6 @@ pub enum CompareResult {
     },
 }
 
-/// Whether `error` is a probe-confirmed absence whose GitHub message starts with `prefix`.
 fn not_found_saying(error: &Error, prefix: &str) -> bool {
     error.kind == Kind::NotFound
         && error
@@ -67,12 +65,10 @@ impl<'a> Git<'a> {
         Git { how, ..self }
     }
 
-    /// `/repos/{o}/{r}{rest}`.
     fn at(&self, rest: &str) -> String {
         format!("{}{rest}", repo_root(&self.slug))
     }
 
-    /// One call's JSON answer.
     fn read(&self, call: &crate::client::Call) -> Result<Value> {
         self.gh
             .call(call)?
@@ -80,7 +76,6 @@ impl<'a> Git<'a> {
             .map_err(|e| e.with_repo(self.slug.to_string()))
     }
 
-    /// A walked listing, mapped to `T` and sorted by `name`, then `opts.limit`.
     fn names<T: FromJson>(
         &self,
         rest: &str,
@@ -104,7 +99,7 @@ impl<'a> Git<'a> {
         Ok(listing)
     }
 
-    /// The commit `reference` names: `GET commits?sha={reference}&per_page=1`.
+    /// The commit `reference` names.
     /// # Errors
     /// NotFound when there is none.
     pub fn resolve(&self, reference: &str) -> Result<CommitObject> {
@@ -198,7 +193,7 @@ impl<'a> Git<'a> {
         self.names("/tags", opts, |tag: &TagObject| &tag.name)
     }
 
-    /// The tree of `reference`: `GET git/trees/{ref}`, `?recursive=1` when `recursive`.
+    /// The tree of `reference`.
     /// # Errors
     /// Usage for a ref with a `.` or `..` part, before any request; the calls' errors.
     pub fn tree(&self, reference: Option<&str>, recursive: bool) -> Result<TreeObject> {

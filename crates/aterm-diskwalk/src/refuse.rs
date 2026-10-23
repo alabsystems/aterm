@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Path-only root refusal checks before any filesystem access ([`refuse`], [`Deny`],
-//! [`LIBRARY_ALLOW`], [`crate::list_one_level`]).
+//! Path-only root refusal checks before any filesystem access.
 
 use std::path::{Component, Path, PathBuf};
 
 use aterm_sysprobe::volumes::{Mount, Table, mount_of};
 
-/// The folders under `$HOME/Library` the walker may enter: aterm's own cache and state .
+/// The folders under `$HOME/Library` the walker may enter: aterm's own cache and state.
 pub const LIBRARY_ALLOW: &[&str] = &["Library/Caches/aterm", "Library/Application Support/aterm"];
 
 /// The file system types the walker never enters even when the table calls them local.
@@ -31,7 +30,6 @@ pub const REMOTE_FSTYPES: &[&str] = &[
     "lustre",
 ];
 
-/// macOS's data volume, under which every firmlinked root also lives.
 const DATA_VOLUME: &str = "/System/Volumes/Data";
 
 /// Why a root (or a folder inside one) is not measured.
@@ -277,7 +275,6 @@ pub fn canonical_for(path: &Path, macos: bool) -> Option<PathBuf> {
     Some(out)
 }
 
-/// Candidate path spellings tested for a canonical path.
 fn forms(path: &Path, fold: bool) -> Vec<PathBuf> {
     let mut out = vec![path.to_path_buf()];
     let data = Path::new(DATA_VOLUME);
@@ -308,7 +305,6 @@ pub fn is_mount_point(dir: &Path, mounts: &Table, fold: bool) -> bool {
     })
 }
 
-/// The spellings of a mount point.
 fn mount_forms(m: &Mount, fold: bool) -> Vec<PathBuf> {
     let Some(on) = canonical(&m.on) else {
         return Vec::new();
@@ -320,7 +316,6 @@ fn mount_forms(m: &Mount, fold: bool) -> Vec<PathBuf> {
     }
 }
 
-/// Component-wise prefix test; ASCII case folded when `fold`.
 fn under(path: &Path, root: &Path, fold: bool) -> bool {
     let mut p = path.components();
     for r in root.components() {
@@ -371,7 +366,7 @@ pub fn refuse(
     volume_refusal(&spellings[0], mounts, deny.fold_case)
 }
 
-/// The path test for a LOOK, not a walk: one directory opened to `stat` a marker name in it .
+/// The path test for a LOOK, not a walk: one directory opened to `stat` a marker name in it.
 #[must_use]
 pub fn refuse_look(
     logical: Option<&Path>,
@@ -391,7 +386,6 @@ pub fn refuse_look(
     volume_refusal(&spellings[0], mounts, deny.fold_case)
 }
 
-/// Every spelling a path test reads, the canonical form first.
 fn spellings(logical: Option<&Path>, canonical_path: &Path) -> Result<Vec<PathBuf>, Refusal> {
     let canon = canonical(canonical_path).ok_or(Refusal::Relative)?;
     let mut spellings = vec![canon];
@@ -402,7 +396,6 @@ fn spellings(logical: Option<&Path>, canonical_path: &Path) -> Result<Vec<PathBu
     Ok(spellings)
 }
 
-/// `/`, the home, an ancestor of a denied root or of the home, or a volume's mount point.
 fn broad(path: &Path, mounts: &Table, deny: &Deny) -> bool {
     let fc = deny.fold_case;
     forms(path, fc).iter().any(|f| {
@@ -442,7 +435,6 @@ pub fn volume_refusal(path: &Path, mounts: &Table, fold: bool) -> Option<Refusal
     holders.iter().find_map(|&(m, _)| unsafe_mount(m))
 }
 
-/// What a mount earns on its own.
 fn unsafe_mount(m: &Mount) -> Option<Refusal> {
     if m.automounted || m.fstype == "autofs" {
         return Some(Refusal::Automounted);

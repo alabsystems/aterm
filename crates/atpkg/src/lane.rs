@@ -174,8 +174,6 @@ pub fn answer(
 
 #[cfg(test)]
 mod tests {
-    /// Input at the limit is read whole; one byte past it is refused, never judged on a
-    /// prefix.
     #[test]
     fn input_past_the_limit_is_refused_not_cut() {
         let limit = usize::try_from(super::MAX_INPUT_BYTES).unwrap();
@@ -229,8 +227,6 @@ mod tests {
         }
     }
 
-    /// The JSON source reads one string field by its dotted path; a payload without it is
-    /// nothing to read, and input that is not JSON is an error, never a refusal.
     #[test]
     fn a_json_field_is_read_by_its_dotted_path() {
         let payload = br#"{"session_id":"x","cwd":"/r","tool_name":"Bash","tool_input":{"command":"cargo +1.97.1 test -p x","description":"d"}}"#;
@@ -256,8 +252,6 @@ mod tests {
         );
     }
 
-    /// The three answers: silence, one escaped line, a refusal with the Trust spelling
-    /// and the directory's stock pin.
     #[test]
     fn the_answer_is_silence_an_escape_line_or_the_refusal() {
         assert_eq!(

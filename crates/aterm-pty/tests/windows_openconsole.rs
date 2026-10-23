@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The console-host lane end to end: a tab spawned under `conpty = "auto"` runs in OpenConsole when this machine has one (a bundled copy, or the installed Windows Terminal's) and passes a child's VT through verbatim; a host that cannot start falls back to the Windows console host and the tab still opens; the default (`conpty` unset) is the OpenConsole beside the binary and never Windows Terminal's; `conpty = "inbox"` is the Windows console host.
+//!
+//! STOCK EXCEPTION: Windows only, and Trust has no Windows std, so only stock Rust builds this (the
+//! Windows lane's guest pins its version: `aterm-lab/src/windows_guest.rs`).
 
 #![cfg(windows)]
 

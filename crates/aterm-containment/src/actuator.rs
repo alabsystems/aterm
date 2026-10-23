@@ -403,6 +403,73 @@ mod tests {
         );
     }
 
+    /// Proof 2b (the secrets vault's files): under the containment profile for a home holding
+    /// what the vault fills on every Mac, git's XDG `store` file and the release signing key,
+    /// profile and Developer ID key cannot be read, nor can the temps and locks their writers
+    /// fill beside them, while `~/.aterm/shell.d`, which a tab's shell sources, and the files
+    /// next to the denied ones still can.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn enforcement_proof_the_vaults_secret_files_are_unreadable_and_shell_d_is_not() {
+        let home = std::env::temp_dir().join(format!("aterm-sbpl-vault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        for dir in [".config/git", ".aterm/apple", ".aterm/shell.d"] {
+            std::fs::create_dir_all(home.join(dir)).expect("create a home directory");
+        }
+        let secrets = [
+            ".config/git/credentials",
+            ".config/git/credentials.lock",
+            ".aterm/machine.key",
+            ".aterm/.machine.key.tmp.4242.0badcafe",
+            ".aterm/release-credentials.toml",
+            ".aterm/release-credentials.toml.atpkg-keys.4242.1.tmp",
+            ".aterm/apple/devid-m0.key",
+        ];
+        let readable = [
+            ".aterm/shell.d/rc",
+            ".aterm/machine.toml",
+            ".config/git/config",
+        ];
+        for file in secrets.iter().chain(readable.iter()) {
+            std::fs::write(home.join(file), b"VAULT-ENFORCE-PROBE").expect("write a probe file");
+        }
+        let canon = std::fs::canonicalize(&home).expect("canonicalize the home");
+        let profile =
+            crate::sbpl::profile_for_home(canon.to_str(), None, crate::FsCapability::HomeReadWrite);
+        let cat = |file: &str| {
+            let path = canon.join(file);
+            sandbox_wrap(&profile, "/bin/cat", &[path.to_str().expect("utf8 path")])
+                .output()
+                .expect("run cat under sandbox-exec")
+        };
+        let read: Vec<(&str, bool, bool)> = secrets
+            .iter()
+            .map(|file| {
+                let out = cat(file);
+                let leaked = String::from_utf8_lossy(&out.stdout).contains("VAULT-ENFORCE-PROBE");
+                (*file, out.status.success(), leaked)
+            })
+            .collect();
+        let kept: Vec<(&str, Option<i32>, bool)> = readable
+            .iter()
+            .map(|file| {
+                let out = cat(file);
+                let seen = String::from_utf8_lossy(&out.stdout).contains("VAULT-ENFORCE-PROBE");
+                (*file, out.status.code(), out.status.success() && seen)
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&home);
+        for (file, ok, leaked) in read {
+            assert!(
+                !ok && !leaked,
+                "{file} was readable under the containment profile"
+            );
+        }
+        for (file, code, seen) in kept {
+            assert!(seen, "~/{file} must stay readable; rc={code:?}");
+        }
+    }
+
     /// Proof 3 (shell compatibility): an ordinary command pipeline under the
     /// exact `Containment` profile the actuator produces (scoped under the real
     /// `$HOME`) exits 0 with the expected output.

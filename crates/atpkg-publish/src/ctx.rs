@@ -2,11 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! [`Ctx`]: everything a verb reads from the machine, resolved once and passed down.
-//!
-//! Environment knobs are read only in [`Ctx::from_env`] (an unset `HOME` is a named
-//! could-not-run); everything else a verb could vary is a typed flag on that verb. Tests
-//! build a `Ctx` with [`Ctx::new`] over scratch directories, an injected anchor and clock,
-//! and `FakeHost` hosts (`crate::host::fake`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -15,8 +10,7 @@ use crate::error::{Error, Result};
 use crate::host::rest::RestHost;
 use crate::host::{Hosts, Slug};
 
-/// The private development owner packs are uploaded to before they are made public (the
-/// export rewrites this spelling to the public owner, as it does everywhere else).
+/// The private development owner packs are staged to before publication.
 pub const STAGING_OWNER: &str = "alabsystems";
 
 /// The accounts a publish speaks to.
@@ -50,13 +44,11 @@ impl Tokens {
 /// This machine's publishing identity, as files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityPaths {
-    /// The secret pkcs8 machine key (`~/.aterm/machine.key`), minted by
-    /// `atpkg-keys setup`/`join`.
+    /// The secret PKCS#8 machine key (`~/.aterm/machine.key`).
     pub key: PathBuf,
     /// Its public record (`~/.aterm/machine.toml`): the roster id and pubkey.
     pub record: PathBuf,
-    /// The machine's installed roster pair (`~/.aterm/roster/aterm-machines.toml`), one
-    /// of the candidates the newest verified roster is chosen from.
+    /// The machine's installed roster pair (`~/.aterm/roster/aterm-machines.toml`).
     pub roster: PathBuf,
 }
 
@@ -65,18 +57,13 @@ pub struct IdentityPaths {
 pub struct Ctx {
     /// `$HOME`.
     pub home: PathBuf,
-    /// The aterm checkout this binary was built from (for `build-local` and `lane
-    /// install`); the snapshot lanes never read it.
+    /// The aterm checkout this binary was built from (for `build-local` and `lane install`).
     pub repo_root: PathBuf,
-    /// The lanes' state root (`$XDG_STATE_HOME/aterm-auto`, else
-    /// `~/.local/state/aterm-auto`).
+    /// The lanes' state root (`$XDG_STATE_HOME/aterm-auto`, else `~/.local/state/aterm-auto`).
     pub state_dir: PathBuf,
-    /// The atpkg prefix (`atpkg::toolchain::atpkg_prefix`): where the store's Trust
-    /// toolchain is resolved from.
+    /// The atpkg prefix (`atpkg::toolchain::atpkg_prefix`) for the store's Trust toolchain.
     pub pkg_prefix: PathBuf,
-    /// The trust checkout the lineage receipt switch is read from (`$HOME/trust`; a verb's
-    /// `--trust-repo` names another). One path for every reader, so a group's preflight
-    /// and the packs it drives read the same switch.
+    /// The trust checkout the lineage receipt switch is read from (`$HOME/trust`).
     pub trust_repo: PathBuf,
     /// The accounts.
     pub accounts: Accounts,
@@ -84,16 +71,13 @@ pub struct Ctx {
     pub tokens: Tokens,
     /// This machine's identity files.
     pub identity: IdentityPaths,
-    /// The paper-master keys every roster is verified under: the compiled
-    /// `pins::PAPER_MASTER_PUBKEYS` (tests inject their own).
+    /// The paper-master keys every roster is verified under (`pins::PAPER_MASTER_PUBKEYS`).
     pub anchor: Vec<String>,
     /// The clock, read once.
     pub now_unix: i64,
     /// The release hosts.
     pub hosts: Hosts,
-    /// The roster generation this context's packs sign under, elected once
-    /// ([`crate::artifact::sign::elected`]) and shared by every clone: a lane or a group
-    /// reads the channel head for it once, not once per pack.
+    /// The roster generation this context's packs sign under, elected once and shared across clones.
     pub(crate) elected: Arc<Mutex<Option<Arc<crate::artifact::sign::Authority>>>>,
 }
 
@@ -128,8 +112,7 @@ impl Ctx {
         ))
     }
 
-    /// A context rooted at `home` that speaks to `hosts`, with the compiled anchor and
-    /// production defaults for every path.
+    /// A context rooted at `home` that speaks to `hosts` with production defaults.
     #[must_use]
     pub fn new(
         home: &Path,
@@ -184,9 +167,7 @@ impl Ctx {
         Slug::new(&self.accounts.public, repo)
     }
 
-    /// `path` with a leading `$HOME` shown as `~`, for anything printed: transcripts are
-    /// pasted beside public releases, and an absolute home path names the operator's
-    /// account.
+    /// `path` with a leading `$HOME` replaced by `~`.
     #[must_use]
     pub fn shown(&self, path: &Path) -> String {
         match path.strip_prefix(&self.home) {

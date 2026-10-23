@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE AI LAYER HAS SEEN OF EACH CLI'S LOGIN: `<aterm state>/ai/`, 0700.
+//! Local AI login state store under `<aterm state>/ai/`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -50,7 +50,7 @@ impl How {
     }
 }
 
-/// Why a login reads ended: a closed word, never a vendor's text.
+/// Why a login reads ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ended {
     /// A review's error output said the login has ended.
@@ -293,14 +293,14 @@ impl Store {
         self.dir.join(WAKE_FILE)
     }
 
-    /// Makes the directory, 0700, this user's own; or says why it is not.
+    /// Makes the directory, 0700, this user's own.
     /// # Errors
     /// It cannot be made, or it is not this user's private directory.
     pub fn ensure(&self) -> io::Result<()> {
         aterm_types::fs_restricted::ensure_private_dir(&self.dir)
     }
 
-    /// Takes `ai.lock`, waiting for its holder: every holder is a short read-edit-write.
+    /// Takes `ai.lock`, waiting for its holder.
     /// # Errors
     /// The directory or the lock file cannot be made or opened.
     pub fn acquire(&self) -> io::Result<Lock> {

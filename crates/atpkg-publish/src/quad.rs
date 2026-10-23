@@ -68,7 +68,7 @@ impl VerifiedQuad {
     }
 }
 
-/// Whether a verification holds the index to its own `valid_until` (gate 2).
+/// Whether a verification holds the index to its own `valid_until`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Freshness {
     /// The client's rule: a lapsed or unreadable horizon is refused.

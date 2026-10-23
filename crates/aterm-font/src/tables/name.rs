@@ -238,7 +238,6 @@ impl<'a> Table<'a> {
         let storage_offset = s.read::<Offset16>()?.to_usize();
 
         if version == 0 {
-            // Do nothing.
         } else if version == 1 {
             let lang_tag_count = s.read::<u16>()?;
             let lang_tag_len = lang_tag_count.checked_mul(LANG_TAG_RECORD_SIZE)?;

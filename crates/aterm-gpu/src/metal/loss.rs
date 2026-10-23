@@ -33,7 +33,7 @@ pub(crate) const ERROR_STACK_OVERFLOW: isize = 12;
 /// What one finished command buffer means for the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CbOutcome {
-    /// `MTLCommandBufferStatusCompleted` — the work ran.
+    /// `MTLCommandBufferStatusCompleted`.
     Completed,
     /// Command buffer has not finished executing (statuses `0..=3`).
     Unfinished { status: usize },
@@ -98,9 +98,6 @@ pub(crate) fn command_buffer_status(cb: Id) -> usize {
     }
 }
 
-/// `-[MTLCommandBuffer error]`'s code, or `None` when nil. The pool is pushed
-/// before the read because the getter can autorelease the `NSError`; the code
-/// is copied out before the pool pops.
 fn command_buffer_error_code(cb: Id) -> Option<isize> {
     let _pool = AutoreleasePool::new();
     // SAFETY: `-error` returns a borrowed `NSError` (or nil) owned by the pool;
@@ -131,14 +128,12 @@ pub(crate) fn outcome_of(cb: Id) -> CbOutcome {
 /// Sticky device-loss latch fed by completed Metal command-buffer outcomes.
 #[derive(Debug, Default)]
 pub(crate) struct LossLatch {
-    /// Debug-only feed counter — see [`Self::record`] for why it exists.
+    /// Debug-only feed counter ([`Self::record`]).
     #[cfg(debug_assertions)]
     fed: std::sync::atomic::AtomicUsize,
     /// Set exactly once, by the first `Lost` outcome recorded.
     lost: OnceLock<String>,
-    /// Whether an `EncodeSession` holds this latch, so one latch means one
-    /// queue (which `Frame::present`'s `Arc::ptr_eq` check relies on). Bound in
-    /// [`crate::metal::encoder::EncodeSession::new`], released on its drop.
+    /// Whether an `EncodeSession` holds this latch ([`crate::metal::encoder::EncodeSession::new`]).
     encode_bound: std::sync::atomic::AtomicBool,
 }
 
@@ -207,8 +202,6 @@ impl LossLatch {
 mod tests {
     use super::*;
 
-    /// Every header code plus the fail-closed arms, classified, with the
-    /// retry/latch line drawn explicitly.
     #[test]
     fn every_error_code_classifies_as_declared() {
         assert_eq!(classify(STATUS_COMPLETED, None), CbOutcome::Completed);
@@ -277,8 +270,6 @@ mod tests {
         ));
     }
 
-    /// The latch never flips on `Completed`, `Unfinished` or `Retryable`,
-    /// flips on the first `Lost`, stays flipped, and keeps the first reason.
     #[test]
     fn the_latch_flips_only_on_lost_and_stays_flipped() {
         let latch = LossLatch::new();

@@ -47,7 +47,7 @@ pub struct Message {
     pub endian: Endian,
     pub kind: Kind,
     pub flags: u8,
-    /// Assigned by [`crate::Connection::send`]; must be nonzero to encode.
+    /// Assigned by [`crate::Connection::send`].
     pub serial: u32,
     pub path: Option<ObjectPath>,
     pub interface: Option<String>,
@@ -59,7 +59,6 @@ pub struct Message {
     pub body: Vec<Value>,
 }
 
-/// A name field, the rule it must meet, and what to call it in a refusal.
 type NameCheck<'a> = (&'a Option<String>, fn(&str) -> bool, &'static str);
 
 fn name(valid: fn(&str) -> bool, text: &str, what: &'static str) -> Result<String> {
@@ -89,9 +88,7 @@ impl Message {
     }
 
     /// A call of `member` on the object at `path`.
-    ///
     /// # Errors
-    ///
     /// [`Error::Invalid`] for a name or path the specification forbids.
     pub fn method_call(
         destination: Option<&str>,
@@ -112,9 +109,7 @@ impl Message {
     }
 
     /// Builds a signal message for `interface.member` from `path`.
-    ///
     /// # Errors
-    ///
     /// [`Error::Invalid`] for a name or path the specification forbids.
     pub fn signal(path: &str, interface: &str, member: &str) -> Result<Self> {
         let mut m = Self::new(Kind::Signal);
@@ -135,9 +130,7 @@ impl Message {
     }
 
     /// The error answer `name` to `call`, its body the one string `text`.
-    ///
     /// # Errors
-    ///
     /// [`Error::Invalid`] unless `name` is an error name.
     pub fn error(call: &Message, name_: &str, text: &str) -> Result<Self> {
         let mut m = Self::method_return(call);
@@ -175,7 +168,7 @@ impl Message {
         matches!(self.kind, Kind::MethodCall) && self.flags & flags::NO_REPLY_EXPECTED == 0
     }
 
-    /// The body's first value as a string: an error's text, `Hello`'s name.
+    /// The body's first value as a string.
     #[inline]
     #[must_use]
     pub fn first_str(&self) -> Option<&str> {
@@ -205,11 +198,8 @@ impl Message {
     }
 
     /// Encodes the message into wire bytes.
-    ///
     /// # Errors
-    ///
-    /// [`Error::Invalid`] for a message the specification forbids: serial 0, a
-    /// required field missing, an invalid name, a body over the limits.
+    /// [`Error::Invalid`] for serial 0, a missing field, an invalid name, or an oversized body.
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.check()?;
         let signature = self.signature();
@@ -266,12 +256,8 @@ impl Message {
     }
 
     /// Parses one D-Bus message from `bytes`.
-    ///
     /// # Errors
-    ///
-    /// [`Error::Malformed`] for bytes that break the specification,
-    /// [`Error::Unsupported`] for an unknown message type or attached unix
-    /// descriptors.
+    /// [`Error::Malformed`] for invalid bytes, or [`Error::Unsupported`] for unknown types or fds.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let total = frame_len(bytes)?.ok_or(Error::malformed(
             "shorter than a message header",
@@ -364,7 +350,6 @@ impl Message {
     }
 }
 
-/// The fields each message type must carry.
 const fn required(m: &Message) -> std::result::Result<(), &'static str> {
     let missing = match m.kind {
         Kind::MethodCall if m.path.is_none() || m.member.is_none() => {
@@ -382,9 +367,7 @@ const fn required(m: &Message) -> std::result::Result<(), &'static str> {
     Err(missing)
 }
 
-/// The header's length: the 16 bytes up to the fields' content, the fields
-/// (at most [`MAX_ARRAY_BYTES`], 2^26, spelled as a literal in the contract),
-/// and the padding to the body's 8-byte boundary.
+/// The header's length ([`MAX_ARRAY_BYTES`]).
 #[cfg_attr(trust_verify, trust::requires(fields <= 67108864))]
 #[cfg_attr(trust_verify, trust::ensures(result >= 16 && result % 8 == 0))]
 #[inline]
@@ -393,11 +376,8 @@ const fn header_len(fields: usize) -> usize {
 }
 
 /// Returns the total wire length of the message at `head`, or `None` if fewer than 16 bytes.
-///
 /// # Errors
-///
-/// [`Error::Malformed`] for an unknown byte order or lengths past the
-/// specification's limits: the stream cannot be resynchronised after that.
+/// [`Error::Malformed`] for an unknown byte order or lengths past the specification's limits.
 pub fn frame_len(head: &[u8]) -> Result<Option<usize>> {
     let Some(fixed) = head.first_chunk::<16>() else {
         return Ok(None);

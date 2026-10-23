@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A wake path's admission, one fixture per refusal word, with a probe that records every path it
-//! is asked.
+//! A wake path's admission.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -26,8 +25,6 @@ impl PathProbe for Recorder {
     }
 }
 
-/// The privacy-guarded roots, as the window's host would hand them: the home's guarded folders,
-/// the volumes, and the folder of every user's home.
 fn protected() -> Vec<PathBuf> {
     [
         "/Users//u/Documents",
@@ -40,7 +37,6 @@ fn protected() -> Vec<PathBuf> {
     .to_vec()
 }
 
-/// The session's roots: its tab sits in the home itself (no root), a job runs in a project.
 fn session() -> Roots {
     roots(
         Path::new(HOME),
@@ -59,8 +55,6 @@ fn admit_with(
     admit(path, home_relative, &session(), &protected(), mode, probe)
 }
 
-/// Whether `path` lies under a guarded root, as the owner's screen would see a `stat` there (the
-/// home itself excepted from the folder of every home).
 fn under_guard(path: &Path) -> bool {
     let text = path.to_string_lossy().to_ascii_lowercase();
     protected().iter().any(|root| {
@@ -70,13 +64,6 @@ fn under_guard(path: &Path) -> bool {
     })
 }
 
-/// EACH REFUSAL WORD, ONE FIXTURE EACH, and the probe is asked nothing for any of them: a dot
-/// folder, a credential's name (either case), a guarded folder (either case), a volume, another
-/// user's home, the home's guarded folders and its scratch under the data volume's spelling, a
-/// guarded folder spelled with a long s or a Kelvin sign, a path under the home but no root (the
-/// tab's cwd is the home, never a root), the home's guarded folder under another case of the
-/// home, a relative path, a path that climbs, the safety and sandbox containments, a path one
-/// byte too long and a control character.
 #[test]
 fn each_lexical_refusal_is_decided_before_any_probe() {
     use ContainmentWord::{Containment, Safety, User};
@@ -167,12 +154,6 @@ fn each_lexical_refusal_is_decided_before_any_probe() {
     }
 }
 
-/// AN ADMITTED PATH IS PROBED FROM THE HOME DOWN, never under a guarded root, and only as far as
-/// it exists: `~/scratch.noindex/run/logs/a.log`, its `run` folder not made yet, is admitted under
-/// the scratch root after three probes; a path under the job's project is admitted under that
-/// root; one under a root beside the home is probed from the filesystem's root; a path of
-/// [`PATH_MAX`] bytes is not too long. NEGATIVE CONTROL: with `CanonicalizeAtRead` (the probe asked before the judgement), a
-/// refused path under `~/Documents` is touched.
 #[test]
 fn an_admitted_path_is_probed_from_the_home_down_and_a_refused_one_never() {
     let mut probe = Recorder::default();
@@ -261,8 +242,6 @@ fn an_admitted_path_is_probed_from_the_home_down_and_a_refused_one_never() {
     );
 }
 
-/// A LINK ANYWHERE FROM THE HOME DOWN IS REFUSED, and the probe goes no further than the link.
-/// CONTROL: the same folder as a folder is admitted.
 #[test]
 fn a_link_on_the_way_is_refused() {
     let mut probe = Recorder::default();
@@ -318,12 +297,6 @@ fn a_link_on_the_way_is_refused() {
     );
 }
 
-/// THE ROOTS: the scratch folder and each working directory, less the home itself, any folder
-/// above it, any under a guarded root (either case), a volume, a relative one and a dot folder;
-/// each once. The home and its guarded folders spelled another way are no roots either: the home
-/// in another case, the data volume's spelling of the home, of the folder of every home and of a
-/// project in it, and a guarded folder spelled with a long s or a Kelvin sign; so is any folder
-/// named outside ASCII. CONTROL: a project folder and one beside the home are roots.
 #[test]
 fn a_cwd_at_or_above_home_or_guarded_is_no_root() {
     let cwds = [
@@ -360,9 +333,6 @@ fn a_cwd_at_or_above_home_or_guarded_is_no_root() {
     );
 }
 
-/// A HOME NAMED OUTSIDE ASCII KEEPS ITS ROOTS, spelled as the home is: its scratch folder and a
-/// project in it are roots, the same home spelled decomposed is no root, and a path under the
-/// home's own spelling is admitted. CONTROL: the decomposed spelling of a path is refused.
 #[test]
 fn a_home_named_outside_ascii_keeps_its_own_spelling() {
     let home = "/Users//jos\u{e9}";
@@ -402,11 +372,6 @@ fn a_home_named_outside_ascii_keeps_its_own_spelling() {
     assert_eq!(judge("Documents/x", true), Err(PathRefusal::Guarded));
 }
 
-/// THE HOME'S ALIASES OPEN NO GUARDED FOLDER (the 2.1 safety review's finding): a tab that says
-/// its cwd is the home in another case, the home under the data volume's spelling, the folder of
-/// every home there, or a guarded folder spelled with a long s, makes no root of it, and a path
-/// into the home's guarded folders through any of those spellings is refused with nothing probed.
-/// CONTROL: the same session admits `~/scratch.noindex/run/logs/a.log`, probed from the home down.
 #[test]
 fn an_alias_of_the_home_opens_no_guarded_folder() {
     let aliases = [
@@ -458,7 +423,6 @@ fn an_alias_of_the_home_opens_no_guarded_folder() {
     assert_eq!(probe.asked.borrow().first(), Some(&PathBuf::from(HOME)));
 }
 
-/// THE LONGEST ROOT A PATH IS UNDER IS ITS ROOT: a job's folder inside the tab's.
 #[test]
 fn a_path_is_under_its_longest_root() {
     let nested = roots(

@@ -20,7 +20,7 @@ pub struct Connector {
     pub login: Login,
     /// The one-shot mode a review runs.
     pub review: Review,
-    /// Lowercase prefix for lines reporting the CLI's own failure, or `None` to inspect trailing lines.
+    /// Lowercase prefix for lines reporting the CLI's own failure.
     pub error_lead: Option<&'static str>,
     /// Lowercase phrases in a failed run's error output meaning the login has ended.
     pub auth_words: &'static [&'static str],
@@ -141,7 +141,6 @@ pub const CLAUDE: Connector = Connector {
         var: Some("CLAUDE_CONFIG_DIR"),
         default: ".claude",
     },
-    // On macOS the login is a keychain item; profile `oauthAccount` and accounts v2 state report it instead.
     stores: &[".credentials.json"],
     credential_env: &[
         "ANTHROPIC_API_KEY",
@@ -257,7 +256,6 @@ pub const AGY: Connector = Connector {
         var: None,
         default: ".gemini/antigravity-cli",
     },
-    // The OS keyring holds its login, which aterm never reads.
     stores: &[],
     credential_env: &["GEMINI_API_KEY"],
     login: Login::Run {

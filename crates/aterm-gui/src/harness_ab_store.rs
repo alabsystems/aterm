@@ -71,10 +71,8 @@ pub(crate) const SCHEMA: u32 = 1;
 /// The book's directory under the harness's state directory.
 pub(crate) const DIR: &str = "ab";
 
-/// The files' mode: the owner's alone.
 const MODE: u32 = 0o600;
 
-/// The oldest day kept, as days before today: today and the seven before.
 const KEPT_BEFORE: i64 = DAYS as i64 - 1;
 
 /// One process's book on disk.
@@ -215,13 +213,11 @@ pub(crate) fn dir_of(harness_state: &Path) -> PathBuf {
     harness_state.join(DIR)
 }
 
-/// Whether `day` falls within the last [`DAYS`] days of `today`.
 const fn kept(day: i64, today: i64) -> bool {
     day >= today.saturating_sub(KEPT_BEFORE)
 }
 
 /// WRITE THIS PROCESS'S BOOK, whole ([`DAYS`]).
-///
 /// # Errors
 /// Returns an error if creating the directory, writing the file, or removing a stale book fails.
 pub(crate) fn write_own(
@@ -255,7 +251,6 @@ pub(crate) fn write_own(
     aterm_agent::harness::upgrade_models::write_atomic_mode(&path, &text, Some(MODE))
 }
 
-/// Whether `name` is a book's file: `<digits>-<digits>.json`.
 fn is_book_name(name: &str) -> bool {
     name.strip_suffix(".json")
         .and_then(|stem| stem.split_once('-'))

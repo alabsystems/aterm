@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Decoders for `libproc` descriptor layouts, `proc_archinfo` and `kinfo_proc` ([`SDK_ROWS`], [`kinfo`]).
+//! Decoders for `libproc` descriptor layouts, `proc_archinfo`, and `kinfo_proc` ([`SDK_ROWS`]).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -149,7 +149,7 @@ pub const KQUEUE_SIZE: usize = 168;
 /// `offsetof(struct kqueue_fdinfo, kqueueinfo.kq_state)`.
 pub const KQUEUE_STATE_AT: usize = 160;
 
-/// `sizeof(struct kevent_extinfo)` (private; held by the L6 self-check).
+/// `sizeof(struct kevent_extinfo)`.
 pub const KNOTE_SIZE: usize = 104;
 /// `kqext_kev.ident`.
 pub const KNOTE_IDENT_AT: usize = 0;

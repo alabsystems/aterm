@@ -974,9 +974,10 @@ impl Rendezvous {
     pub fn render(&self) -> String {
         format!(
             "# Written by `aterm fabric on` — where this machine's fabric is. `aterm link\n\
-             # ls` and `aterm fabric` read it when their flags are omitted;\n\
-             # `aterm fabric off` removes it. Not the source of truth: aterm launches its\n\
-             # bridge from `[fabric] command` in aterm.toml, which `command` below mirrors.\n\
+             # ls` reads it for flags not given, and `aterm fabric` when aterm.toml has no\n\
+             # [fabric] command; `aterm fabric off` removes it. Not the source of truth: aterm\n\
+             # launches its bridge from `[fabric] command` in aterm.toml, which `command`\n\
+             # below mirrors.\n\
              fleet = {}\n\
              broker = {}\n\
              node = {}\n\
@@ -2224,7 +2225,8 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
             out.done(
                 "broker",
                 &format!(
-                    "systemctl --user daemon-reload; enable --now {label} ({why}); wait for {sock}"
+                    "systemctl --user daemon-reload, enable and restart {label} ({why}); wait \
+                     for {sock}"
                 ),
                 &format!("systemd --user {label} (re)started ({why})"),
             );

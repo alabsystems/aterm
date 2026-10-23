@@ -15,7 +15,6 @@ pub const ENV_TAKE: &str = "LAB_LINK_TAKE";
 /// Environment variable overriding the shell binary launched by the relay.
 pub const ENV_EXEC: &str = "LAB_LINK_EXEC";
 
-/// The round trip when none is named.
 const DEFAULT_RTT_MS: u64 = 100;
 
 /// Configuration for a latency-injecting PTY relay.
@@ -35,7 +34,6 @@ impl Settings {
     }
 
     /// Reads relay settings from environment lookup `get` for process `pid`.
-    ///
     /// # Errors
     /// `LAB_LINK_RTT_MS` is not a whole number of milliseconds.
     pub fn from_env(get: impl Fn(&str) -> Option<String>, pid: u32) -> Result<Settings, String> {
@@ -145,7 +143,6 @@ pub fn wait_ms(now: Instant, a: Option<Instant>, b: Option<Instant>) -> i32 {
     i32::try_from(ms).unwrap_or(i32::MAX)
 }
 
-/// The far end's take: a line per chunk, ptyrec's shape.
 struct Take(Option<std::fs::File>);
 
 impl Take {
@@ -160,9 +157,6 @@ impl Take {
         }))
     }
 
-    /// The far end's window as it is told it: `<t_ns> W <rows>x<cols>`, at the
-    /// start and at every size passed on, so a replay of the take draws at the
-    /// size the far end drew at.
     fn size(&mut self, ws: &WinSize) {
         let Some(f) = &mut self.0 else { return };
         let line = format!("{} W {}x{}\n", sys::monotonic_ns(), ws.ws_row, ws.ws_col);
@@ -207,7 +201,6 @@ pub fn main(args: &[String]) -> i32 {
     relay(&settings, None, command)
 }
 
-/// No size: what the relay hands on when its outer side is no terminal.
 const NO_SIZE: WinSize = WinSize {
     ws_row: 24,
     ws_col: 80,
@@ -215,8 +208,6 @@ const NO_SIZE: WinSize = WinSize {
     ws_ypixel: 0,
 };
 
-/// The relay proper: `command` behind an inner PTY (started with `arg0` when
-/// given), every chunk held `rtt/2` each way.
 fn relay(settings: &Settings, arg0: Option<&str>, command: &[String]) -> i32 {
     let Ok(signals) = sys::SignalPipe::install(&[
         libc::SIGWINCH,
@@ -392,8 +383,6 @@ mod tests {
         a.iter().map(|s| (*s).to_string()).collect()
     }
 
-    /// Each way holds every chunk for half the round trip, in the order read,
-    /// whole; nothing is handed on before it is due.
     #[test]
     fn a_way_hands_each_chunk_on_half_a_round_trip_after_it_was_read_in_order() {
         let t0 = Instant::now();
@@ -415,8 +404,6 @@ mod tests {
         assert!(way.is_empty(), "an empty read holds nothing");
     }
 
-    /// The poll waits until the earlier chunk is due, rounded up, so it never
-    /// wakes before one; nothing held waits on the descriptors alone.
     #[test]
     fn the_wait_is_until_the_earlier_due_chunk_rounded_up() {
         let t0 = Instant::now();
@@ -427,7 +414,6 @@ mod tests {
         assert_eq!(wait_ms(t0 + ms(9), Some(t0 + ms(7)), None), 0);
     }
 
-    /// A relay run by hand names its round trip and its take, then the command.
     #[test]
     fn the_relay_by_hand_takes_a_round_trip_and_a_take_then_dashes_then_a_command() {
         let a = v(&["--rtt", "250", "--take", "/t/x.take", "--", "zsh", "-f"]);
@@ -443,8 +429,6 @@ mod tests {
         assert!(parse_args(&v(&["zsh"])).is_none());
     }
 
-    /// Started under a shell's name it reads its round trip and its take's
-    /// directory from the environment, and starts the shell of that name.
     #[test]
     fn under_a_shells_name_it_starts_that_shell_with_the_environments_link() {
         let env = |k: &str| match k {

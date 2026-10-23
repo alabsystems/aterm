@@ -16,13 +16,11 @@ pub fn is_fleet(f: &str) -> bool {
 /// Why a record on an `in` lane was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
-    /// Not seven segments, not under this fleet, or a segment that is not the shape its position
-    /// demands.
+    /// Not seven segments, not under this fleet.
     Malformed,
     /// A `<sid>` this node does not host.
     NotHosted,
-    /// A record on this node's own lane, under this node's `<src>`, at an offset the bridge never
-    /// got a `PublishAck` for: a forgery by a co-holder of the node cap (§6.2).
+    /// Record on this node's own lane at an offset the bridge never got a `PublishAck` for.
     ForgedSelf,
 }
 
@@ -51,8 +49,7 @@ pub struct InAddr {
     pub kind: String,
 }
 
-/// Parse an `in` subject by position from the left, against the fleet and node this
-/// bridge serves: exactly `f`, `<F>`, `in`, `<node>`, `<sid>`, `<src>`, `<kind>`.
+/// Parse an `in` subject by position from the left, against the fleet and node this bridge serves.
 /// # Errors
 /// [`Reject::Malformed`] for anything that is not that shape.
 pub fn parse_in(fleet: &str, node: &str, subject: &str) -> Result<InAddr, Reject> {
@@ -149,8 +146,7 @@ pub struct HaltRow<'a> {
     pub reason: Option<String>,
 }
 
-/// Parse a fleet halt row, `/f/<F>/fleet/<h-name>/halt`, by the rule every bridge applies a halt
-/// under (§5.3), or `None` for a record that halts nothing.
+/// Parse a fleet halt row (`/f/<F>/fleet/<h-name>/halt`).
 #[must_use]
 pub fn parse_halt<'a>(fleet: &str, subject: &'a str, body: &[u8]) -> Option<HaltRow<'a>> {
     let segs: Vec<&'a str> = subject.split('/').collect();
@@ -195,9 +191,7 @@ pub struct SayAddr {
     pub topic: String,
 }
 
-/// Parse a broadcast subject left-anchored and by position, seven segments
-/// (`f`/`<F>`/`pub`/`<node>`/`<sid>`/`say`/`<topic>`), like [`parse_in`]: the filter's `>` matches
-/// one or more segments, so only a counting parse refuses a longer subject.
+/// Parse a seven-segment broadcast subject (`f`/`<F>`/`pub`/`<node>`/`<sid>`/`say`/`<topic>`).
 #[must_use]
 pub fn parse_say(fleet: &str, subject: &str) -> Option<SayAddr> {
     let segs: Vec<&str> = subject.split('/').collect();
@@ -222,8 +216,6 @@ pub fn parse_say(fleet: &str, subject: &str) -> Option<SayAddr> {
 mod tests {
     use super::*;
 
-    /// The 8-segment forgery is malformed, though a right-anchored reading
-    /// would name `h-andrew` as the sender.
     #[test]
     fn an_eight_segment_subject_is_malformed_however_its_tail_reads() {
         let forged = "/f/f1/in/n-a/s-b/s-1/h-andrew/answer";
@@ -240,7 +232,6 @@ mod tests {
         );
     }
 
-    /// Every other wrong shape is the same refusal.
     #[test]
     fn the_shape_is_pinned_at_every_position() {
         for bad in [
@@ -259,10 +250,6 @@ mod tests {
         }
     }
 
-    /// Only a human's row of the halt shape halts: an `a-` service's or a node's
-    /// `state=on` row, or one of another shape, halts nothing. The body reads as
-    /// the bridge's decoder reads it: a tab is not a separator, a newline ends the
-    /// tokens, and a later `state=` wins.
     #[test]
     fn only_a_humans_halt_row_halts() {
         let on = b"v=1 t=1 state=on reason=main%20broken";

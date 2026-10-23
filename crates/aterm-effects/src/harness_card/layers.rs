@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CARD ON FX LAYERS (`docs/DESIGN-card-engine-2026-10-19.md` §4.8): the card's frame as two contents, card-local, the host lays at the card's origin as two layers ([`CardFrame::layers`]).
+//! THE CARD ON FX LAYERS (`docs/DESIGN-card-engine-2026-10-19.md` §4.8).
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
@@ -23,9 +23,6 @@ use crate::effect_util::{
     STAR_PAINTS, STAR_TAPER_STEPS, StarPart, star_arm, star_arm_px, star_pieces,
 };
 
-/// How many contents pairs an episode cycles through: the frame the host is
-/// building, the one the renderer last drew and one spare, so the pair a
-/// frame refills is held by nobody in the steady state (`Arc::get_mut`).
 const RING: usize = 3;
 
 /// A card's SHAPE: its scene with the card's origin taken out ([`Self::of`]).
@@ -35,7 +32,7 @@ pub struct CardShape {
 }
 
 impl CardShape {
-    /// `scene`'s shape, and the scene-space pixel its card-local `(0, 0)` lands on: the card's origin, the border's outer top-left.
+    /// `scene`'s shape.
     #[must_use]
     pub fn of(scene: &CardScene) -> (Self, (i32, i32)) {
         let s = scene;
@@ -111,7 +108,7 @@ fn sat_i32(v: i64) -> i32 {
     i32::try_from(v).unwrap_or(if v < 0 { i32::MIN } else { i32::MAX })
 }
 
-/// One frame of a card: its two contents, card-local, and where the card's origin lands in the scene's pixel space ([`CardShape::of`]).
+/// One frame of a card.
 #[derive(Clone, Debug)]
 pub struct CardFrame {
     /// The border and the trail, drawn beneath the glyph ink.
@@ -122,7 +119,7 @@ pub struct CardFrame {
     pub origin: (i32, i32),
 }
 
-/// The layer id of a card's `slot` content: the host's stable name for the card (its session) mixed with the slot, so a card's two layers keep their ids from frame to frame and two cards never share one.
+/// The layer id of a card's `slot` content.
 #[must_use]
 #[inline]
 pub const fn card_layer_id(card: u64, slot: FxSlot) -> u64 {
@@ -135,7 +132,7 @@ pub const fn card_layer_id(card: u64, slot: FxSlot) -> u64 {
 }
 
 impl CardFrame {
-    /// The frame as its two layers (design §4.8): `under` in window space at the card's origin, so a spill sees the border in the padding, and `over` in grid space; both [`FxBlend::Exact`], clipped to `pane` (window pixels), named by [`card_layer_id`] for `card`.
+    /// The frame as its two layers (design §4.8).
     #[must_use]
     pub fn layers(&self, card: u64, pane: PxRect, grid: (i32, i32)) -> [FxLayer; 2] {
         let mut under = FxLayer::new(
@@ -177,7 +174,6 @@ impl CardFrame {
                 edge(pane.y1, grid.1),
             );
         } else {
-            // A relative origin outside i32 cannot name this placement.
             over.clip = PxRect::EMPTY;
         }
         [under, over]
@@ -191,11 +187,11 @@ impl CardFrame {
     }
 }
 
-/// One card's last KEPT frame: its shape, which flow step of which grid it is (`None`: the SETTLED frame) and its two contents, kept so that a held card, or a flowing one between two of its steps, is replayed rather than drawn again ([`super::HarnessCard::replay`], [`super::HarnessCard::replay_step`]): the same `Arc`s, frame after frame.
+/// One card's last KEPT frame.
 #[derive(Clone, Debug)]
 pub struct KeptFrame {
     pub(super) shape: CardShape,
-    /// The flow step and the grid it was drawn on ([`super::HarnessCard::flow_step`]); `None` for the settled frame.
+    /// The flow step and the grid it was drawn on ([`super::HarnessCard::flow_step`]).
     pub(super) step: Option<(u64, u32)>,
     pub(super) under: Arc<FxContent>,
     pub(super) over: Arc<FxContent>,
@@ -220,7 +216,7 @@ impl KeptFrame {
     }
 }
 
-/// One card's frames, kept by its host beside the card ([`super::HarnessCard::draw`], [`super::HarnessCard::replay`]): the frame it keeps (settled, or the flow's current step), the ring of contents its frames are built in, and its cell height's arts.
+/// One card's frames.
 #[derive(Debug, Default)]
 pub struct CardFrames {
     kept: Option<KeptFrame>,
@@ -243,7 +239,7 @@ impl CardFrames {
         self.kept = kept;
     }
 
-    /// The arts this card's frames are drawn with (its last frame's cell height), for a host that hands them to the renderer ahead of use.
+    /// The arts this card's frames are drawn with (its last frame's cell height).
     #[must_use]
     #[inline]
     pub const fn arts(&self) -> Option<&Arc<CardArts>> {
@@ -281,10 +277,6 @@ impl CardFrames {
     }
 }
 
-/// Refill `content` in place through `f`, re-sealed; a content some frame
-/// still holds (the renderer kept it longer than the ring's depth) is
-/// replaced by a fresh one with its room ([`FxContent::empty_like`]), so a
-/// miss costs the content and its two vectors, never their growth.
 fn refill(content: &mut Arc<FxContent>, f: impl FnOnce(&mut Vec<FxItem>, &mut Vec<FxInk>)) {
     if Arc::get_mut(content).is_none() {
         *content = Arc::new(content.empty_like());
@@ -305,20 +297,13 @@ const fn fx_ink(p: Paint) -> FxInk {
     FxInk::over(p.color, p.alpha)
 }
 
-/// [`fx_art::art_dimensions`] of a `w × h` art in the card's pixels.
+/// Validate a producer's dimensions before allocating any texels.
 #[inline]
 fn art_size(w: i64, h: i64) -> Option<(u16, u16, usize)> {
     fx_art::art_dimensions(usize::try_from(w).ok()?, usize::try_from(h).ok()?)
 }
 
-/// The rim's strip-id art for one frame of the kitty at one pixel size: the
-/// strips ([`rim_strips`]) as one Index8 picture, strip `k` texel `k + 1`
-/// (they never overlap: one strip a texel), its top-left texel at `origin`
-/// from the kitty's top-left; each strip's midpoint, doubled (`x0 + x1`,
-/// `y0 + y1`, from the kitty's top-left), the input `rim_paint` reads; and
-/// its cover ([`fx_art::cover`], at most [`RIM_COVER_MAX`] rectangles, from
-/// the kitty's top-left): the rim is drawn one item a rectangle, so no
-/// fragment runs over the kitty it rings or the air round it.
+/// The rim's strip-id art for one frame of the kitty at one pixel size.
 #[derive(Clone, Debug)]
 struct RimArt {
     art: Arc<FxArt>,
@@ -341,8 +326,6 @@ impl RimArt {
         art_size(w, h)
     }
 
-    /// The rim of `frame` at kitty pixel `p` and rim width `rim`; `None`
-    /// with no rim (`rim == 0`), or an art past the registry's bounds.
     fn of(frame: &[&str], p: i64, rim: i64) -> Option<Self> {
         if rim == 0 || p == 0 {
             return None;
@@ -394,8 +377,7 @@ impl RimArt {
     }
 }
 
-/// One star's arts ([`star_pieces`] through [`fx_art::pieces`]): its folded
-/// and peeled forms and each point step's taper, which its paints read.
+/// One star's arts ([`star_pieces`] through [`fx_art::pieces`]).
 #[derive(Clone, Debug)]
 struct StarArt {
     pieces: PieceArt,
@@ -403,7 +385,6 @@ struct StarArt {
 }
 
 impl StarArt {
-    /// The star of half-length `arm` (glints when `gold`).
     fn of(arm: i32, gold: bool) -> Option<Self> {
         if arm < 1 {
             return None;
@@ -432,7 +413,7 @@ impl StarArt {
     }
 }
 
-/// The card's arts at one cell height: the kitty's six frames (scale-free), the rim of each at the height's kitty pixel, and every star the height's card lays — each arm from 1 to the largest a light hero star reaches, plain and gold.
+/// The card's arts at one cell height.
 #[derive(Debug)]
 pub struct CardArts {
     ch: u16,
@@ -448,7 +429,7 @@ fn kitty_slot(art: &KittyArt, pose: KittyPose) -> usize {
 }
 
 impl CardArts {
-    /// The arts for cell height `ch`, shared by every card of that height while any holds them: built on the first ask, kept weakly.
+    /// The arts for cell height `ch`.
     #[must_use]
     pub fn for_cell(ch: u16) -> Option<Arc<Self>> {
         let dimensions = Self::dimensions(ch)?;
@@ -491,7 +472,6 @@ impl CardArts {
         Some((p, rim, arm_max))
     }
 
-    /// Build the arts for an admitted cell height `ch`.
     fn build(ch: u16, (p, rim, arm_max): (i64, i64, i32)) -> Self {
         let arts = [KITTY_SHORT, kitty_tall()];
         let poses = [KittyPose::Open, KittyPose::Blink, KittyPose::Flick];
@@ -518,7 +498,7 @@ impl CardArts {
         self.ch
     }
 
-    /// Every art, for a host that hands them to the renderer's atlas ahead of their first frame (`RenderInput::fx_prefetch`).
+    /// Every art.
     pub fn arts(&self) -> impl Iterator<Item = &Arc<FxArt>> {
         let kitty = self.kitty.iter();
         let rim = self.rim.iter().flatten().map(|r| &r.art);
@@ -548,9 +528,6 @@ impl CardArts {
     }
 }
 
-/// The under content's sink: every ramp clipped and re-ramped where a clip
-/// cuts it ([`clip_ramp`]), the border's side slices run together into one
-/// stack of one-row ramps a side.
 struct UnderItems<'a> {
     clip: Rect,
     items: &'a mut Vec<FxItem>,
@@ -611,8 +588,6 @@ impl Ramps for UnderItems<'_> {
     }
 }
 
-/// The under content of `cx`'s frame: the border, then (but in serious
-/// mode) the trail.
 fn fill_under(cx: &Emit<'_>, items: &mut Vec<FxItem>, palette: &mut Vec<FxInk>) {
     let mut out = UnderItems {
         clip: cx.geo.clip,
@@ -631,9 +606,6 @@ fn fill_under(cx: &Emit<'_>, items: &mut Vec<FxItem>, palette: &mut Vec<FxInk>) 
     );
 }
 
-/// The over content of `cx`'s frame (none in serious mode): the kitty, its
-/// rim, then the burst, rainbow glints, field and ride sparkles
-/// ([`Emit::each_star`]), using the same cached star arts.
 fn fill_over(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Vec<FxInk>) {
     if cx.scene.serious {
         return;
@@ -664,9 +636,6 @@ fn fill_over(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &
     );
 }
 
-/// The kitty: one sprite of its frame's art at its square pixel, its seven
-/// colours opaque ([`KittyInk`]), drawn whole inside the clip or not at all
-/// (`kitty_rect`).
 fn kitty(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Vec<FxInk>) {
     let Some((at, pose)) = cx.kitty else {
         return;
@@ -694,12 +663,6 @@ fn kitty(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut 
     }));
 }
 
-/// The rim: one sprite of its strip-id art round the kitty, each strip its
-/// own entry in the border's spectrum ([`Emit::rim_paint`] at the strip's
-/// midpoint), laid one item a rectangle of its cover ([`RimArt::cover`]),
-/// inside the border's stroke and cut round the trail's hole
-/// ([`Emit::rim_hole`]) — one item each side of the hole a rectangle
-/// reaches.
 fn rim(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Vec<FxInk>) {
     let Some((at, pose)) = cx.kitty else {
         return;
@@ -755,12 +718,6 @@ const fn px_rect(r: Rect) -> PxRect {
     PxRect::new(r.x0 as i32, r.y0 as i32, r.x1 as i32, r.y1 as i32)
 }
 
-/// One star ([`StarCall`]): on dark one FOLDED sprite, each class of its
-/// pieces the `add_sat` sum of their light; on light its PEELED sprites, a
-/// layer of its depth each, every piece in its print ink — the paper's
-/// white where the pixel lies on the trail's ink (`on_trail`, segment by
-/// segment), its ink off it, so a star the trail's edge crosses is whole in
-/// two tones, cut into tone rectangles ([`tone_rects`]).
 fn star(
     items: &mut Vec<FxItem>,
     palette: &mut Vec<FxInk>,
@@ -851,9 +808,6 @@ fn star(
     });
 }
 
-/// The tone rectangles of a light star's box `b` (clipped) under the trail's
-/// ink `covers` (its segments, left to right, each starting where the last
-/// ends): `(rect, white)` for each, `white` where the pixels lie on the ink.
 fn tone_rects(b: Rect, covers: &[Rect], mut lay: impl FnMut(Rect, bool)) {
     let lo = covers.partition_point(|c| c.x1 <= b.x0);
     let span = covers[lo..].partition_point(|c| c.x0 < b.x1);
@@ -896,7 +850,7 @@ fn tone_rects(b: Rect, covers: &[Rect], mut lay: impl FnMut(Rect, bool)) {
     }
 }
 
-/// The items and palette the card lays for the one star `s` (any arm, its art built afresh), inside `geo_clip`, under the light trail's ink `on_trail`: [`star`], for the tests.
+/// The items and palette the card lays for the one star `s` (any arm, its art built afresh).
 #[cfg(test)]
 pub(super) fn one_star(
     s: StarCall,
@@ -918,7 +872,7 @@ pub(super) fn kitty_art(arts: &CardArts, art: &KittyArt, pose: KittyPose) -> Arc
     Arc::clone(arts.kitty(art, pose))
 }
 
-/// The rim's strip-id art, its top-left's place from the kitty's top-left and its strip count for one frame, for the tests.
+/// The rim's strip-id art.
 #[cfg(test)]
 pub(super) fn rim_art(
     arts: &CardArts,
@@ -929,7 +883,7 @@ pub(super) fn rim_art(
         .map(|r| (Arc::clone(&r.art), r.origin, r.mids.len()))
 }
 
-/// The rectangles the rim of one frame is laid in, from the kitty's top-left ([`RimArt::cover`]), for the tests.
+/// The rectangles the rim of one frame is laid in.
 #[cfg(test)]
 pub(super) fn rim_cover(arts: &CardArts, art: &KittyArt, pose: KittyPose) -> Option<Box<[Rect]>> {
     arts.rim(art, pose).map(|r| r.cover.clone())

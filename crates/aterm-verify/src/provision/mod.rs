@@ -20,7 +20,7 @@ pub use place::SCRATCH_PREFIX;
 pub use rows::{Anchor, Archive, Engine, Install, MICROSOFT_TEAM, ROWS, Row, row};
 pub use stable::{FOREIGN_CELL_TARGETS, WasmClause, wasm_clause};
 
-/// The OS's curl, by absolute path (§6.1 row 10).
+/// System `curl` binary path.
 pub(crate) const CURL: &str = "/usr/bin/curl";
 
 /// Stamp filename beside a pinned program ([`aterm_uds::host::PIN_STAMP`]).
@@ -271,10 +271,7 @@ pub(crate) fn complete(t: &Target) -> bool {
     t.dir.join(&t.exe).is_file() && place::read_stamp(&t.dir).is_some_and(|s| t.admits(&s))
 }
 
-/// `engine`'s pinned browser exactly as `verify provision` placed it on
-/// `machine`: its executable, when it is there and its stamp admits the pin
-/// ([`complete`]). A copy laid by hand, an adopted one or another pin's is
-/// not, so nothing a run finds this way is a browser nobody pinned.
+/// Returns `engine`'s executable on `machine` when present with a matching pin stamp ([`complete`]).
 pub(crate) fn placed_browser(engine: Engine, machine: &Machine) -> Option<PathBuf> {
     let t = target(row(engine_name(engine))?, machine)?;
     complete(&t).then(|| t.dir.join(&t.exe))
@@ -493,7 +490,6 @@ fn rustup_row(
     match stable::run(&machine.repo, &machine.homes, host.rustup(), init, say) {
         Ok(acquired) if acquired.is_empty() => State::Present(machine.homes.rustup_home.clone()),
         Ok(_) => State::Placed(machine.homes.rustup_home.clone()),
-        // A failed run need not prove rustup-init's exit: its scratch stays.
         Err(why) => match fetched {
             Some((scratch, _)) => State::Failed(format!(
                 "rustup: {why}; keeping rustup-init's scratch at {}",
@@ -560,7 +556,6 @@ fn unpack_row(
     Ok(t.dir.join(&t.exe))
 }
 
-/// The `--record` row.
 fn cargo_row(
     row: &Row,
     t: &Target,
@@ -621,7 +616,6 @@ fn cargo_row(
     }
 }
 
-/// A browser row: fetched.
 fn browser_row(
     engine: Engine,
     t: &Target,
@@ -639,7 +633,6 @@ fn browser_row(
     }
 }
 
-/// [`browser_row`]'s fetch, unzip, check, stamp and placement of `pin` as row `name`.
 fn place_browser(
     name: &str,
     pin: &crate::browser::Pin,
@@ -766,7 +759,6 @@ impl System {
     }
 }
 
-/// The last `n` lines of `text`.
 fn tail(text: &[u8], n: usize) -> String {
     let text = String::from_utf8_lossy(text);
     let lines: Vec<&str> = text.trim_end().lines().collect();

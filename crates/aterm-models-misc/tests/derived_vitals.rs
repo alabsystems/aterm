@@ -132,6 +132,7 @@ fn the_scope_balance_holds_and_each_law_has_its_own_mutant() {
         (3, &["PartsNeverNegative"]),
         (4, &["ResidualIsShown"]),
         (5, &["MatchedWindowsOnly"]),
+        (6, &["ExitedWorkStaysCounted"]),
     ] {
         let broken = interp::violated_invariants(&interp::with_buggy(&model, dial));
         assert_eq!(broken.into_iter().collect::<Vec<_>>(), laws, "Buggy {dial}");
@@ -146,6 +147,46 @@ fn the_scope_balance_holds_and_each_law_has_its_own_mutant() {
         (s["moved"], s["others"], s["tab"], s["rest"], s["residual"]),
         (1, 0, 2, 0, -1)
     );
+
+    let run = [
+        "ExitedWork",
+        "DelegatedElsewhere",
+        "DelegatedWork",
+        "Move",
+        "Close",
+    ];
+    let mut s = model.init_state();
+    for action in run {
+        assert!(model.fire(action, &mut s), "{action}");
+    }
+    assert_eq!(
+        (s["g"], s["a"], s["x"], s["l"], s["d"], s["e"]),
+        (3, 1, 1, 2, 1, 1)
+    );
+    assert_eq!(
+        (
+            s["moved"],
+            s["others"],
+            s["tab"],
+            s["rest"],
+            s["services"],
+            s["residual"]
+        ),
+        (2, 0, 1, 2, 0, 0),
+        "both tabs' members leave the launcher once; only the caller's is its tab; \
+         the exited member and the other tab's stay on aterm's side"
+    );
+    let dropped = interp::with_buggy(&model, 6);
+    let mut s = dropped.init_state();
+    for action in run {
+        assert!(dropped.fire(action, &mut s), "{action}");
+    }
+    assert_eq!(
+        (s["rest"], s["services"], s["residual"]),
+        (1, 1, 0),
+        "Buggy 6 charges the reaped member's time to services, the sum intact"
+    );
+    assert!(!dropped.check_invariant("ExitedWorkStaysCounted", &s));
 }
 
 #[test]

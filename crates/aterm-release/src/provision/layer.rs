@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What `ship provision` audits past its own Apple, notary and credential checks
-//! (docs/DESIGN-init-system-2026-10-20.md §4.6): a release host is a develop machine plus the
-//! `release` layer.
+//! What `ship provision` audits past its own Apple, notary and credential checks: a release
+//! host is a develop machine plus the `release` layer.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,14 +50,12 @@ enum Kind {
     Firebase,
 }
 
-/// One item of the layers this audit reads.
 struct LayerItem {
     id: &'static str,
     kind: Kind,
     host: Arc<dyn ReleaseHost>,
 }
 
-/// The items, in the order the audit prints them.
 const ITEMS: [(&str, Kind); 6] = [
     ("base", Kind::Base),
     ("develop", Kind::Develop),
@@ -68,7 +65,6 @@ const ITEMS: [(&str, Kind); 6] = [
     ("release.firebase", Kind::Firebase),
 ];
 
-/// Whether `path` is a regular file with an execute bit.
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -228,7 +224,6 @@ impl LayerItem {
         }
     }
 
-    /// The one act that makes this item right.
     fn remedy(&self) -> Remedy {
         match self.kind {
             Kind::Base => Remedy::Init {
@@ -333,7 +328,6 @@ impl Item for LayerItem {
     }
 }
 
-/// The items over `host`.
 fn items(host: &Arc<dyn ReleaseHost>) -> Vec<Box<dyn Item>> {
     ITEMS
         .iter()
@@ -347,7 +341,6 @@ fn items(host: &Arc<dyn ReleaseHost>) -> Vec<Box<dyn Item>> {
         .collect()
 }
 
-/// `remedy` as the `fix:` line an audit prints: a command that exists, or the act.
 fn fix_words(remedy: &Remedy) -> String {
     match remedy {
         Remedy::Repair => "aterm pkg repair".into(),
@@ -363,7 +356,6 @@ fn fix_words(remedy: &Remedy) -> String {
     }
 }
 
-/// `row` as one audit line.
 fn check_of(row: &ItemReport) -> Check {
     let explain = row.explain.clone().unwrap_or(Explain {
         why: row.why.clone().unwrap_or_else(|| row.title.clone()),
@@ -424,7 +416,6 @@ impl System {
         }
     }
 
-    /// The installed aterm: the account's `~/.local/bin/aterm` link, else the app's.
     fn installed_aterm(&self) -> Option<PathBuf> {
         [
             self.home.join(".local/bin/aterm"),
@@ -435,7 +426,6 @@ impl System {
     }
 }
 
-/// The JSON report among `stdout`'s lines: the last that parses as one.
 fn report_in(stdout: &str) -> Option<aterm_converge::Report> {
     stdout
         .lines()
@@ -528,7 +518,6 @@ impl ReleaseHost for System {
 mod tests {
     use super::*;
 
-    /// A release host made of a scratch home, with what each item reads set by hand.
     struct Fake {
         home: PathBuf,
         base: Option<bool>,
@@ -570,7 +559,6 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// A host every item of the layer passes on.
     fn whole(home: &Path) -> Fake {
         std::fs::create_dir_all(home.join("publication/.git")).unwrap();
         executable(&home.join("publication/bin/pub"));
@@ -585,12 +573,10 @@ mod tests {
         }
     }
 
-    /// `ship provision`'s closing over `checks` on a minted machine: its verdict.
     fn closing(home: &Path, checks: &[(&'static str, Check)]) -> crate::ledger::Result<()> {
         closing_as(home, checks, false, true)
     }
 
-    /// `ship provision`'s closing over `checks`, a `--check` or not, minted or not.
     fn closing_as(
         home: &Path,
         checks: &[(&'static str, Check)],
@@ -614,15 +600,11 @@ mod tests {
         })
     }
 
-    /// The release item `id`'s line over `fake`.
     fn line_of(fake: Fake, id: &str) -> Check {
         let checks = audit(&(Arc::new(fake) as Arc<dyn ReleaseHost>));
         checks.into_iter().find(|(i, _)| *i == id).unwrap().1
     }
 
-    /// Each release item's own gap is a FAIL naming what is missing: gitleaks beside the
-    /// publication engine, an executable deploy.sh in the site checkout, node and
-    /// firebase-tools. NEGATIVE CONTROL: the whole host passes each (the test above).
     #[test]
     fn each_release_items_gap_fails_naming_what_is_missing() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -667,7 +649,6 @@ mod tests {
         ));
     }
 
-    /// [`whole`]'s host over files already laid, left as they are.
     fn whole_keeping(home: &Path) -> Fake {
         Fake {
             home: home.to_path_buf(),
@@ -679,8 +660,6 @@ mod tests {
         }
     }
 
-    /// A `--check` of a host not yet minted exits non-zero naming each open item, as one of
-    /// a minted host does. NEGATIVE CONTROL: the same audit with nothing open exits 0.
     #[test]
     fn an_unminted_check_with_a_gap_fails_naming_it() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -697,9 +676,6 @@ mod tests {
         );
     }
 
-    /// The design's S7 test: a missing release item makes `ship provision` exit non-zero
-    /// naming it. NEGATIVE CONTROL: the same host with the engine in place closes READY
-    /// TO CUT.
     #[test]
     fn a_missing_release_item_fails_the_run_naming_it() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -737,8 +713,6 @@ mod tests {
         }
     }
 
-    /// Base and develop gate the run as the release items do, each naming its one
-    /// command; a LibreSSL off macOS is no gap.
     #[test]
     fn base_and_develop_name_their_commands() {
         let dir = aterm_tempfile::tempdir().unwrap();

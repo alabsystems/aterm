@@ -37,7 +37,6 @@ pub(crate) fn split_messages(pending: &mut Vec<u8>) -> Vec<Value> {
     out
 }
 
-/// Forward every message `from` carries to `tx` until EOF.
 fn pump(mut from: std::io::PipeReader, tx: &Sender<Value>) {
     let (mut pending, mut buf) = (Vec::new(), vec![0u8; 1 << 16]);
     loop {
@@ -66,8 +65,6 @@ impl Cdp {
         }
     }
 
-    /// The next message, within what is left of the hang detector started at
-    /// `t0`; `what` names the wait in the error.
     fn recv(&mut self, t0: Instant, what: &str) -> Result<Value, String> {
         let left = HANG_DETECTOR.saturating_sub(t0.elapsed());
         match self.from.recv_timeout(left) {
@@ -141,13 +138,7 @@ impl Cdp {
         }
     }
 
-    /// Wait for the console line `marker` from the page `session` (a
-    /// `Runtime.consoleAPICalled` whose first argument is exactly `marker`),
-    /// taken out of the events; the lines before it stay for
-    /// [`Cdp::take_console`]. The hang detector starts again at each message
-    /// the page sends, so a page that keeps printing is not hung however long
-    /// it runs, and one silent for a minute is. A page that crashes ends the
-    /// wait at once, a crash read while an earlier call waited included.
+    /// Waits for console line `marker` from `session`, resetting the hang detector on each event.
     pub(crate) fn wait_console(&mut self, session: &str, marker: &str) -> Result<(), String> {
         let from_page = |m: &Value| m.get("sessionId").and_then(Value::as_str) == Some(session);
         let is = |m: &Value| {
@@ -160,7 +151,6 @@ impl Cdp {
                 && m.get("method").and_then(Value::as_str) == Some("Inspector.targetCrashed")
         };
         let crash = || format!("the page crashed before {marker:?}");
-        // The events already read, oldest first: whichever came first decides.
         if let Some(i) = self.events.iter().position(|m| is(m) || crashed(m)) {
             if crashed(&self.events[i]) {
                 return Err(crash());
@@ -208,7 +198,6 @@ impl Cdp {
     }
 }
 
-/// `console.<type>: <args>` for one `Runtime.consoleAPICalled` event.
 fn console_line(m: &Value) -> String {
     let kind = m
         .pointer("/params/type")
@@ -298,9 +287,6 @@ mod tests {
         assert_eq!(console_line(&m), "console.error: boom 3 Error: x");
     }
 
-    /// The pipe round trip: a stand-in browser on two real pipes answers a
-    /// call after an unrelated event, which is kept for `wait_event`, and a
-    /// protocol error comes back as `Err`.
     #[test]
     fn a_call_waits_for_its_own_answer_and_keeps_the_events_between() {
         let (to_read, to_write) = std::io::pipe().expect("pipe");
@@ -342,9 +328,6 @@ mod tests {
         browser.join().expect("the stand-in");
     }
 
-    /// A console marker is waited for past the page's other lines, which stay
-    /// for `take_console`; another page's marker is not this page's, and a
-    /// crash ends the wait.
     #[test]
     fn a_console_marker_ends_the_wait_and_the_lines_before_it_stay() {
         let (_to_read, to_write) = std::io::pipe().expect("pipe");
@@ -376,10 +359,6 @@ mod tests {
         assert_eq!(cdp.wait_console("other", "done"), Ok(()));
     }
 
-    /// A crash the page reported while an earlier call waited for its answer
-    /// ends the console wait at once, not at the hang detector. NEGATIVE
-    /// CONTROL: for a page whose marker was read before its crash, and after
-    /// another page's crash, the wait ends as found.
     #[test]
     fn a_crash_read_during_an_earlier_call_ends_the_console_wait_at_once() {
         let (to_read, to_write) = std::io::pipe().expect("pipe");
@@ -405,8 +384,6 @@ mod tests {
         cdp.call(Some("s"), "Runtime.evaluate", aterm_json::json!({}))
             .expect("answered");
         drop(to_read);
-        // Without the buffered crash this would be the hang detector's
-        // sentence, a minute on.
         assert_eq!(
             cdp.wait_console("s", "done"),
             Err("the page crashed before \"done\"".to_string())

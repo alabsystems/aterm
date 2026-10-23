@@ -186,8 +186,8 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
     if matches!(cmd.act, Act::Halt(_)) && !person.starts_with("h-") {
         eprintln!(
             "aterm fabric {verb}: {} is not a human: only an `h-<name>` halts the fleet (every \
-             bridge applies `/f/<F>/fleet/h-<name>/halt` alone); an agent asks one with `post \
-             to=h-<name> kind=ask`",
+             bridge applies `/f/<F>/fleet/h-<name>/halt` alone); an agent's session asks one \
+             with `aterm ctl @<sid> post to=h-<name> kind=ask <text>`",
             safe(&person, 64)
         );
         return ExitCode::from(2);

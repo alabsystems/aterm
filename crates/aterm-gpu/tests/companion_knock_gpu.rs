@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// The knock-out on both backends: a body drawn under the text (`FreeZ::UnderText`) is cut to
-// the page under each glyph that lies on it and two pixels round the ink
-// (`aterm_render::KNOCK_DILATE_OFFSETS`), the CPU in its composite and the GPU on its
-// glyph-knock stream, before any trail draws. Judged on the GPU frame per ink pixel against
-// the nearest ring of pixels the glyphs leave at the page, as the CPU's
-// `companion_knock_out` judges its own; the two frames stay close. Negative control: the
-// knock-out off leaves the letters under 4.5:1 against a tan coat.
-//
-// No GPU or no font: COULD NOT RUN.
+
+//! GPU companion knock-out parity and contrast tests.
 
 use std::sync::Arc;
 
@@ -41,9 +33,6 @@ fn contrast(a: u32, b: u32) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-/// `(ink px judged, ink px under 4.5:1)`: each pixel of `clean` reading 4.5:1 or more on the
-/// page, inside `bx`, against the median of its nearest ring (Chebyshev 1, else 2) of pixels
-/// `clean` leaves at the page colour.
 fn judge(clean: &[u32], frame: &[u32], width: usize, paper: u32, bx: [usize; 4]) -> (usize, usize) {
     let height = clean.len() / width;
     let (mut ink, mut under) = (0, 0);
@@ -91,8 +80,6 @@ fn judge(clean: &[u32], frame: &[u32], width: usize, paper: u32, bx: [usize; 4])
     (ink, under)
 }
 
-/// Letters on a tan body read against the page on the GPU as on the CPU; with the knock-out
-/// off the GPU leaves them under the bar.
 #[test]
 fn both_backends_knock_the_body_out_under_its_letters() {
     let (mut cpu, mut gpu) = backends(18.0, Theme::default());
@@ -152,7 +139,6 @@ fn both_backends_knock_the_body_out_under_its_letters() {
     );
     assert_eq!(cpu_under, 0, "CPU: letters on the body under 4.5:1");
     assert_eq!(gpu_under, 0, "GPU: letters on the body under 4.5:1");
-    // A loose bound: the GPU blends in linear light, the CPU in its own linear table.
     assert!(
         delta <= 24,
         "CPU and GPU knock-outs must stay visually close (max per-channel delta {delta})"
@@ -170,11 +156,6 @@ fn both_backends_knock_the_body_out_under_its_letters() {
     );
 }
 
-/// On glass the knock-out lays the page's colour, never its opacity, on both backends: at
-/// background opacity 0.8 a body box over the letters whose texels are all transparent leaves
-/// the frame byte-equal with and without the knock-out (an opaque stamp drew a solid
-/// glyph-shaped outline round each letter on the glass), and with a tan coat no pixel is made
-/// more opaque than the body left it, the letters still reading against the page's colour.
 #[test]
 fn on_a_translucent_window_both_backends_keep_the_glass() {
     let (mut cpu, mut gpu) = backends(18.0, Theme::default());

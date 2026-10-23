@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Notification Center's widget list with no widget: the `[consumer] widgets` catalog row
-//! that clears it (`consumer.widgets.notification-center`, [`super::catalog::Lit::NoWidgets`]),
-//! whose clear `aterm init`'s row of the same id shares ([`cleared`]), so the key has one
-//! owner (machines design §5.1).
-//!
-//! The list lives in Notification Center's app container, which macOS opens only to a
-//! process whose app holds Full Disk Access ([`super::defaults::withheld`]); the catalog
-//! expands the row only for a run that holds it.
+//! Notification Center's widget list with no widget.
 
 use super::defaults::{self, Relaunch, Relaunches, Target};
 use super::{Activation, Ctx, Item};
@@ -19,13 +12,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// The process that reads the list, and is relaunched to read a write of it.
 pub const READER: &str = "NotificationCenter";
 
-/// What `read` (Notification Center's `widgets` key) should hold to show no widget, or
-/// `None` when it already does: the list with no instance and no desktop placement, every
-/// field it does not know kept; an absent list written as an empty one.
-///
+/// What `read` (Notification Center's `widgets` key) should hold to show no widget.
 /// # Errors
-/// The read failed, or the list is not the dictionary of an instances array it is known as;
-/// it is then left untouched.
+/// The read failed, or the list is not the dictionary of an instances array it is known as; it is
+/// then left untouched.
 pub fn cleared(
     sys: &dyn System,
     user: &User,
@@ -76,9 +66,6 @@ pub fn placement_conversion(user: &User) -> Cmd {
         .as_user(user)
 }
 
-/// NotificationCenter recreates this binary plist even with no widgets. Its empty
-/// display list is metadata, not a configured widget; removing it on every probe
-/// would cause an endless write/relaunch cycle.
 fn empty_placement(sys: &dyn System, user: &User, value: &PValue) -> Result<bool, String> {
     let PValue::Data(bytes) = value else {
         return Ok(false);
@@ -104,7 +91,6 @@ fn empty_placement(sys: &dyn System, user: &User, value: &PValue) -> Result<bool
         }))
 }
 
-/// The list as a report shows it: how many widgets it holds, never their bytes.
 fn shown(read: &Read<PValue>) -> String {
     match read {
         Read::Value(PValue::Dict(fields)) => match fields.iter().find(|(k, _)| k == "instances") {
@@ -119,9 +105,7 @@ fn shown(read: &Read<PValue>) -> String {
     }
 }
 
-/// A fleet run's item of the clearing row for one account: its list cleared, then
-/// Notification Center relaunched once with every other row of the run it reads
-/// ([`Relaunch`]).
+/// A fleet run's item of the clearing row for one account.
 #[derive(Debug)]
 pub struct NoWidgets {
     id: String,

@@ -3580,7 +3580,8 @@ fn record_row(opts: &Opts, session: &str, text: &str, now: u64) -> Option<Row> {
 #[cfg(test)]
 pub(crate) const RECORD_PANICS: &str = "0badf00d-dead-4bad-8bad-panicsonread0";
 
-/// [`rows`] as `aterm harness upgrade --status` shows them.
+/// [`rows`] as `aterm harness upgrade --status` shows them, and whether records and
+/// live holders were read whole.
 #[must_use]
 pub fn status_rows(opts: &Opts, claims: bool) -> (Vec<Row>, bool) {
     status_rows_with(
@@ -3621,7 +3622,7 @@ fn status_rows_with(
     holders: &dyn Fn(&BTreeSet<String>) -> Option<Vec<Holder>>,
     aside: &dyn Fn() -> Aside,
 ) -> (Vec<Row>, bool) {
-    let all = rows_at(
+    let (all, records_whole) = read_rows(
         &Opts {
             only_sid: None,
             ..opts.clone()
@@ -3661,7 +3662,7 @@ fn status_rows_with(
         }
     };
     shown.retain(|r| opts.only_sid.as_ref().is_none_or(|s| *s == r.tab));
-    (shown, vetted)
+    (shown, records_whole && vetted)
 }
 
 /// Tab `tab`'s row (lc-9 of ).

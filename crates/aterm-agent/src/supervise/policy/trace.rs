@@ -1,34 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A DECISION'S RULE TRACE: the checks a policy consulted on its way to a
-//! decision, in the order it consulted them, each with what came of it —
-//! diagnostic data for answering "why did it press 2?".
-//!
-//! The approval policy ([`super::approval::decide_traced`]) and the turn-end
-//! policy ([`super::turn_end::decide_turn_end_traced`]) each take a
-//! [`Trace`] and write a [`TraceStep`] at every check that decided, overruled
-//! a decision, or was consulted and passed the box on; the plain `decide` and
-//! `decide_turn_end` are the same functions handed [`NoTrace`], so there is
-//! ONE policy and a trace can never tell of a decision the policy did not
-//! make.
-//!
-//! **Computed only where a reader asks, never in the loop.** The shipped loop
-//! and a recording one decide through [`NoTrace`]: a step is built only
-//! behind [`Trace::on`] ([`note`]), so a live decision builds no string and
-//! allocates nothing for a trace it does not keep, and a tape holds no trace
-//! (a trace is a function of what the tape does hold). `aterm drive replay
-//! --why` (`tape::explain`) collects an approval's steps by deciding again
-//! from the recorded facts and policy inputs, and a turn end's by rebuilding
-//! the fold in a strict replay on the recording build, the one replay that
-//! traces (`Fx::tracing`).
-//!
-//! **Named by rule id.** A step that decided by a rule names it
-//! ([`TraceStep::rule`]: `read-only@classify-v7`, `continue@v1`); a check
-//! that has no rule of its own — a gate that hands the box to a person, a
-//! level's rules that proved nothing, the press gate overruling an answer —
-//! is named by the check ([`TraceStep::check`]). The decision a trace ends
-//! on is said by [`deciding`]: the last step that decided or overruled.
+//! Rule trace ([`super::approval::decide_traced`], [`super::turn_end::decide_turn_end_traced`]).
+//! Collectors: [`Trace`], [`TraceStep`], [`NoTrace`], [`Trace::on`], and [`note`].
+//! Selectors: [`TraceStep::rule`], [`TraceStep::check`], and [`deciding`].
 
 /// One step of a decision's trace ([module docs](self)).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +19,7 @@ pub struct TraceStep {
 }
 
 impl TraceStep {
-    /// The step's name: its rule's id where a rule decided, else its check's.
+    /// The step's name.
     #[must_use]
     pub fn name(&self) -> &'static str {
         self.rule.unwrap_or(self.check)
@@ -68,10 +43,8 @@ pub enum Outcome {
 
 /// Where a decision writes its trace ([module docs](self)).
 pub trait Trace {
-    /// Whether steps are kept: `false`, and none is ever built.
     fn on(&self) -> bool;
 
-    /// Keep `step`.
     fn step(&mut self, step: TraceStep);
 }
 
@@ -87,7 +60,6 @@ impl Trace for NoTrace {
     fn step(&mut self, _: TraceStep) {}
 }
 
-/// A trace kept in order.
 impl Trace for Vec<TraceStep> {
     fn on(&self) -> bool {
         true
@@ -98,8 +70,7 @@ impl Trace for Vec<TraceStep> {
     }
 }
 
-/// `trace`'s step at `check` under `rule`, its outcome built only when the
-/// trace keeps steps.
+/// `trace`'s step at `check` under `rule`, its outcome built only when the trace keeps steps.
 pub(crate) fn note(
     trace: &mut dyn Trace,
     check: &'static str,
@@ -115,8 +86,7 @@ pub(crate) fn note(
     }
 }
 
-/// The step a trace's decision was made at: the last that decided or
-/// overruled one. `None` for a trace that decided nothing (an empty one).
+/// The step a trace's decision was made at: the last that decided or overruled one.
 #[must_use]
 pub fn deciding(steps: &[TraceStep]) -> Option<&TraceStep> {
     steps
@@ -125,9 +95,7 @@ pub fn deciding(steps: &[TraceStep]) -> Option<&TraceStep> {
         .find(|s| matches!(s.outcome, Outcome::Decided(_) | Outcome::Overruled(_)))
 }
 
-/// `steps` as text, one step a line, each indented by `indent`: its name,
-/// then what came of it. Every text here is the policy's own words about a
-/// screen it read, so the caller prints it as it prints any text off a tape.
+/// `steps` as text, one step a line, each indented by `indent`.
 #[must_use]
 pub fn render(steps: &[TraceStep], indent: &str) -> String {
     let mut out = String::new();

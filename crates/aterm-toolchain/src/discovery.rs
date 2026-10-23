@@ -2,15 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Trust toolchain discovery (std-only) shared by `aterm-verify`, `atpkg`, and `aterm-release`.
-//!
-//! Resolution order:
-//! 1. `$TRUST_STAGE2_BIN` (explicit override, never fallen back from);
-//! 2. `<rustup_home>/toolchains/<channel>/bin` (resolved through atpkg's store view if applicable);
-//! 3. `<atpkg_prefix>/store/trust/current/bin`;
-//! 4. `PATH`.
-//!
-//! A rustup `trust` toolchain older than the atpkg store build ranks below the store ([`Demoted`]).
-//! Every candidate is canonicalized and verified against `rust-toolchain.toml`'s pinned channel.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -28,7 +19,6 @@ pub fn is_executable_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// True if `path` is an `atpkg` pending-install stub script rather than a real binary.
 fn is_pending_stub(path: &Path) -> bool {
     use std::io::Read as _;
     const HEAD: u64 = 256;
@@ -82,15 +72,12 @@ pub fn pinned_channel(root: &Path) -> Option<String> {
         .and_then(pinned_channel_in)
 }
 
-/// True for stock upstream channels (`stable`, `beta`, `nightly*`, `1.*`).
 fn is_upstream_channel(channel: &str) -> bool {
     matches!(channel, "" | "stable" | "beta" | "nightly")
         || channel.starts_with("nightly-")
         || channel.starts_with("1.")
 }
 
-/// Check whether `dir` satisfies the `pinned` toolchain channel by verifying its
-/// branded driver (`<channel>c`) reports a valid sysroot with `lib/rustlib`.
 fn is_pinned_toolchain(dir: &Path, pinned: Option<&str>) -> bool {
     let channel = match pinned {
         None => return true,
@@ -100,7 +87,6 @@ fn is_pinned_toolchain(dir: &Path, pinned: Option<&str>) -> bool {
     pinned_sysroot(dir, channel).is_some()
 }
 
-/// Run `<channel>c --print sysroot` in `dir` and return the sysroot if `lib/rustlib` exists.
 fn pinned_sysroot(dir: &Path, channel: &str) -> Option<PathBuf> {
     let driver = [format!("{channel}c"), channel.to_string()]
         .into_iter()
@@ -128,8 +114,7 @@ fn pinned_sysroot(dir: &Path, channel: &str) -> Option<PathBuf> {
         .then(|| PathBuf::from(sysroot))
 }
 
-/// Resolve the `atpkg` install prefix from `[packages].prefix` in `aterm.toml`,
-/// falling back to [`default_atpkg_prefix`].
+/// Resolve the `atpkg` install prefix from `[packages].prefix` in `aterm.toml`.
 #[must_use]
 pub fn atpkg_prefix(home: &Path, xdg_config_home: Option<&Path>) -> PathBuf {
     let cfg = xdg_config_home
@@ -197,14 +182,12 @@ pub fn store_stage2_bin(prefix: &Path) -> PathBuf {
         .join("current/bin")
 }
 
-/// Channel name managed in the `atpkg` store.
 const STORE_CHANNEL: &str = "trust";
 
-/// Timeout for a single `-vV` compiler commit-date probe.
 const DATE_PROBE_BOUND: Duration = Duration::from_secs(5);
 
-/// A rustup `trust` toolchain ranked below the `atpkg` store because its `commit-date`
-/// is older than the store build's.
+/// A rustup `trust` toolchain ranked below the `atpkg` store because its `commit-date` is older
+/// than the store build's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Demoted {
     /// The rustup entry's physical `bin` directory.
@@ -217,7 +200,6 @@ pub struct Demoted {
     pub linked: bool,
 }
 
-/// Remedy when the demoted rustup entry is a symlink.
 const REMEDY_LINK: &str = "`aterm pkg repair` re-points it at the store";
 
 macro_rules! detach_fix {
@@ -261,7 +243,6 @@ impl Demoted {
     }
 }
 
-/// Read `commit-date: YYYY-MM-DD` from `trustc -vV` (or `rustc -vV`) in `bin`.
 fn commit_date(bin: &Path) -> Option<String> {
     ["trustc", "rustc"]
         .iter()
@@ -286,7 +267,6 @@ fn commit_date(bin: &Path) -> Option<String> {
         })
 }
 
-/// Run `program` with `args` and return stdout if it exits 0 within `bound`.
 fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<String> {
     use std::io::Read as _;
     use std::process::Stdio;
@@ -320,7 +300,6 @@ fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<Stri
     status.success().then_some(out)
 }
 
-/// Return `(rustup_date, store_date)` when `rustup` is older than `<store_prefix>/store/trust/current`.
 fn older_than_store(rustup: &Path, store_prefix: &Path) -> Option<(String, String)> {
     if std::fs::symlink_metadata(store_prefix.join("links").join(STORE_CHANNEL)).is_ok() {
         return None;
@@ -332,8 +311,6 @@ fn older_than_store(rustup: &Path, store_prefix: &Path) -> Option<(String, Strin
     (its < theirs).then_some((its, theirs))
 }
 
-/// Resolve an `atpkg` store view (`<store_prefix>/rustup/...`) to the underlying
-/// dev-linked checkout `bin` or `<store_prefix>/store/trust/current/bin`.
 fn view_presents(entry: &Path, store_prefix: &Path) -> Option<PathBuf> {
     let resolved = std::fs::canonicalize(entry).ok()?;
     let views = std::fs::canonicalize(store_prefix.join(crate::layout::VIEWS_DIR)).ok()?;
@@ -377,8 +354,8 @@ pub struct Toolchain {
     pub tippy: Option<PathBuf>,
     /// `trustfmt` binary path, if found in the toolchain or borrowed from the managed build.
     pub trustfmt: Option<PathBuf>,
-    /// Formatter/lint tools (`trustfmt`, `targo-tippy`) borrowed from the managed Trust build
-    /// when absent from a non-override toolchain directory.
+    /// Formatter/lint tools (`trustfmt`, `targo-tippy`) borrowed from the managed Trust build when
+    /// absent from a non-override toolchain directory.
     pub borrowed: Vec<(&'static str, PathBuf)>,
     /// First candidate directory containing `targo` that failed the pinned-toolchain check.
     pub refused: Option<PathBuf>,
@@ -562,7 +539,6 @@ impl Toolchain {
     pub const OVERRIDE_REMEDY: &'static str =
         "unset TRUST_STAGE2_BIN, or point it at a sealed toolchain's bin";
 
-    /// Select [`Self::OVERRIDE_REMEDY`] or [`Self::INSTALL_REMEDY`].
     const fn remedy(&self) -> &'static str {
         if self.store_bin.is_none() {
             Self::OVERRIDE_REMEDY
@@ -624,7 +600,6 @@ impl Toolchain {
         format!("{TRUSTFMT} ({})", self.missing_tool(TRUSTFMT))
     }
 
-    /// Format the missing-tool diagnostic for `name`.
     fn missing_tool(&self, name: &str) -> String {
         if self.store_bin.is_none() {
             format!(
@@ -648,8 +623,6 @@ pub const TRUSTFMT: &str = "trustfmt";
 /// The Trust lint driver's file name.
 pub const TIPPY: &str = "targo-tippy";
 
-/// Locate `name` (`trustfmt` or `targo-tippy`) in the `atpkg` store or `path_env`
-/// belonging to a validated `pinned` toolchain sysroot.
 fn managed_tool(
     name: &str,
     store_prefix: Option<&Path>,
@@ -684,7 +657,6 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// Create a temporary directory that the caller removes.
     fn mktemp_dir(tag: &str) -> std::io::Result<PathBuf> {
         Ok(aterm_tempfile::Builder::new()
             .prefix(&format!("{tag}."))
@@ -692,14 +664,12 @@ mod tests {
             .keep())
     }
 
-    /// Append the platform executable suffix to `path`.
     fn runnable(path: &Path) -> PathBuf {
         let mut named = path.as_os_str().to_os_string();
         named.push(std::env::consts::EXE_SUFFIX);
         PathBuf::from(named)
     }
 
-    /// Mark `path` executable on Unix.
     fn make_runnable(path: &Path) {
         #[cfg(unix)]
         {
@@ -712,14 +682,12 @@ mod tests {
         }
     }
 
-    /// Write a stub executable that exits 0 without printing a sysroot.
     fn exec_stub(path: &Path) {
         let path = &runnable(path);
         fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write");
         make_runnable(path);
     }
 
-    /// Write a stub driver that prints `<bin>/..` for `--print sysroot` and creates `lib/rustlib`.
     fn driver_stub(path: &Path) {
         let path = &runnable(path);
         let sysroot = path.parent().expect("bin dir").parent().expect("sysroot");
@@ -761,7 +729,6 @@ mod tests {
 
     #[test]
     fn the_reported_location_when_nothing_resolves_is_the_store() {
-        // When no candidate exists, report the store (or rustup entry if store is None).
         let home = Path::new("/nonexistent-home");
         let prefix = default_atpkg_prefix(home);
         let t = Toolchain::discover_with_store(
@@ -898,7 +865,6 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
-    /// `rustup_home` uses non-empty `$RUSTUP_HOME`, falling back to `<home>/.rustup`.
     #[test]
     fn rustup_home_is_the_variable_when_set_and_home_dot_rustup_otherwise() {
         let home = Path::new("/h");
@@ -1106,7 +1072,8 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
-    /// An `atpkg` rustup view resolves through to the store build or dev-linked checkout it presents.
+    /// An `atpkg` rustup view resolves through to the store build or dev-linked checkout it
+    /// presents.
     #[cfg(unix)]
     #[test]
     fn atpkgs_view_is_read_through_to_the_build_it_presents() {
@@ -1287,7 +1254,8 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// A non-override toolchain missing `trustfmt`/`targo-tippy` borrows them from the managed build.
+    /// A non-override toolchain missing `trustfmt`/`targo-tippy` borrows them from the managed
+    /// build.
     #[cfg(unix)]
     #[test]
     fn a_toolchain_lacking_the_formatter_and_lint_takes_the_managed_builds() {
@@ -1445,7 +1413,6 @@ mod tests {
 
     #[test]
     fn a_targo_that_is_not_the_pinned_toolchain_is_refused_not_adopted() {
-        // A `targo` without a matching `trustc` answering `--print sysroot` is refused.
         let tmp = mktemp_dir("atv-pin").expect("mktemp");
         let bin = tmp.join("bin");
         fs::create_dir_all(&bin).expect("mkdir");
@@ -1496,7 +1463,6 @@ mod tests {
 
     #[test]
     fn the_path_fallback_adopts_only_the_pinned_toolchain() {
-        // PATH fallback skips unpinned `targo` binaries and adopts the first pinned one.
         let tmp = mktemp_dir("atv-pinpath").expect("mktemp");
         let impostor = tmp.join("impostor");
         let real = tmp.join("stage/bin");

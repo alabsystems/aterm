@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Right-to-left run shaping tests: bidi-reordered stretches are shaped in
-//! logical order and mapped back to visual columns, while un-reordered rows and
-//! adjacent LTR operators keep their painted order.
+//! Right-to-left run shaping and adjacent LTR ligature tests.
 
 use aterm_core::config::{BiDiConfig, BiDiMode, TerminalConfig};
 use aterm_core::terminal::Terminal;
@@ -11,9 +9,7 @@ use aterm_render::{ColumnGlyph, Renderer, Theme};
 
 const CASCADIA: &[u8] = include_bytes!("../assets/bundled/CascadiaMonoPL-Regular.ttf");
 const JETBRAINS: &[u8] = include_bytes!("../assets/bundled/JetBrainsMono-Regular.ttf");
-/// مرحبا, logical order.
 const MARHABA: &str = "\u{645}\u{631}\u{62D}\u{628}\u{627}";
-/// שלום and עולם, logical order.
 const SHALOM: &str = "\u{5E9}\u{5DC}\u{5D5}\u{5DD}";
 const OLAM: &str = "\u{5E2}\u{5D5}\u{5DC}\u{5DD}";
 
@@ -30,9 +26,6 @@ fn plan_of(
     (input, plan)
 }
 
-/// What the plan holds at each visual column when `logical` is shaped in
-/// logical order: the shaped glyph of the column's character where shaping
-/// changed it from its `cmap` glyph, else the per-cell path.
 fn logical_plan(input: &aterm_core::render::RenderInput, logical: &str) -> Vec<ColumnGlyph> {
     use aterm_font::shape::{Feature, ShapeFace, UnicodeBuffer};
     let face = ShapeFace::from_slice(CASCADIA, 0).unwrap();
@@ -63,7 +56,6 @@ fn logical_plan(input: &aterm_core::render::RenderInput, logical: &str) -> Vec<C
     out
 }
 
-/// The glyph ids rustybuzz recorded for `case` on Cascadia, by cluster.
 fn recorded(case: &str) -> Vec<(u32, u32)> {
     let corpus = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -132,10 +124,6 @@ fn visual_rtl_runs_join_in_logical_order() {
     assert_eq!(u32::from(ligated(0)), logical_at(8));
 }
 
-/// Brackets around an Arabic word in a left-to-right line resolve to the
-/// line's level, so neither is mirrored: the plan leaves both on the
-/// per-cell path, where the cell holds the bracket as written. rustybuzz
-/// mirrored both (`ar.parens.visual.0`).
 #[test]
 fn brackets_mirror_by_level_not_by_run() {
     let mut r = Renderer::from_bytes(CASCADIA, 18.0, Theme::default()).unwrap();
@@ -159,10 +147,6 @@ fn brackets_mirror_by_level_not_by_run() {
     );
 }
 
-/// A row the bidi step leaves in logical order is shaped as written. Here
-/// `bidi = "off"` (`BiDiMode::Disabled`); the web modules build aterm-core
-/// without its reorder and hand the renderer the same rows. Each letter takes
-/// the form rustybuzz gave the logical text (`ar.marhaba.logical`).
 #[test]
 fn logical_order_rows_join_as_written() {
     let mut r = Renderer::from_bytes(CASCADIA, 18.0, Theme::default()).unwrap();
@@ -207,12 +191,6 @@ fn logical_order_rows_join_as_written() {
     assert_ne!(backwards[4], want[4], "alef's two forms differ");
 }
 
-/// Left-to-right operators painted beside a reordered right-to-left word
-/// keep the order they are painted in, so a programming ligature plans
-/// exactly as it does in a left-to-right run: the spacer and the wide glyph
-/// stay where the font draws them. After the word (`שלום==`, the operator
-/// at the line's level) and between two words (`שלום==עולם`, the operator
-/// at the words' level, painted inside the reversed token) alike.
 #[test]
 fn operators_beside_an_rtl_word_ligate_as_in_an_ltr_run() {
     let mut r = Renderer::from_bytes(JETBRAINS, 18.0, Theme::default()).unwrap();

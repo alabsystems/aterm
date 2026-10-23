@@ -2,23 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The census lexer: every comment and literal of a Rust file found once, in
-//! bytes, so a scan reads code and never prose.
-//!
-//! Two views come out of one pass, each the source's own length, line for line
-//! and byte for byte, so an offset found in one reads the same place in the
-//! other:
-//!
-//! * the code view: comments and literal contents blanked to spaces. A string
-//!   that opens and closes on one line keeps its two `"`, so
-//!   `#[cfg(all(test, feature = "x"))]` still parses as a gate and a call's
-//!   literal argument still shows where it sits; a multi-line string loses
-//!   them, so no line-based reader sees a stray quote.
-//! * the text view: comments blanked, literals intact, for the rules whose
-//!   subject is a literal (a `/dev/` path, a framework name, a request string).
-//!
-//! Every delimiter is ASCII, so a blanked span always covers whole UTF-8
-//! sequences and both views stay valid UTF-8.
+//! The census lexer: code and text views of a Rust file with comments and literals blanked.
 
 /// What a non-code span is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,8 +15,7 @@ pub(crate) enum SpanKind {
     Char,
 }
 
-/// One comment or literal: its byte range, and for a string the byte offsets
-/// of its opening and closing `"`.
+/// Byte range of a comment or literal, plus quote offsets for a string.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Span {
     pub(crate) start: usize,
@@ -57,7 +40,6 @@ pub(crate) fn spans(src: &str) -> Vec<Span> {
     while i < b.len() {
         let c = b[i];
         let found = if is_ident_start(c) && (i == 0 || !is_ident(b[i - 1])) {
-            // An identifier is skipped whole, unless it prefixes a literal.
             let mut w = i;
             while w < b.len() && is_ident(b[w]) {
                 w += 1;
@@ -105,14 +87,12 @@ pub(crate) fn spans(src: &str) -> Vec<Span> {
     out
 }
 
-/// A literal or comment found at some offset: where it ends (exclusive).
 struct Lit {
     end: usize,
     kind: SpanKind,
     quotes: Option<(usize, usize)>,
 }
 
-/// A `"…"` string whose opening quote is at `q`, honouring `\` escapes.
 const fn cooked_string(b: &[u8], q: usize) -> Option<Lit> {
     let mut j = q + 1;
     while j < b.len() {
@@ -135,8 +115,6 @@ const fn cooked_string(b: &[u8], q: usize) -> Option<Lit> {
     })
 }
 
-/// A raw string whose `#`s (if any) start at `at`, right after its `r` prefix;
-/// `None` when no `"` follows them (`r#ident` is a raw identifier).
 fn raw_string(b: &[u8], at: usize) -> Option<Lit> {
     let hashes = b[at..].iter().take_while(|&&c| c == b'#').count();
     let q = at + hashes;
@@ -159,7 +137,6 @@ fn raw_string(b: &[u8], at: usize) -> Option<Lit> {
     })
 }
 
-/// The byte length of the UTF-8 sequence a lead byte starts.
 const fn utf8_len(lead: u8) -> usize {
     match lead {
         0xF0..=0xFF => 4,
@@ -169,8 +146,6 @@ const fn utf8_len(lead: u8) -> usize {
     }
 }
 
-/// A char literal at `i` (`'x'`, `'é'`, `'\n'`, `'\u{1F600}'`); `None` for
-/// anything else a `'` starts (a lifetime, a label).
 fn char_literal(b: &[u8], i: usize) -> Option<Lit> {
     let next = *b.get(i + 1)?;
     if next == b'\\' {
@@ -191,7 +166,6 @@ fn char_literal(b: &[u8], i: usize) -> Option<Lit> {
     })
 }
 
-/// A block comment opening at `i`, nested ones included.
 fn block_comment(b: &[u8], i: usize) -> Lit {
     let mut depth = 0usize;
     let mut j = i;
@@ -218,7 +192,7 @@ fn block_comment(b: &[u8], i: usize) -> Lit {
     }
 }
 
-/// The two views of one file (see the module doc).
+/// Code and text views of one file.
 pub(crate) struct Lexed {
     /// Comments and literal contents blanked.
     pub(crate) code: String,
@@ -248,13 +222,8 @@ pub(crate) fn lex(src: &str) -> Lexed {
     }
 }
 
-/// The code view with each line's trailing whitespace dropped: what the
-/// held-guard walk reads.
-///
-/// This runs before any unshipped-item mask: the mask ends an item at its first
-/// `<indent>}` line, so on raw text a `}` inside a test module's raw string
-/// would end the module early and strand the literal's closer, turning the rest
-/// of the file into string contents.
+/// Code view with trailing whitespace trimmed, run before any unshipped-item
+/// mask so a `}` inside a raw string cannot end a test module early.
 pub(crate) fn blank_non_code(src: &str) -> String {
     let code = lex(src).code;
     let mut out = String::with_capacity(code.len());
@@ -273,8 +242,6 @@ fn blank(bytes: &mut [u8]) {
     }
 }
 
-/// Spans cover whole UTF-8 sequences, so a blanked buffer is still UTF-8; the
-/// lossy arm is unreachable and only keeps this function total.
 fn utf8(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
@@ -283,8 +250,6 @@ fn utf8(bytes: Vec<u8>) -> String {
 mod tests {
     use super::*;
 
-    /// Every literal and comment is blanked where it stands, columns and line
-    /// count kept; a one-line string keeps its quotes, a multi-line one does not.
     #[test]
     fn the_code_view_blanks_every_literal_and_comment_in_place() {
         let src = "let a = \"x // y\"; // z\nlet b = r#\"multi\nline\"#; /* c\nd */ e\n\

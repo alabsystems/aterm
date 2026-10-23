@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Controller CLI verbs (`init`, `ls`, `status`, `outstanding`, `plan`, `apply`, `run`, `person`, `rekey`, `unenroll`).
+//! Controller CLI verbs.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 macro_rules! outln {
@@ -98,7 +98,7 @@ impl Tally {
     }
 }
 
-/// `aterm machines init [--passphrase]`: initialize controller keys, signers, inventory, and starter baseline.
+/// `aterm machines init [--passphrase]`: initialize controller keys, signers, and inventory.
 #[must_use]
 pub fn init(env: &Env<'_>, passphrase: bool, out: &mut dyn std::io::Write) -> ExitCode {
     if passphrase && !env.tty {
@@ -494,7 +494,7 @@ pub fn status(env: &Env<'_>, names: &[String], all: bool, by_item: bool) -> Exit
     tally.code()
 }
 
-/// `aterm machines rename <host> <new-name>`: set or rename a host's canonical display name in `machines.toml`.
+/// `aterm machines rename <host> <new-name>`: set a host's display name in `machines.toml`.
 #[must_use]
 pub fn rename(env: &Env<'_>, selector: &str, new_name: &str) -> ExitCode {
     match inventory::set_host_name(env.sys, &env.paths, selector, new_name) {
@@ -629,7 +629,7 @@ fn resolve_ipv4_banner_and_rtt(
     (ipv4, banner, rtt_us)
 }
 
-/// Parse batched SSH vitals probe output from Linux (`/proc`, `nvidia-smi`) or macOS (`sysctl`, `vm_stat`).
+/// Parses batched SSH vitals probe output from Linux or macOS.
 #[must_use]
 pub fn parse_ssh_vitals_output(
     out: &str,
@@ -1103,7 +1103,7 @@ pub fn monitor(
     tabs(env, names, all)
 }
 
-/// `aterm machines tabs`: live table of accessible Macs, `aterm` instances, tabs, vitals, and AI CLI status.
+/// `aterm machines tabs`: live table of hosts, `aterm` instances, tabs, and vitals.
 #[must_use]
 pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
     let inv = match inventory::load(env.sys, &env.paths) {
@@ -1482,7 +1482,7 @@ const fn outcome_word(outcome: Outcome) -> &'static str {
     }
 }
 
-/// `aterm machines outstanding`: fleet-wide to-do list of unreached hosts, failures, and pending person steps.
+/// `aterm machines outstanding`: fleet-wide list of unreached hosts, failures, and person steps.
 #[must_use]
 pub fn outstanding(env: &Env<'_>) -> ExitCode {
     let inv = match load(env) {
@@ -1721,7 +1721,7 @@ pub fn plan_or_apply(
     plan_or_apply_only(env, names, all, mode, now, &[])
 }
 
-/// `aterm machines plan|apply [--only <table>,…]`: plan or apply selected baseline tables and merge reports.
+/// `aterm machines plan|apply [--only <table>,…]`: plan or apply selected baseline tables.
 #[must_use]
 pub fn plan_or_apply_only(
     env: &Env<'_>,
@@ -2840,7 +2840,7 @@ pub fn attach(env: &Env<'_>, name: &str, run: Option<&str>) -> ExitCode {
     }
 }
 
-/// `aterm machines run <host…|--all> [--user <u>] -- <argv>`: run one signed command without a shell.
+/// `aterm machines run <host…|--all> [--user <u>] -- <argv>`: run one signed command.
 #[must_use]
 pub fn run(
     env: &Env<'_>,
@@ -2953,7 +2953,7 @@ fn exec_body(env: &Env<'_>, host: &Host, floor: u64, exec: Exec) -> Result<Envel
     Ok(envelope)
 }
 
-/// `aterm machines person [<host>…|--all]`: list outstanding interactive person steps grouped by step.
+/// `aterm machines person [<host>…|--all]`: list outstanding interactive person steps.
 #[must_use]
 pub fn person(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
     let inv = match load(env) {
@@ -3260,7 +3260,7 @@ fn tell(host: &Host, walked: &[screen::Walked], emit: &mut dyn FnMut(Said)) -> (
     (failed, changed)
 }
 
-/// `aterm machines person <host> --here` and `screen <host>`: walk outstanding person steps and re-plan.
+/// `aterm machines person <host> --here` and `screen <host>`: walk pending person steps.
 #[must_use]
 pub fn walk(
     env: &Env<'_>,
@@ -3437,7 +3437,7 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `aterm machines github login`: prompt for the `[github]` account token with echo off and store it in Keychain.
+/// `aterm machines github login`: prompt for the `[github]` token and store it in Keychain.
 #[must_use]
 pub fn github_login(env: &Env<'_>) -> ExitCode {
     let inv = match load(env) {
@@ -3787,7 +3787,7 @@ fn replace_signers(env: &Env<'_>, text: &str) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", current.display()))
 }
 
-/// `aterm machines here plan|apply <baseline.toml>`: run a baseline directly on this Mac without an envelope.
+/// `aterm machines here plan|apply <baseline.toml>`: run a baseline directly on this Mac.
 #[must_use]
 pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> ExitCode {
     if mode == Mode::Apply && sys.euid() != 0 {

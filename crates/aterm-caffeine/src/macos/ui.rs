@@ -422,7 +422,7 @@ mod tests {
     use super::*;
     use crate::launchd::Startup;
     use crate::menu::{self, MenuAction};
-    use crate::model::{Choice, Mode};
+    use crate::model::{Choice, Clocks, Mode};
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect {
@@ -475,7 +475,10 @@ mod tests {
 
     #[test]
     fn a_menu_of_the_same_shape_is_retitled_in_place() {
-        const NOW: u64 = 1_790_000_000;
+        const NOW: Clocks = Clocks {
+            since_boot: 300_000,
+            wall: 1_790_000_000,
+        };
         let off = menu::compose(Mode::Off, NOW, Startup::Off, "1");
         assert_eq!(changed_rows(&off, &off), Some(vec![]));
         let forever = menu::compose(Mode::Forever, NOW, Startup::Off, "1");

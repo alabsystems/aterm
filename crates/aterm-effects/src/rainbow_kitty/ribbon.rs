@@ -1680,6 +1680,10 @@ pub struct Ribbon {
     /// share seams, so they share a floor.
     holds: Vec<(u16, f32, Instant)>,
     holds_next: Vec<(u16, f32, Instant)>,
+    /// Prior shape of each moved or newborn cohort until the next plan.
+    /// Kept apart from row holds so an earlier move cannot rewrite a later
+    /// run's source. A fresh identity explicitly has no previous shape.
+    carried_holds: Vec<(u32, Option<(f32, Instant)>)>,
     /// The live cells, resident and reused (§18: no allocation per frame).
     cells: Vec<Cell>,
     cohorts: Vec<Cohort>,
@@ -3447,12 +3451,18 @@ impl Ribbon {
             if !takeover && (base_live || over_live.is_some()) {
                 continue;
             }
-            let (born, attack_at, cov0, rearm) = match over {
+            let (born, attack_at, cov0, rearm, adopted) = match over {
                 Some(i) => {
                     let old = self.cells[i];
                     let level = clamp01(self.env_of(ctx, &old));
                     self.cells.remove(i);
-                    (old.born, old.attack_at, old.cov0, Some((at, level)))
+                    (
+                        old.born,
+                        old.attack_at,
+                        old.cov0,
+                        Some((at, level)),
+                        Some(old.cohort),
+                    )
                 }
                 None => {
                     if k >= WAKE_MAX_CELLS && k > reach && !Self::reads_as_glass_light(base_cov) {
@@ -3465,9 +3475,10 @@ impl Ribbon {
                             born_new,
                             cov0,
                             Some((born_new, clamp01(base_cov / cov0))),
+                            None,
                         )
                     } else {
-                        (born_new, born_new, cov0_new, None)
+                        (born_new, born_new, cov0_new, None, None)
                     }
                 }
             };
@@ -3476,6 +3487,9 @@ impl Ribbon {
                 None => self.join_wake_cohort(row, col, anchor_col, walk, at),
             };
             let cohort = self.cohorts[idx];
+            if let Some(old) = adopted {
+                self.copy_hold(old, cohort.id, row);
+            }
             let cell = Cell {
                 row,
                 col,
@@ -3661,6 +3675,9 @@ impl Ribbon {
             line_killed: false,
             printed: None,
         });
+        // A fresh identity cannot borrow the row's previous occupant, even
+        // when it is minted before the first content move in this batch.
+        self.stage_hold(id, None);
         self.cohorts.len() - 1
     }
 
@@ -3795,6 +3812,7 @@ impl Ribbon {
                 }
             }
             self.carry_release(wake.id, band.id);
+            self.merge_hold(wake.id, band.id, row);
             for cell in &mut self.cells {
                 if cell.cohort == wake.id {
                     cell.cohort = band.id;
@@ -4138,6 +4156,7 @@ impl Ribbon {
                 }
             }
             self.carry_release(from_id, into_id);
+            self.merge_hold(from_id, into_id, a.row);
             for c in &mut self.cells {
                 if c.cohort == from_id {
                     c.cohort = into_id;
@@ -4206,6 +4225,7 @@ impl Ribbon {
         }
         self.heal_seams();
         self.build(ctx, below);
+        self.carried_holds.clear();
         self.scroll_followed = false;
         self.followed_now.clear();
         self.short_reanchor = None;
@@ -4445,6 +4465,8 @@ impl Ribbon {
         self.attach_floor = None;
         self.index.begin(cols);
         if self.cells.is_empty() {
+            self.holds.clear();
+            self.holds_next.clear();
             return;
         }
         let mut sorted = mem::take(&mut self.sorted);
@@ -4528,27 +4550,25 @@ impl Ribbon {
             let hold = match held_row {
                 Some((r, hold)) if r == row => hold,
                 _ => {
-                    let last = sorted[s..]
-                        .iter()
-                        .take_while(|e| e.0 == row)
-                        .last()
-                        .map_or(sorted[s].1, |e| e.1);
+                    let end = s + sorted[s..].partition_point(|e| e.0 == row);
+                    let row_cells = &sorted[s..end];
+                    let last = row_cells.last().map_or(sorted[s].1, |e| e.1);
                     let floor = f32::from(ctx.geom.origin_y) + (f32::from(row) + 1.0) * chf;
                     let held = if floor >= pane_bot {
                         Some(true)
                     } else {
                         below.and_then(|p| Self::inked_below(p, ctx, row, sorted[s].1, last))
                     };
-                    let flowing = sorted[s..]
+                    let flowing = row_cells
                         .iter()
-                        .take_while(|e| e.0 == row)
                         .filter_map(|e| cohort_of(&self.cells, *e))
                         .any(|id| {
                             self.cohorts
                                 .iter()
                                 .any(|c| c.id == id && c.flow.is_some() && c.phase.is_retracting())
                         });
-                    let hold = self.ease_hold(ctx, row, held.map(|h| h && !flowing));
+                    let previous = self.previous_hold(row, row_cells);
+                    let hold = self.ease_hold(ctx, row, held.map(|h| h && !flowing), previous);
                     held_row = Some((row, hold));
                     hold
                 }
@@ -4584,17 +4604,98 @@ impl Ribbon {
         self.holds_next.clear();
     }
 
-    /// Row `row`'s hold this frame, eased toward `held` from its last
+    /// The strongest prior shape among the cohorts actually drawing this row.
+    /// A moved-out run contributes nothing; a partial move leaves its original
+    /// source alongside the copy's carried shape. A no-move, no-birth frame
+    /// reads its row directly, and a move scans each contiguous cohort once.
+    fn previous_hold(&self, row: u16, row_cells: &[(u16, u16, u32)]) -> Option<(f32, Instant)> {
+        let original = self.holds.iter().find(|h| h.0 == row).map(|h| (h.1, h.2));
+        if self.carried_holds.is_empty() {
+            return original;
+        }
+        let mut seen = None;
+        let mut strongest: Option<(f32, Instant)> = None;
+        for &(_, _, idx) in row_cells {
+            let Some(cell) = self.cells.get(idx as usize) else {
+                continue;
+            };
+            if seen == Some(cell.cohort) {
+                continue;
+            }
+            seen = Some(cell.cohort);
+            let previous = self
+                .carried_holds
+                .iter()
+                .find(|h| h.0 == cell.cohort)
+                .map_or(original, |h| h.1);
+            strongest = Self::strongest_hold(strongest, previous);
+        }
+        strongest
+    }
+
+    fn strongest_hold(
+        a: Option<(f32, Instant)>,
+        b: Option<(f32, Instant)>,
+    ) -> Option<(f32, Instant)> {
+        a.into_iter()
+            .chain(b)
+            .max_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+    }
+
+    fn cohort_hold(&self, cohort: u32, row: u16) -> Option<(f32, Instant)> {
+        self.carried_holds
+            .iter()
+            .find(|h| h.0 == cohort)
+            .map(|h| h.1)
+            .unwrap_or_else(|| self.holds.iter().find(|h| h.0 == row).map(|h| (h.1, h.2)))
+    }
+
+    fn stage_hold(&mut self, cohort: u32, previous: Option<(f32, Instant)>) {
+        if let Some(carried) = self.carried_holds.iter_mut().find(|h| h.0 == cohort) {
+            carried.1 = previous;
+        } else {
+            self.carried_holds.push((cohort, previous));
+        }
+    }
+
+    /// Adopting old visual cells keeps their shape while any old cells left
+    /// behind retain their own custody. Fresh identities explicitly carry no
+    /// prior shape, so they cannot revive a departed occupant's row hold.
+    fn copy_hold(&mut self, from: u32, into: u32, row: u16) {
+        if from == into || self.carried_holds.is_empty() {
+            return;
+        }
+        let previous =
+            Self::strongest_hold(self.cohort_hold(from, row), self.cohort_hold(into, row));
+        self.stage_hold(into, previous);
+    }
+
+    /// A whole-cohort merge retires the removed identity after transferring
+    /// its strongest shape to the survivor.
+    fn merge_hold(&mut self, from: u32, into: u32, row: u16) {
+        if from == into {
+            return;
+        }
+        self.copy_hold(from, into, row);
+        self.carried_holds.retain(|h| h.0 != from);
+    }
+
+    /// Row `row`'s hold this frame, eased toward `held` from `last`
     /// ([`HOLD_EASE_S`] in, [`HOLD_RELEASE_S`] out), or born at it; recorded
     /// for the next frame. `None` (the row below not known: the frame of a
     /// scroll, which clears the probe, or a row away from the caret's) keeps
     /// the level the row had, and a row first lit so is born free.
-    fn ease_hold(&mut self, ctx: &Ctx<'_>, row: u16, held: Option<bool>) -> f32 {
+    fn ease_hold(
+        &mut self,
+        ctx: &Ctx<'_>,
+        row: u16,
+        held: Option<bool>,
+        last: Option<(f32, Instant)>,
+    ) -> f32 {
         #[cfg(test)]
         let steps = self.hold_steps;
         #[cfg(not(test))]
         let steps = false;
-        let last = self.holds.iter().find(|h| h.0 == row).map(|h| (h.1, h.2));
         let level = match (held.map(|h| f32::from(u8::from(h))), last) {
             (None, Some((level, _))) => level,
             (None, None) => 0.0,
@@ -6009,6 +6110,10 @@ impl Ribbon {
         if !away && self.seam.is_some_and(|s| s.row == new_row) {
             self.seam = None;
         }
+        // A run carries its own prior shape, including across multiple hops
+        // in this batch. Never mutate another run's prior row state here.
+        let previous = self.cohort_hold(cohort, row);
+        self.stage_hold(id, previous);
         self.index.reset();
         self.plan.clear();
         self.runs.clear();
@@ -6244,6 +6349,9 @@ impl Ribbon {
     pub fn reset(&mut self) {
         self.cells.clear();
         self.cohorts.clear();
+        self.holds.clear();
+        self.holds_next.clear();
+        self.carried_holds.clear();
         self.plan.clear();
         self.runs.clear();
         self.sorted.clear();
@@ -10193,6 +10301,41 @@ mod tests {
                 );
             }
         }
+        // A full reset ends the old row's custody. A new line at that row
+        // starts free, whether the row below is blank or not yet known.
+        for probe in [Some(&blank), None] {
+            let t0 = Instant::now();
+            let mut reset = Ribbon::new();
+            type_run(&mut reset, t0, 10, 8, &c, 0.9);
+            let held_at = at(t0, 8 * 60 + 16);
+            deepest(&mut reset, held_at, &inked);
+            let settled_at = at(held_at, (HOLD_EASE_S * 1000.0) as u64 + 16);
+            assert!(deepest(&mut reset, settled_at, &inked) <= 0.0);
+            reset.reset();
+
+            let next = at(settled_at, 16);
+            let mut fresh = Ribbon::new();
+            for rib in [&mut reset, &mut fresh] {
+                type_run(rib, next, 10, 8, &c, 0.9);
+            }
+            let cx = ctx(at(next, 8 * 60), &c, (2, 18), 0.9);
+            let draw = |rib: &mut Ribbon| {
+                rib.plan_over(&cx, probe);
+                let mut sink = Sink::default();
+                rib.emit(&cx, &mut sink.frame());
+                sink.under
+            };
+            let (got, want) = (draw(&mut reset), draw(&mut fresh));
+            assert!(
+                want.iter()
+                    .any(|q| f32::from(q.y) + f32::from(q.h) > row_bottom + 2.0),
+                "the fresh line still reaches below its row"
+            );
+            assert_eq!(
+                got, want,
+                "a reset must not lend the new line an old row's hold"
+            );
+        }
     }
 
     /// A LINE A SCROLL CARRIES UP KEEPS ITS ROW'S SHAPE (the 2026-10-23
@@ -10273,6 +10416,726 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A content-proven repaint carries the line's held shape just as a VT scroll does.
+    /// The destination is outside the caret probe, so unknown glyphs must retain its
+    /// previous hold rather than make the carried line free in the repaint's first frame.
+    #[test]
+    fn a_proven_repaint_carries_a_held_rows_shape_through_unknown_glyphs() {
+        let g = Geom {
+            rows: 14,
+            win_h: 14 * 18,
+            ..geom()
+        };
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 13,
+                col0: 2,
+                n: 12,
+                period_ms: 60,
+                disp: 0.9,
+            },
+            &c,
+        );
+        let cohort = rib
+            .cohorts()
+            .iter()
+            .find(|coh| coh.row == 13)
+            .expect("the typed line has a cohort")
+            .id;
+        let carry = at(t0, 12 * 60);
+        let mut moved = Vec::new();
+        assert_eq!(
+            rib.translate_run(
+                super::super::witness::FollowRun {
+                    row: 13,
+                    cohort,
+                    lo: 2,
+                    hi: 13,
+                    dr: -2,
+                },
+                carry,
+                true,
+                &mut moved,
+            ),
+            12,
+            "the production witness carry moved the complete typed line"
+        );
+        let row_bottom = f32::from(g.origin_y) + 12.0 * g.ch as f32;
+        let cx = ctx_in(carry, &c, (13, 2), 0.9, g);
+        rib.plan_over(&cx, None);
+        let mut sink = Sink::default();
+        rib.emit(&cx, &mut sink.frame());
+        let deepest = sink
+            .under
+            .iter()
+            .filter(|q| q.color != 0)
+            .map(|q| f32::from(q.y) + f32::from(q.h))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(deepest.is_finite(), "the carried line is still lit");
+        assert!(
+            deepest <= row_bottom,
+            "the proven repaint loses the held shape: light jumps {:.1} px below its row",
+            deepest - row_bottom
+        );
+    }
+
+    /// A partial repaint leaves both halves held, and a free run joining the held
+    /// destination does not lower that row's floor. The geometry at each run's own
+    /// columns distinguishes both errors without reading the hold bookkeeping.
+    #[test]
+    fn a_partial_repaint_keeps_both_halves_and_a_stronger_destination_held() {
+        let g = Geom {
+            rows: 14,
+            win_h: 14 * 18,
+            ..geom()
+        };
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 11,
+                col0: 2,
+                n: 12,
+                period_ms: 60,
+                disp: 0.9,
+            },
+            &c,
+        );
+        let mut inked = GlyphProbe::new();
+        inked.probe_row(12, &[true; 120]);
+        let start = at(t0, 12 * 60);
+        rib.plan_over(&ctx_in(start, &c, (11, 14), 0.9, g), Some(&inked));
+        let carry = at(start, (HOLD_EASE_S * 1000.0) as u64 + 16);
+        rib.plan_over(&ctx_in(carry, &c, (11, 14), 0.9, g), Some(&inked));
+        let depth = |rib: &mut Ribbon, now: Instant, row: u16, col: u16| {
+            let cx = ctx_in(now, &c, (13, 2), 0.9, g);
+            rib.plan_over(&cx, None);
+            let mut sink = Sink::default();
+            rib.emit(&cx, &mut sink.frame());
+            let x = f32::from(g.origin_x) + (f32::from(col) + 0.5) * g.cw as f32;
+            sink.under
+                .iter()
+                .filter(|q| {
+                    q.color != 0 && f32::from(q.x) <= x && x < f32::from(q.x) + f32::from(q.w)
+                })
+                .map(|q| f32::from(q.y) + f32::from(q.h))
+                .fold(f32::NEG_INFINITY, f32::max)
+                - (f32::from(g.origin_y) + f32::from(row + 1) * g.ch as f32)
+        };
+        let cohort = rib
+            .cohorts()
+            .iter()
+            .find(|coh| coh.row == 11)
+            .expect("the held line")
+            .id;
+        let mut moved = Vec::new();
+        assert_eq!(
+            rib.translate_run(
+                super::super::witness::FollowRun {
+                    row: 11,
+                    cohort,
+                    lo: 8,
+                    hi: 13,
+                    dr: -2,
+                },
+                carry,
+                true,
+                &mut moved,
+            ),
+            6
+        );
+        for (row, col) in [(11, 4), (9, 10)] {
+            let below = depth(&mut rib, carry, row, col);
+            assert!(below.is_finite(), "the partial run on row {row} stays lit");
+            assert!(
+                below <= 0.0,
+                "row {row}'s partial run lost its held shape: {below:.1} px"
+            );
+        }
+
+        rib.on_event(
+            &nav((11, 14), (7, 20)),
+            carry,
+            &ctx_in(carry, &c, (7, 20), 0.9, g),
+        );
+        type_keys(
+            &mut rib,
+            carry,
+            Keys {
+                g,
+                row: 7,
+                col0: 20,
+                n: 4,
+                period_ms: 60,
+                disp: 0.9,
+            },
+            &c,
+        );
+        let join = at(carry, 4 * 60);
+        let free_depth = depth(&mut rib, join, 7, 22);
+        assert!(
+            free_depth > 2.0,
+            "control: the joining run is free ({free_depth:.1} px)"
+        );
+        let cohort = rib
+            .cohorts()
+            .iter()
+            .find(|coh| coh.row == 7)
+            .expect("the free joining run")
+            .id;
+        assert_eq!(
+            rib.translate_run(
+                super::super::witness::FollowRun {
+                    row: 7,
+                    cohort,
+                    lo: 20,
+                    hi: 23,
+                    dr: 2,
+                },
+                join,
+                true,
+                &mut moved,
+            ),
+            4
+        );
+        let below = depth(&mut rib, join, 9, 22);
+        assert!(below.is_finite(), "the joining run stays lit");
+        assert!(
+            below <= 0.0,
+            "the joining run weakens the destination's hold: {below:.1} px"
+        );
+    }
+
+    /// A repaint batch may move a held line onto a free one's old row before
+    /// moving that free line away. Each run carries its own previous shape,
+    /// including another hop of the first run in the same batch.
+    #[test]
+    fn a_repaint_batch_keeps_each_runs_previous_shape_across_multiple_hops() {
+        let g = Geom {
+            rows: 14,
+            win_h: 14 * 18,
+            ..geom()
+        };
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 7,
+                col0: 2,
+                n: 8,
+                period_ms: 20,
+                disp: 0.9,
+            },
+            &c,
+        );
+        let mut inked = GlyphProbe::new();
+        inked.probe_row(8, &[true; 120]);
+        let start = at(t0, 8 * 20);
+        rib.plan_over(&ctx_in(start, &c, (7, 10), 0.9, g), Some(&inked));
+        let next = at(start, (HOLD_EASE_S * 1000.0) as u64 + 16);
+        rib.plan_over(&ctx_in(next, &c, (7, 10), 0.9, g), Some(&inked));
+        // A pasted line leaves the first flowing; a navigation jump would
+        // abandon it before the second line finished typing.
+        rib.on_event(
+            &Event::Move {
+                from: (7, 10),
+                to: (8, 20),
+                licence: Licence::Insert,
+                dir: Dir::Right,
+            },
+            next,
+            &ctx_in(next, &c, (8, 20), 0.9, g),
+        );
+        type_keys(
+            &mut rib,
+            next,
+            Keys {
+                g,
+                row: 8,
+                col0: 20,
+                n: 8,
+                period_ms: 20,
+                disp: 0.9,
+            },
+            &c,
+        );
+        let carry = at(next, 8 * 20);
+        let depth = |rib: &mut Ribbon, row: u16, col: u16| {
+            let cx = ctx_in(carry, &c, (13, 2), 0.9, g);
+            rib.plan_over(&cx, None);
+            let mut sink = Sink::default();
+            rib.emit(&cx, &mut sink.frame());
+            let x = f32::from(g.origin_x) + (f32::from(col) + 0.5) * g.cw as f32;
+            sink.under
+                .iter()
+                .filter(|q| {
+                    q.color != 0 && f32::from(q.x) <= x && x < f32::from(q.x) + f32::from(q.w)
+                })
+                .map(|q| f32::from(q.y) + f32::from(q.h))
+                .fold(f32::NEG_INFINITY, f32::max)
+                - (f32::from(g.origin_y) + f32::from(row + 1) * g.ch as f32)
+        };
+        let held_depth = depth(&mut rib, 7, 5);
+        let free_depth = depth(&mut rib, 8, 24);
+        assert!(
+            held_depth.is_finite() && held_depth <= 0.0,
+            "the first run is held ({held_depth:.1} px)"
+        );
+        assert!(
+            free_depth > 2.0,
+            "the other run is free ({free_depth:.1} px)"
+        );
+        let held = rib
+            .cohorts()
+            .iter()
+            .find(|coh| coh.row == 7)
+            .expect("held run")
+            .id;
+        let free = rib
+            .cohorts()
+            .iter()
+            .find(|coh| coh.row == 8)
+            .expect("free run")
+            .id;
+        let mut moved = Vec::new();
+        for (row, cohort, lo, hi, dr) in
+            [(7, held, 2, 9, 1), (8, held, 2, 9, 2), (8, free, 20, 27, 3)]
+        {
+            assert_eq!(
+                rib.translate_run(
+                    super::super::witness::FollowRun {
+                        row,
+                        cohort,
+                        lo,
+                        hi,
+                        dr
+                    },
+                    carry,
+                    true,
+                    &mut moved
+                ),
+                8
+            );
+        }
+        let held_depth = depth(&mut rib, 10, 5);
+        let free_depth = depth(&mut rib, 11, 24);
+        assert!(
+            held_depth.is_finite() && held_depth <= 0.0,
+            "a second hop lost the held run's shape ({held_depth:.1} px)"
+        );
+        assert!(
+            free_depth > 2.0,
+            "the later run inherited another run's hold ({free_depth:.1} px)"
+        );
+    }
+
+    fn repaint_column_depth(
+        rib: &mut Ribbon,
+        c: &Config,
+        g: Geom,
+        now: Instant,
+        row: u16,
+        col: u16,
+    ) -> f32 {
+        let cx = ctx_in(now, c, (13, 2), 0.9, g);
+        rib.plan_over(&cx, None);
+        let mut sink = Sink::default();
+        rib.emit(&cx, &mut sink.frame());
+        let x = f32::from(g.origin_x) + (f32::from(col) + 0.5) * g.cw as f32;
+        sink.under
+            .iter()
+            .filter(|q| q.color != 0 && f32::from(q.x) <= x && x < f32::from(q.x) + f32::from(q.w))
+            .map(|q| f32::from(q.y) + f32::from(q.h))
+            .fold(f32::NEG_INFINITY, f32::max)
+            - (f32::from(g.origin_y) + f32::from(row + 1) * g.ch as f32)
+    }
+
+    /// Adjacent, content-proven runs can heal into the older cohort before
+    /// painting. The removed younger identity's held shape must survive.
+    #[test]
+    fn a_repaint_join_keeps_the_held_shape_when_the_older_free_cohort_survives() {
+        let g = Geom {
+            rows: 14,
+            win_h: 14 * 18,
+            ..geom()
+        };
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 7,
+                col0: 2,
+                n: 8,
+                period_ms: 20,
+                disp: 0.9,
+            },
+            &c,
+        );
+        let next = at(t0, 8 * 20);
+        rib.on_event(
+            &Event::Move {
+                from: (7, 10),
+                to: (8, 10),
+                licence: Licence::Insert,
+                dir: Dir::Right,
+            },
+            next,
+            &ctx_in(next, &c, (8, 10), 0.9, g),
+        );
+        type_keys(
+            &mut rib,
+            next,
+            Keys {
+                g,
+                row: 8,
+                col0: 10,
+                n: 8,
+                period_ms: 20,
+                disp: 0.9,
+            },
+            &c,
+        );
+        let mut inked = GlyphProbe::new();
+        inked.probe_row(9, &[true; 120]);
+        let start = at(next, 8 * 20);
+        rib.plan_over(&ctx_in(start, &c, (8, 18), 0.9, g), Some(&inked));
+        let carry = at(start, (HOLD_EASE_S * 1000.0) as u64 + 16);
+        rib.plan_over(&ctx_in(carry, &c, (8, 18), 0.9, g), Some(&inked));
+        let free_depth = repaint_column_depth(&mut rib, &c, g, carry, 7, 4);
+        let held_depth = repaint_column_depth(&mut rib, &c, g, carry, 8, 14);
+        assert!(
+            free_depth > 2.0,
+            "the older run is free ({free_depth:.1} px)"
+        );
+        assert!(
+            held_depth.is_finite() && held_depth <= 0.0,
+            "the newer run is held ({held_depth:.1} px)"
+        );
+        let free = rib
+            .cohorts()
+            .iter()
+            .find(|coh| coh.row == 7)
+            .expect("free run")
+            .id;
+        let held = rib
+            .cohorts()
+            .iter()
+            .find(|coh| coh.row == 8)
+            .expect("held run")
+            .id;
+        let mut moved = Vec::new();
+        for (row, cohort, lo, hi, dr) in [(7, free, 2, 9, 2), (8, held, 10, 17, 1)] {
+            assert_eq!(
+                rib.translate_run(
+                    super::super::witness::FollowRun {
+                        row,
+                        cohort,
+                        lo,
+                        hi,
+                        dr
+                    },
+                    carry,
+                    false,
+                    &mut moved
+                ),
+                8
+            );
+        }
+        let depth = repaint_column_depth(&mut rib, &c, g, carry, 9, 14);
+        assert_eq!(
+            rib.cohorts().iter().filter(|coh| coh.row == 9).count(),
+            1,
+            "the real seam healer merged both runs"
+        );
+        assert!(
+            depth.is_finite() && depth <= 0.0,
+            "the seam merge discarded the held shape ({depth:.1} px)"
+        );
+    }
+
+    /// An empty natural-retirement frame ends the previous row's custody.
+    /// A later cold run over unknown glyphs is born free, as a fresh ribbon is.
+    #[test]
+    fn a_repaint_rows_shape_does_not_survive_its_natural_empty_frame() {
+        let g = Geom {
+            rows: 14,
+            win_h: 14 * 18,
+            ..geom()
+        };
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let keys = Keys {
+            g,
+            row: 11,
+            col0: 2,
+            n: 12,
+            period_ms: 60,
+            disp: 0.9,
+        };
+        type_keys(&mut rib, t0, keys, &c);
+        let mut inked = GlyphProbe::new();
+        inked.probe_row(12, &[true; 120]);
+        let start = at(t0, 12 * 60);
+        rib.plan_over(&ctx_in(start, &c, (11, 14), 0.9, g), Some(&inked));
+        let held = at(start, (HOLD_EASE_S * 1000.0) as u64 + 16);
+        rib.plan_over(&ctx_in(held, &c, (11, 14), 0.9, g), Some(&inked));
+        let before = repaint_column_depth(&mut rib, &c, g, held, 11, 8);
+        assert!(
+            before.is_finite() && before <= 0.0,
+            "the previous line is held ({before:.1} px)"
+        );
+        let empty = at(t0, 20_000);
+        rib.plan_over(&ctx_in(empty, &c, (11, 14), 0.9, g), None);
+        assert!(rib.cells().is_empty(), "the old line naturally retired");
+        let cold = at(empty, 16);
+        type_keys(&mut rib, cold, keys, &c);
+        let now = at(cold, 12 * 60);
+        let depth = repaint_column_depth(&mut rib, &c, g, now, 11, 8);
+        let mut fresh = Ribbon::new();
+        type_keys(&mut fresh, cold, keys, &c);
+        let control = repaint_column_depth(&mut fresh, &c, g, now, 11, 8);
+        assert!(control > 2.0, "the fresh twin is free ({control:.1} px)");
+        assert!(
+            (depth - control).abs() < 0.5,
+            "the cold run inherited retired row state ({depth:.1} vs {control:.1} px)"
+        );
+    }
+
+    /// A navigation wake can still be visible after abandonment. If its text is
+    /// repainted and another navigation takes over its cells before planning,
+    /// preserving their light also preserves the shape carried with that light.
+    #[test]
+    fn a_repainted_wake_keeps_its_shape_when_navigation_remints_its_live_cells() {
+        let g = Geom {
+            rows: 14,
+            win_h: 14 * 18,
+            ..geom()
+        };
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let first = ctx_in(t0, &c, (9, 4), 0.9, g);
+        let old = rib
+            .wake(9, 20, 4, t0, &first, WAKE_LIFE_S, true)
+            .expect("navigation lays a wake");
+        let carry = at(t0, 100);
+        let mut inked = GlyphProbe::new();
+        inked.probe_row(10, &[true; 120]);
+        let source = ctx_in(carry, &c, (9, 4), 0.9, g);
+        rib.plan_over(&source, Some(&inked));
+        let depth = |rib: &mut Ribbon, cx: &Ctx<'_>, row: u16| {
+            let mut sink = Sink::default();
+            rib.emit(cx, &mut sink.frame());
+            let x = f32::from(g.origin_x) + 12.5 * g.cw as f32;
+            sink.under
+                .iter()
+                .filter(|q| {
+                    q.color != 0 && f32::from(q.x) <= x && x < f32::from(q.x) + f32::from(q.w)
+                })
+                .map(|q| f32::from(q.y) + f32::from(q.h))
+                .fold(f32::NEG_INFINITY, f32::max)
+                - (f32::from(g.origin_y) + f32::from(row + 1) * g.ch as f32)
+        };
+        let held = depth(&mut rib, &source, 9);
+        assert!(
+            held.is_finite() && held <= 0.0,
+            "the source wake is held ({held:.1} px)"
+        );
+        let old_cells: Vec<_> = rib
+            .cells()
+            .iter()
+            .filter(|cell| cell.cohort == old)
+            .map(|cell| (cell.col, cell.born))
+            .collect();
+        assert_eq!(old_cells.len(), 17);
+
+        rib.on_event(
+            &nav((9, 4), (5, 0)),
+            carry,
+            &ctx_in(carry, &c, (5, 0), 0.9, g),
+        );
+        assert!(
+            rib.cohorts()
+                .iter()
+                .any(|coh| coh.id == old && coh.abandoned)
+        );
+        assert!(
+            rib.cells()
+                .iter()
+                .filter(|cell| cell.cohort == old)
+                .all(|cell| !cell.leaving())
+        );
+        let mut moved = Vec::new();
+        assert_eq!(
+            rib.translate_run(
+                super::super::witness::FollowRun {
+                    row: 9,
+                    cohort: old,
+                    lo: 4,
+                    hi: 20,
+                    dr: -2,
+                },
+                carry,
+                true,
+                &mut moved,
+            ),
+            17
+        );
+
+        let target = ctx_in(carry, &c, (7, 4), 0.9, g);
+        rib.on_event(&nav((7, 20), (7, 4)), carry, &target);
+        let adopted: Vec<_> = rib.cells().iter().filter(|cell| cell.row == 7).collect();
+        assert_eq!(adopted.len(), 17);
+        assert!(
+            adopted
+                .iter()
+                .all(|cell| { cell.cohort != old && old_cells.contains(&(cell.col, cell.born)) }),
+            "the fresh wake must actually adopt the old visual cells"
+        );
+        rib.plan_over(&target, None);
+        let after = depth(&mut rib, &target, 7);
+        assert!(after.is_finite(), "the adopted wake is still visible");
+        assert!(
+            after <= 0.0,
+            "navigation remint lost the repainted wake's shape ({after:.1} px)"
+        );
+    }
+
+    #[test]
+    fn a_reminted_free_wake_does_not_borrow_the_held_cohort_that_moved_out() {
+        let g = Geom {
+            rows: 14,
+            win_h: 14 * 18,
+            ..geom()
+        };
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let first = ctx_in(t0, &c, (7, 4), 0.9, g);
+        let free = rib
+            .wake(7, 20, 4, t0, &first, WAKE_LIFE_S, true)
+            .expect("the free source wake");
+        let lay = at(t0, 100);
+        rib.plan_over(&ctx_in(lay, &c, (7, 4), 0.9, g), None);
+        rib.relay_word(9, 40, 46, lay, None);
+        let held = rib
+            .cohorts()
+            .iter()
+            .find(|coh| coh.row == 9 && !coh.wake)
+            .expect("the held destination's original cohort")
+            .id;
+        let carry = at(t0, 160);
+        let mut inked = GlyphProbe::new();
+        inked.probe_row(10, &[true; 120]);
+        let source = ctx_in(carry, &c, (9, 46), 0.9, g);
+        rib.plan_over(&source, Some(&inked));
+        let depth = |rib: &mut Ribbon, cx: &Ctx<'_>, row: u16, col: u16| {
+            let mut sink = Sink::default();
+            rib.emit(cx, &mut sink.frame());
+            let x = f32::from(g.origin_x) + (f32::from(col) + 0.5) * g.cw as f32;
+            sink.under
+                .iter()
+                .filter(|q| {
+                    q.color != 0 && f32::from(q.x) <= x && x < f32::from(q.x) + f32::from(q.w)
+                })
+                .map(|q| f32::from(q.y) + f32::from(q.h))
+                .fold(f32::NEG_INFINITY, f32::max)
+                - (f32::from(g.origin_y) + f32::from(row + 1) * g.ch as f32)
+        };
+        let free_before = depth(&mut rib, &source, 7, 12);
+        let held_before = depth(&mut rib, &source, 9, 42);
+        assert!(
+            free_before > 2.0,
+            "the source wake is free ({free_before:.1} px)"
+        );
+        assert!(
+            held_before.is_finite() && held_before <= 0.0,
+            "the destination's original cohort is held ({held_before:.1} px)"
+        );
+        let old_cells: Vec<_> = rib
+            .cells()
+            .iter()
+            .filter(|cell| cell.cohort == free)
+            .map(|cell| (cell.col, cell.born))
+            .collect();
+        assert_eq!(old_cells.len(), 17);
+        rib.on_event(
+            &nav((7, 4), (5, 0)),
+            carry,
+            &ctx_in(carry, &c, (5, 0), 0.9, g),
+        );
+        assert!(
+            rib.cohorts()
+                .iter()
+                .any(|coh| coh.id == free && coh.abandoned)
+        );
+        let mut moved = Vec::new();
+        for (row, cohort, lo, hi, dr, expected) in
+            [(9, held, 40, 45, 2, 6), (7, free, 4, 20, 2, 17)]
+        {
+            assert_eq!(
+                rib.translate_run(
+                    super::super::witness::FollowRun {
+                        row,
+                        cohort,
+                        lo,
+                        hi,
+                        dr,
+                    },
+                    carry,
+                    true,
+                    &mut moved,
+                ),
+                expected
+            );
+        }
+        assert!(
+            rib.cells()
+                .iter()
+                .all(|cell| cell.cohort != held || cell.row == 11)
+        );
+        let target = ctx_in(carry, &c, (9, 4), 0.9, g);
+        rib.on_event(&nav((9, 20), (9, 4)), carry, &target);
+        let adopted: Vec<_> = rib.cells().iter().filter(|cell| cell.row == 9).collect();
+        assert_eq!(adopted.len(), 17);
+        assert!(
+            adopted
+                .iter()
+                .all(|cell| { cell.cohort != free && old_cells.contains(&(cell.col, cell.born)) }),
+            "the fresh wake actually adopts the free source's visual cells"
+        );
+        rib.plan_over(&target, None);
+        let free_after = depth(&mut rib, &target, 9, 12);
+        let held_after = depth(&mut rib, &target, 11, 42);
+        assert!(
+            held_after.is_finite() && held_after <= 0.0,
+            "the moved-out original remains held ({held_after:.1} px)"
+        );
+        assert!(
+            free_after > 2.0,
+            "the reminted free wake borrowed the departed cohort's hold ({free_after:.1} px)"
+        );
     }
 
     #[test]

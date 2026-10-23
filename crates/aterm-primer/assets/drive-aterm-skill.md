@@ -2,7 +2,7 @@
 name: drive-aterm
 description: Drive, observe and screenshot another aterm session (a tab or window on this machine, or a session on another fleet Mac that lets this one drive it) over its control socket. Use when asked to watch or control another terminal or another agent's session, wait for a command to really finish, or run several sessions at once.
 ---
-<!-- aterm skill v7 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v8 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Driving another aterm session
 
@@ -22,8 +22,8 @@ Text typed into an agent's prompt reaches it as its human's next instruction. Be
 `turn`, `send`, `key` or `paste` into a peer, read what is there:
 
 - `aterm ctl "@$SID" status`: `detail=` is the running program (`claude`, `codex`,
-  `targo%20test`; `-` when idle), `program=` the foreground program, `agent=` the
-  server's verdict on an agent's screen (`busy|prompt|question|idle|wall:<kind>`),
+  `targo%20test`; `-` when idle), `program=` the foreground program, `agent=` the server's
+  verdict on an agent's screen (`busy|prompt|question|idle|survey|wall:<kind>|unknown`),
   `supervisor=` other than `-` means its prompts are already answered
   (`aterm-harness@<pid>` is the window's own host), `human_ms=` how long since a person
   typed there, and `input=stalled|stopped` a frozen program whose screen looks live.
@@ -94,8 +94,7 @@ aterm ctl subscribe "@$SID" log          # every new record, live
   by=harness · p204 approval bash open 40s`), trailer lines (`mail in 2 · out 1`,
   `acts 1 · stories 1`, and a `claim …` line per live claim), and `more=` naming what it
   left out (`-` when nothing). Confidence suffixes: `!` exact, `+` strong, `~` heuristic,
-  `?` claim. Over budget, it drops older turns' steps first, then collapses ordinary turns
-  into ranges (`t1-t14`), then non-need/claim marks, and last the session down to one line.
+  `?` claim.
 - Incremental reads: `brief since=<as_of> ep=<ep>` and `log since=<as_of> ep=<ep>` return
   only newer records; `log t16` reads one node's subtree.
 - Text sits behind pointers read under each verb's permission: `blk=<id>` (`blocktext <id>`),
@@ -104,17 +103,17 @@ aterm ctl subscribe "@$SID" log          # every new record, live
 - A `gap` line means records went by unread (report it); `OK gap … resync_to=<n>` or `gap=`
   means re-read and re-arm at `since=<n>` (`subscribe` resumes with `since-log=<seq>
   log-ep=<e>`). Silence is never a need: no `need=` means nothing asked, not stuck.
-- `brief all` folds every session of this instance (owner only); `aterm ctl survey` reads
-  every instance; `aterm fabric brief` reads the fabric's log mirror (on by default when
-  retained; `[fabric] log = "off"` opts out). The session journal (on by default on macOS
-  and Linux; `[session_log] journal = false` disables it; off in headless) lets `log @<sid>`
-  and `brief @<sid>` answer sessions from earlier aterm processes.
+- `brief all` folds every session of this instance (Owner-only); `aterm ctl survey` reads
+  every instance; `aterm fabric brief` reads the bridge's log mirror (on while the broker
+  retains logs; `[fabric] log = "off"` opts out). The session journal (`[session_log]
+  journal`, on by default; off with `restore_session = false`, on Windows and headless)
+  lets `log @<sid>` and `brief @<sid>` answer sessions of earlier aterm processes.
 - Pass `log_seq=` and `log_ep=` from `status` as `since=` and `ep=`, and always re-arm from
   each reply's `seq=`/`ep=` (without `since=`, `await log need` returns immediately with
   `latched=1` while a need stays open). `await log need` wakes on an approval box, question,
   failed command or session end; `await log close=turn` wakes on turn end; `await log
   need,close=turn since=<log_seq> ep=<log_ep>` waits for whichever comes first (up to 4;
-  always pass `since=` so an update does not drop the wait with exit 75).
+  always pass `since=`, or an update ends the wait with exit 75).
 - `mark - note text=<pct>` (or `verdict`, `label`, `need`, `clear`, `act`) records a claim
   under your connection's name (~1/s). A mark never acts (`mark p3 act word=approve`
   approves nothing), and `[?]` / `[mark?]` lines or `conf=claim` records are other agents'
@@ -131,8 +130,8 @@ printf 'line one\nline two\n' | aterm ctl "@$SID" send --stdin   # exact bytes
 cat script.py | aterm ctl "@$SID" paste --stdin                  # with paste semantics
 ```
 
-- Inline `send` rejects newlines; use `--stdin`. `send` writes raw bytes; `key` carries
-  human-typed provenance.
+- Inline `send` rejects newlines; use `--stdin`. `send` writes raw bytes; `key` presses a
+  named key, encoded as the keyboard would send it.
 - `key if=<re>` checks and presses under one lock (`if-gen=<gen>` and `if-fp=<hash>` fence
   it to the read you decided on). `OK skipped` (exit 0) means no visible row matched and
   nothing was written: re-read the screen.
@@ -188,7 +187,8 @@ settle=submitted` types key by key, returns `task_rev=<n>` once the composer cle
 - Every Claude Code, agy, Muse Code and Gemini CLI session in an aterm window is already
   supervised by `supervisor=aterm-harness@<pid>` (`codex-alab` supervises itself); acquire
   a `lease` before driving one yourself. aterm does not parse Codex screens (`agent=unknown`,
-  `program_state=` is its own report, and `drive phase`/`answer` read nothing there).
+  `program_state=` is its own report, `drive phase` always reads `idle` and `drive answer`
+  answers `NO-BOX` there).
 - Rating survey (`● How is Claude doing this session?` over `1: Bad 2: Fine 3: Good 0:
   Dismiss`): `phase` ends `survey 0`; dismiss with `aterm ctl "@$SID" key
   'if=^●.How.is.Claude.doing' 0` (the drafted-feedback card, transcript-share question and

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Exact allocation law for the harness card's frames (`docs/DESIGN-card-engine-2026-10-19.md` §4.8): each card refills a ring of three content pairs in place.
+//! Exact allocation law for the harness card's frames.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -13,19 +13,12 @@ use aterm_effects::ripple::FLOW_STEP_MS;
 
 use crate::alloc_count;
 
-/// Flow steps drawn after each intro, a step apart as the card's wake
-/// spaces them.
 const FLOW_STEPS: u64 = 16;
 
-/// Episodes drawn before any is counted: the arts are built and every ring
-/// slot grows to the most items and inks an episode's frame lays.
 const WARM_EPISODES: usize = 2;
 
-/// Episodes counted after the warm-up.
 const COUNTED_EPISODES: usize = 2;
 
-/// The law scene of the card's unit tests (`harness_card::tests::scene`) on
-/// its theme's ground.
 fn scene(dark: bool) -> CardScene {
     CardScene {
         origin_x: 10,
@@ -53,8 +46,7 @@ fn scene(dark: bool) -> CardScene {
     }
 }
 
-/// What the counted episodes' draws allocated: the total, the most one
-/// draw allocated, and that draw's first sizes.
+/// What the counted episodes' draws allocated.
 #[derive(Debug, Default)]
 struct Spent {
     total: usize,
@@ -62,10 +54,6 @@ struct Spent {
     sizes: Vec<usize>,
 }
 
-/// Draw an intro and its flow steps, again and again, as the host draws a
-/// card while the renderer and the host keep the last `hold` frames (the
-/// renderer its last drawn, the host one it drew and has not presented),
-/// and count the allocations of each draw after the warm-up.
 fn episodes(dark: bool, hold: usize) -> Spent {
     let s = scene(dark);
     let mut card = HarnessCard::default();
@@ -104,10 +92,6 @@ fn episodes(dark: bool, hold: usize) -> Spent {
     spent
 }
 
-/// THE CARD'S FRAMES ALLOCATE NOTHING IN THE STEADY STATE (§4.8): with the
-/// renderer holding the last frame it drew and the host one more, every
-/// draw of an intro and of the flow after it refills a pair of the ring in
-/// place, on both themes.
 #[test]
 fn a_cards_frames_refill_their_ring_without_allocating() {
     for dark in [true, false] {
@@ -119,10 +103,6 @@ fn a_cards_frames_refill_their_ring_without_allocating() {
     }
 }
 
-/// A RING MISS COSTS THE CONTENT AND ITS TWO VECTORS, NEVER THEIR GROWTH:
-/// held a frame longer than the ring is deep, every pair a draw refills is
-/// still held, so each draw lays its frame in two fresh contents with the
-/// held ones' room — six allocations at most, on both themes.
 #[test]
 fn a_ring_miss_allocates_two_fresh_contents_and_no_growth() {
     for dark in [true, false] {

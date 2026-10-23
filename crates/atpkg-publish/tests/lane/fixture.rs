@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Test fixtures for publication lanes: scratch home, fake host, git repos, and fake packer/indexer.
+//! Test fixtures for publication lanes: scratch home, fake host, git repos, and fake packer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -22,8 +22,7 @@ use atpkg_publish::triple::Triple;
 
 use super::super::shared::{Made, made_once, scratch};
 
-/// `git -C <dir> <args>` ([`atpkg_publish::testkit::git`]) with a fixed identity, failing the
-/// test on an error.
+/// Runs `git -C <dir> <args>` with a fixed identity.
 pub fn git(dir: &Path, args: &[&str]) -> String {
     git_at(dir, args, None)
 }
@@ -64,10 +63,7 @@ pub fn git_at(dir: &Path, args: &[&str], day: Option<&str>) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A fresh repository on `main` with `commits` empty commits, written by one
-/// `git fast-import` (a build number is a commit count, and pins run to the hundreds); its
-/// commits, oldest first. The history is the same bytes every time (a fixed identity and
-/// fixed dates), so each count is made once per process and laid down after.
+/// Creates or reuses a repository on `main` with `commits` empty commits, oldest first.
 pub fn repo(dir: &Path, commits: u64) -> Vec<String> {
     static MADE: Made<u64, Vec<String>> = Mutex::new(BTreeMap::new());
     made_once(&MADE, &commits, dir, |dir| make_repo(dir, commits))
@@ -135,8 +131,7 @@ pub fn commit(dir: &Path, msg: &str, day: Option<&str>) -> String {
     git(dir, &["rev-parse", "HEAD"])
 }
 
-/// A stable 40-hex "public commit" for `seed` (the engine rewrites history, so the public
-/// sha is not the dev sha).
+/// Deterministic 40-hex public commit digest for `seed`.
 #[must_use]
 pub fn hex40(seed: &str) -> String {
     let mut out = String::new();
@@ -476,8 +471,7 @@ impl Fx {
     }
 }
 
-/// What an [`Fx`] holds besides its directory ([`Fx::held`]): its keys, a fork of its host,
-/// and its packer, indexer, notifier and ledger as it left them.
+/// Snapshot of an [`Fx`] world outside its directory for [`Fx::laid`].
 #[derive(Clone)]
 pub struct Held {
     root: PathBuf,
@@ -522,8 +516,7 @@ impl Release {
     };
 }
 
-/// A packer that writes what the real one would: the asset, the manifest (fresh, or the
-/// base's bytes verbatim with this target's row appended), its signature, and the upload.
+/// Fake packer that records requests and stages synthetic assets, manifests, and signatures.
 #[derive(Default)]
 pub struct FakePacker {
     /// Every request, in order.
@@ -646,8 +639,7 @@ impl Packer for FakePacker {
     }
 }
 
-/// An indexer that publishes the head's pins with the delta applied, signed by the
-/// fixture's machine, as `atpkg-index-<head+1>`.
+/// Fake indexer that applies pin deltas and signs `atpkg-index-<head+1>`.
 pub struct FakeIndexer {
     keys: Arc<Keys>,
     host: Arc<FakeHost>,

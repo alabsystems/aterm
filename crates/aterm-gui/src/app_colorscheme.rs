@@ -17,7 +17,8 @@ pub(crate) const fn scheme_from_word(
     }
 }
 
-/// Map a winit window [`Theme`](aterm_window::window::Theme) onto the engine's [`Appearance`](aterm_types::Appearance).
+/// Map a winit window [`Theme`](aterm_window::window::Theme) onto the engine's
+/// [`Appearance`](aterm_types::Appearance).
 #[must_use]
 pub(crate) const fn theme_to_appearance(
     theme: Option<aterm_window::window::Theme>,
@@ -39,12 +40,13 @@ pub(crate) enum ThemeChange {
     OsFlip,
     /// A rejected renderer rebuild restored the previous render config.
     Rollback,
-    /// The transient preview lane (`theme preview|revert`, its TTL): the preview's candidate, or the configured theme once it ends.
+    /// Transient preview lane (`theme preview|revert`, or its TTL expiry).
     Preview,
 }
 
 impl ThemeChange {
-    /// Whether this install keeps a preview held by `hold` standing, provided the preview's selector still draws (a reload re-checks that, [`App::settle_theme_preview`]).
+    /// Whether this install keeps a preview held by `hold` standing, provided the preview's
+    /// selector still resolves ([`App::settle_theme_preview`]).
     pub(crate) fn keeps_preview(self, hold: crate::control_theme::PreviewHold) -> bool {
         match self {
             Self::OsFlip | Self::Rollback | Self::Preview | Self::CatalogReload => true,
@@ -54,7 +56,7 @@ impl ThemeChange {
         }
     }
 
-    /// One reason for two triggers folded into one install (a held colour swap and the generation that releases it).
+    /// Combine two install triggers into a single reason.
     pub(crate) fn merged(self, other: Option<Self>) -> Self {
         match other {
             None => self,
@@ -74,11 +76,11 @@ impl ThemeChange {
 /// What one [`App::install_resolved_colors`] changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ThemeInstall {
-    /// The engine projection (`TerminalConfig`) differed, so every session and the factory got `apply_config`.
+    /// The engine projection (`TerminalConfig`) differed.
     pub(crate) engine_changed: bool,
-    /// The renderer [`Theme`](aterm_render::Theme) differed, so it went through [`App::apply_theme_live`].
+    /// The renderer [`Theme`](aterm_render::Theme) differed.
     pub(crate) theme_changed: bool,
-    /// The authored chrome colours (`accent_color` and its kin, theme or config) differed, so every chrome surface was invalidated to re-derive its tokens.
+    /// The authored chrome colours (`accent_color` and its kin) differed.
     pub(crate) chrome_changed: bool,
 }
 
@@ -141,8 +143,6 @@ impl App {
             }
         }
         if (engine_changed || own_applies > 0) && !theme_changed {
-            // Cells re-coloured under an unchanged chrome: each window's repaint
-            // key keeps an untouched presentation cheap.
             self.request_redraw_all_windows();
         }
         aterm_log::debug!(
@@ -155,7 +155,8 @@ impl App {
         }
     }
 
-    /// End the standing preview unless [`ThemeChange::keeps_preview`] holds and its selector still resolves.
+    /// End the standing preview unless [`ThemeChange::keeps_preview`] holds and its selector still
+    /// resolves.
     pub(crate) fn settle_theme_preview(&mut self, reason: ThemeChange) {
         let Some(preview) = self.theme_preview.as_ref() else {
             return;
@@ -167,7 +168,8 @@ impl App {
         }
     }
 
-    /// Record the live OS `appearance` and install the colours it draws: the OS-flip caller of [`Self::install_resolved_colors`].
+    /// Record the live OS `appearance` and install the resolved colours
+    /// ([`Self::install_resolved_colors`]).
     pub(crate) fn sync_app_theme_to_appearance(&mut self, appearance: aterm_types::Appearance) {
         #[cfg(windows)]
         {
@@ -196,7 +198,7 @@ impl App {
         }
     }
 
-    /// One reading from the OS appearance source ([`crate::Wake::OsAppearance`]) or the development `appearance dark|light` verb.
+    /// Handle an OS appearance reading ([`crate::Wake::OsAppearance`]) or the `appearance` verb.
     pub(crate) fn on_os_appearance(&mut self, appearance: aterm_types::Appearance) {
         self.sync_app_theme_to_appearance(appearance);
     }
@@ -214,7 +216,8 @@ impl App {
         }
     }
 
-    /// `os_appearance= theme_side= reported_scheme= [scheme_from=] bg_dark=`, the appearance fields of a session's `status`.
+    /// Format the appearance status fields (`os_appearance= theme_side= reported_scheme=
+    /// [scheme_from=] bg_dark=`).
     pub(crate) fn appearance_status_fields(
         &self,
         reported: Option<aterm_types::Appearance>,
@@ -323,10 +326,8 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// BROKEN-2 — an OS light/dark flip that moves the palette's appearance
-    /// updates the SESSION FACTORY's scheme baseline, so a tab/split spawned AFTER
-    /// the flip starts at it (its engine is built from the factory's
-    /// `terminal_config`, whose `color_scheme` it carries).
+    /// An OS light/dark flip that changes the palette appearance updates the session factory's
+    /// scheme baseline for newly spawned sessions.
     #[test]
     fn os_flip_updates_the_session_factory_appearance() {
         let mut app = crate::App::headless_for_test();
@@ -371,10 +372,8 @@ pub(crate) mod install_resolved_colors {
     use crate::app_config::{Config, ThemeCatalog};
     use aterm_types::{Appearance, ColorScheme, Rgb};
 
-    /// A CHROME-ONLY EDIT REPAINTS: re-resolving with only `accent_color`
-    /// changed leaves the renderer theme alone but reports the chrome change,
-    /// drops every window's strip-row cache, and the new accent is what the
-    /// header's tokens carry.
+    /// Re-resolving with only `accent_color` changed reports `chrome_changed`, clears every
+    /// window's strip-row cache, and updates the header accent token.
     #[test]
     fn a_chrome_only_edit_repaints() {
         let mut app = App::headless_for_test();
@@ -413,7 +412,7 @@ pub(crate) mod install_resolved_colors {
         assert_eq!(header.accent, [0xff, 0x00, 0xaa]);
     }
 
-    /// Apply `text` as `aterm.toml` through the real admission path (the prepared generation a config watcher hands the App).
+    /// Apply `text` as `aterm.toml` through the prepared config generation admission path.
     pub(crate) fn apply_config_text(app: &mut App, dir: &std::path::Path, text: &str) {
         let path = dir.join("aterm.toml");
         std::fs::write(&path, text).expect("write config");
@@ -504,10 +503,8 @@ pub(crate) mod install_resolved_colors {
         out
     }
 
-    /// A mode-2031 subscriber is pushed `?997;2n` when the config switches
-    /// Dracula → Solarized Light, and by the time the push reaches the PTY the
-    /// engine already answers OSC 11 with the new background (APPEAR-8: the
-    /// palette and the push land in one critical section, palette first).
+    /// Switching Dracula to Solarized Light pushes `?997;2n` to a mode-2031 subscriber after the
+    /// new palette lands, while an unrelated config edit sends no push.
     #[cfg(unix)]
     #[test]
     fn a_theme_switch_pushes_997_after_the_new_palette_and_an_unrelated_edit_does_not() {
@@ -699,10 +696,7 @@ pub(crate) mod install_resolved_colors {
         );
     }
 
-    /// A change of the engine projection rings every session's screen
-    /// readers: a styled frame's colours resolve against it, so the hold that
-    /// installs it moves the frame, and a content subscription pushes the
-    /// reload on that ring.
+    /// Changing the engine projection wakes every session's frame watchers.
     #[test]
     fn a_projection_change_rings_every_sessions_watchers() {
         let mut app = App::headless_for_test();
@@ -815,9 +809,7 @@ pub(crate) mod install_resolved_colors {
     }
 }
 
-/// The OS appearance as its own source (APPEAR-1/2/10/12): a forced window
-/// chrome does not mask a flip, launch builds for the side the OS shows, and
-/// `status` says which side is drawn and reported.
+/// Tests for OS appearance source decoupling, launch appearance seeding, and status fields.
 #[cfg(test)]
 mod appearance_source {
     use crate::App;
@@ -850,9 +842,8 @@ mod appearance_source {
             .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
     }
 
-    /// APPEAR-2: `window_theme = "dark"` forces the chrome, yet a light OS
-    /// reading (the event the platform observer posts) draws and reports the
-    /// light side.
+    /// `window_theme = "dark"` forces the window chrome while still following an OS light flip for
+    /// a split theme.
     #[test]
     fn a_forced_dark_chrome_still_follows_an_injected_light_flip() {
         let mut app = App::headless_for_test();
@@ -884,10 +875,7 @@ mod appearance_source {
         assert_eq!(dsr_996(&app), b"\x1b[?997;1n");
     }
 
-    /// APPEAR-12: a launch built for the light reading (what `warm_config` and
-    /// `main_entry` build when the early read says light) needs nothing at
-    /// attach, which reads light again: session 0 already draws and reports
-    /// the light side, and no second `apply_config` fans out.
+    /// A launch built for a light OS reading needs no second `apply_config` fan-out at attach.
     #[test]
     fn a_launch_built_for_light_needs_no_second_apply_config_at_attach() {
         let launch = |read: Appearance| {
@@ -925,9 +913,8 @@ mod appearance_source {
         );
     }
 
-    /// APPEAR-10: `status` and the `appearance` line say which OS reading is
-    /// in effect, which side it picked, what the session reports and whether
-    /// its background is dark, and the four agree after a flip.
+    /// `status` and the `appearance` line agree on OS reading, theme side, reported scheme, and
+    /// background darkness after a flip.
     #[test]
     fn status_appearance_fields_agree_after_a_flip() {
         let mut app = App::headless_for_test();
@@ -976,13 +963,7 @@ mod appearance_source {
         assert_eq!(field(&record, "reported_scheme"), Some("dark"), "{record}");
     }
 
-    /// Linux `window_theme = "auto"`: the variant the window's chrome takes
-    /// (`chrome_theme_for_apprt`, X11's `_GTK_THEME_VARIANT` and the Wayland
-    /// header) follows an OS light/dark flip through the side of a split
-    /// `theme` it draws, and a single theme keeps its own side whatever the OS
-    /// shows: the title bar matches the terminal under it, the Windows caption's
-    /// rule (`platform_win::resolve_chrome_theme`) and what macOS's transparent
-    /// title bar shows.
+    /// On Linux with `window_theme = "auto"`, the chrome variant follows the drawn theme side.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_auto_chrome_follows_the_os_through_the_theme_it_draws() {

@@ -45,10 +45,6 @@ pub(crate) struct Arm {
 }
 
 impl Arm {
-    /// THE DEFAULT ARM, NAMED: what aterm opens its guarded broker at by
-    /// default — the bench's own default tier, which the bench holds equal to
-    /// `aterm_link::durability::default_for` (`fabric_bench/run.rs`), at
-    /// aterm's horizon when it is ordered.
     fn shipped() -> Arm {
         let tier = bench_spec::Tier::default();
         Arm {
@@ -58,7 +54,6 @@ impl Arm {
         }
     }
 
-    /// The arm's words for the bench (`durability=… [horizon_ms=…]`).
     fn words(self) -> Vec<String> {
         let mut words = vec![format!("durability={}", self.tier.word())];
         if let Some(ms) = self.horizon_ms {
@@ -67,7 +62,6 @@ impl Arm {
         words
     }
 
-    /// The arm's flags for the ledger's reproducing line.
     fn flags(self) -> String {
         let mut flags = format!(" --durability {}", self.tier.word());
         if let Some(ms) = self.horizon_ms {
@@ -349,14 +343,8 @@ impl Args {
     }
 }
 
-/// The variable the bench reads its run from.
 const BENCH_ENV: &str = "FABRIC_BENCH";
-
-/// The bench's progress lines start with this; the lane echoes them live and
-/// keeps the rest of the build's chatter for a failure message.
 const PROGRESS: &str = "fabric bench:";
-
-/// How many trailing output lines a failure quotes.
 const TAIL: usize = 60;
 
 /// Run the `fabric` performance lane.
@@ -448,15 +436,12 @@ fn measure(args: &Args) -> Result<String, Halt> {
     Ok(format!("ledger entries {}", written.join(", ")))
 }
 
-/// The binary the lane built for the arm, and what it read about the build.
 struct Built {
     path: PathBuf,
     identity: String,
     lane_build: String,
 }
 
-/// One bench run of `arm` on the binary `built`, written into the ledger: the
-/// entry's path.
 fn run_arm(
     targo: &Targo<'_>,
     args: &Args,
@@ -590,11 +575,6 @@ fn run_arm(
     Ok(md_path)
 }
 
-/// Every targo this lane runs: the run's toolchain ([`CargoDriver`]), in the
-/// workspace, with no environment source of rustflags ([`flags`]), and led by
-/// the build-dir `--config` every perf build of the workspace gets
-/// ([`crate::perf::driver::workspace_build_dir`]): the one atpkg's shim hands a
-/// plain `targo` here, else `<target>/build.noindex`.
 struct Targo<'a> {
     driver: &'a CargoDriver,
     build_dir: Option<String>,
@@ -613,8 +593,6 @@ impl<'a> Targo<'a> {
         }
     }
 
-    /// The arguments before the caller's: the cache `--config`, the lane flag,
-    /// the verb.
     fn lead(&self, verb: &str) -> Vec<String> {
         let mut lead = Vec::new();
         if let Some(value) = &self.build_dir {
@@ -643,7 +621,6 @@ impl<'a> Targo<'a> {
         cmd
     }
 
-    /// The command line [`Self::command`] builds, for the `$ …` log line.
     fn display(&self, verb: &str, args: &[&str]) -> String {
         let mut parts = vec![self.driver.program.display().to_string()];
         parts.extend(self.lead(verb));
@@ -651,8 +628,6 @@ impl<'a> Targo<'a> {
         parts.join(" ")
     }
 
-    /// Run `verb args` to completion; its stdout, or a failure quoting its
-    /// stderr's tail.
     fn output(&self, verb: &str, args: &[&str], what: &str) -> Result<String, Halt> {
         let out = self
             .command(verb)
@@ -673,18 +648,12 @@ impl<'a> Targo<'a> {
     }
 }
 
-/// The three facts `crates/aterm/build.rs` stamps `aterm` with that it would
-/// otherwise probe from git, by the names it reads them pinned under.
 const GIT_FACTS: [&str; 3] = [
     "ATERM_BUILD_GIT_COMMIT",
     "ATERM_BUILD_GIT_COMMIT_FULL",
     "ATERM_BUILD_DEV_COMMITS",
 ];
 
-/// THE BUILD'S GIT FACTS, PINNED FOR THE WHOLE PLAN: the caller's when it
-/// pinned all three (`caller` reads the environment; an empty value is
-/// unpinned, as build.rs reads it), else build.rs's own reading of them
-/// (`probe`).
 fn git_facts(
     caller: impl Fn(&str) -> Option<String>,
     probe: impl FnOnce() -> [String; 3],
@@ -700,10 +669,6 @@ fn git_facts(
     GIT_FACTS.into_iter().zip(values).collect()
 }
 
-/// build.rs's own reading of the three facts in `dir`, probe for probe
-/// (`build_stamp::emit`): HEAD's 12-hex commit with `-dirty` when `git status`
-/// lists anything, the full commit, and the commits since the newest `v*.*.0`
-/// tag — `unknown`, `unknown` and `0` where git cannot say.
 fn probe_git_facts(dir: &Path) -> [String; 3] {
     let git = |args: &[&str]| {
         arena::stdout_of(
@@ -727,8 +692,6 @@ fn probe_git_facts(dir: &Path) -> [String; 3] {
     [commit, full, dev_commits]
 }
 
-/// Cargo's plan for this arm's build of the bench (`--unit-graph`, which
-/// compiles nothing), read down to the units on the measured path.
 fn plan(targo: &Targo<'_>, args: &Args) -> Result<units::Audit, Halt> {
     let mut plan_args = args.build_args();
     plan_args.extend(["--unit-graph", "-Z", "unstable-options"]);
@@ -737,8 +700,6 @@ fn plan(targo: &Targo<'_>, args: &Args) -> Result<units::Audit, Halt> {
         .map_err(|why| Halt::Fail(format!("the build plan does not read: {why}")))
 }
 
-/// The rustflags cargo's config files hold (`targo config get` of the `build`
-/// and `target` tables; a table not set is none).
 fn config_rustflags(targo: &Targo<'_>) -> Result<Vec<flags::Source>, Halt> {
     let table = |name: &str| -> Result<Option<String>, Halt> {
         let args = ["-Z", "unstable-options", "get", "--format", "json", name];
@@ -764,8 +725,6 @@ fn config_rustflags(targo: &Targo<'_>) -> Result<Vec<flags::Source>, Halt> {
         .map_err(|why| Halt::Fail(format!("cargo's config does not read: {why}")))
 }
 
-/// Build the arm's bench and the `aterm` it launches, and return where cargo
-/// says it wrote that `aterm`.
 fn build_bench(targo: &Targo<'_>, args: &Args) -> Result<PathBuf, Halt> {
     let mut build_args = vec!["-q"];
     build_args.extend(args.build_args());
@@ -775,8 +734,6 @@ fn build_bench(targo: &Targo<'_>, args: &Args) -> Result<PathBuf, Halt> {
     built_binary(&messages, "aterm").map_err(|why| Halt::Fail(format!("the bench's build: {why}")))
 }
 
-/// The executable cargo reports for the binary target `name`, out of a
-/// build's `--message-format json` lines.
 fn built_binary(messages: &str, name: &str) -> Result<PathBuf, String> {
     for line in messages.lines() {
         let Ok(message) = aterm_json::from_str::<aterm_json::Value>(line) else {
@@ -805,9 +762,6 @@ fn built_binary(messages: &str, name: &str) -> Result<PathBuf, String> {
     Err(format!("cargo reported no `{name}` binary"))
 }
 
-/// Why the bench's report is not of the binary the lane built — another path,
-/// or the same path holding another file at the run's start or end — or
-/// `None`.
 fn another_build(report: &aterm_json::Value, built: &Path, identity: &str) -> Option<String> {
     let ran = report
         .get("aterm_binary")
@@ -835,8 +789,6 @@ fn another_build(report: &aterm_json::Value, built: &Path, identity: &str) -> Op
     None
 }
 
-/// `<dir>/<date>-fabric.md` and its `.json`, or `-2`, `-3`… when a run that
-/// day already wrote one: the ledger is append-only.
 fn ledger_paths(dir: &Path, date: &str) -> (PathBuf, PathBuf) {
     let mut n = 1;
     loop {
@@ -854,7 +806,6 @@ fn ledger_paths(dir: &Path, date: &str) -> (PathBuf, PathBuf) {
     }
 }
 
-/// `sysctl -n vm.loadavg`'s three averages (`1.0 2.0 3.0`), or `unavailable`.
 fn load_average() -> String {
     arena::stdout_of(
         aterm_uds::spawnfd::command(aterm_uds::os_path!("sysctl")).args(["-n", "vm.loadavg"]),
@@ -867,8 +818,6 @@ fn load_average() -> String {
     .unwrap_or_else(|| "unavailable".to_string())
 }
 
-/// The cores a load average is read against: logical CPUs and, where the OS
-/// says (Apple silicon), how many are performance cores.
 fn cpus() -> String {
     let logical = std::thread::available_parallelism()
         .map_or_else(|_| "?".to_string(), |n| n.get().to_string());
@@ -883,7 +832,6 @@ fn cpus() -> String {
     }
 }
 
-/// What a ledger entry records about the run beside its numbers.
 struct Provenance<'a> {
     scenario: bench_spec::Scenario,
     date: &'a str,
@@ -902,7 +850,6 @@ struct Provenance<'a> {
 }
 
 impl Provenance<'_> {
-    /// The entry's head. Pure (unit-tested).
     fn render(&self) -> String {
         let scenarios = match self.scenario {
             bench_spec::Scenario::All => "post -> deliver, burst, ping-pong, attach",
@@ -1062,11 +1009,6 @@ mod tests {
         assert!(Args::from_options(&o).is_err());
     }
 
-    /// WHAT SHIPS, NAMED APART: `--retention`, `--log` and
-    /// `--retention-interval-ms` reach the bench's words and every entry's
-    /// reproducing line only when given (the bench's defaults are what
-    /// ships, and its report names them either way), and the bench's own
-    /// grammar refuses a tick interval on a broker that retains nothing.
     #[test]
     fn retention_the_mirror_and_the_tick_reach_the_bench_and_the_ledger() {
         let shipped = Arm::shipped();
@@ -1113,9 +1055,6 @@ mod tests {
         }
     }
 
-    /// `--bystanders N` (B10) reaches the bench's words and the entry's
-    /// reproducing line only when given, 0 included; the bench's own grammar
-    /// refuses a count past what one instance carries.
     #[test]
     fn the_bystanders_reach_the_bench_and_the_ledger() {
         let shipped = Arm::shipped();
@@ -1146,11 +1085,6 @@ mod tests {
         }
     }
 
-    /// THE SAME-DAY ARMS IN ONE INVOCATION: `--durability` names the tiers in
-    /// order, an ordered tier runs once per `--horizon-ms` (aterm's 100 ms,
-    /// `bench_spec::ORDERED_HORIZON_MS`, when none is named), and `--passes
-    /// 2` runs the list forward then backward — A B C D D C B A — each run's
-    /// own reproducing line naming its arm alone.
     #[test]
     fn the_arms_run_in_order_and_alternate_by_pass() {
         use bench_spec::Tier;
@@ -1196,11 +1130,6 @@ mod tests {
         assert!(Args::from_options(&o).is_err(), "eight runs, one file");
     }
 
-    /// THE BUILD'S GIT FACTS ARE ONE READING, all three pinned on every
-    /// targo: the caller's when it pinned all three (nothing probed), else
-    /// the probe's for all three — never a mix, under which aterm's build
-    /// script would still read git for the rest and watch the shared refs —
-    /// and an empty pin is none, as the script reads it.
     #[test]
     fn the_build_git_facts_are_the_callers_three_or_one_probe() {
         let probe = || {

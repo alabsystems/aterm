@@ -8,10 +8,8 @@
 
 use crate::model::PValue;
 
-/// Maximum container nesting depth accepted by the parser.
 const MAX_DEPTH: usize = 256;
 
-/// The header `defaults export` writes before the root value.
 const HEADER: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n";
 
 /// Parse a whole XML plist document (`<?xml …?><plist><…/></plist>`) to its root value.
@@ -86,7 +84,6 @@ fn strip_fraction_zeros(text: &str) -> String {
     }
 }
 
-/// Append `text` with `&`, `<`, and `>` escaped.
 fn push_escaped(out: &mut String, text: &str) {
     for c in text.chars() {
         match c {
@@ -255,7 +252,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse the XML prolog and optional `<plist>` wrapper around `root`.
     fn document<T>(
         &mut self,
         root: impl FnOnce(&mut Self, Tag) -> Result<T, String>,
@@ -285,7 +281,6 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    /// A root dictionary's entries, each value read on its own (see [`parse_domain`]).
     fn domain(&mut self, tag: Tag) -> Result<Entries, String> {
         match tag {
             Tag::Empty(name) if name == "dict" => Ok(Vec::new()),
@@ -319,7 +314,6 @@ impl<'a> Parser<'a> {
         self.rest().starts_with(prefix)
     }
 
-    /// Move past `end`, which must occur; `what` names the construct for the error.
     fn skip_past(&mut self, end: &[u8], what: &str) -> Result<(), String> {
         match find(self.rest(), end) {
             Some(at) => {
@@ -330,7 +324,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skip whitespace, comments, the XML declaration and the DOCTYPE.
     fn skip_misc(&mut self) -> Result<(), String> {
         loop {
             while self
@@ -352,7 +345,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Read one tag at the cursor.
     fn tag(&mut self) -> Result<Tag, String> {
         if self.s.get(self.pos) != Some(&b'<') {
             return Err(if self.pos >= self.s.len() {
@@ -405,7 +397,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// The text up to `</name>` (which is consumed), entities decoded.
     fn text(&mut self, name: &str) -> Result<String, String> {
         let mut bytes: Vec<u8> = Vec::new();
         loop {
@@ -443,7 +434,6 @@ impl<'a> Parser<'a> {
         String::from_utf8(bytes).map_err(|_| self.err(&format!("<{name}> is not UTF-8")))
     }
 
-    /// One `&…;` reference at the cursor.
     fn entity(&mut self) -> Result<char, String> {
         let rest = self.rest();
         let Some(end) = rest.iter().take(12).position(|&b| b == b';') else {
@@ -477,7 +467,6 @@ impl<'a> Parser<'a> {
         Ok(c)
     }
 
-    /// The value the tag `tag` (already read) opens.
     fn value_from(&mut self, tag: Tag, depth: usize) -> Result<PValue, String> {
         if depth > MAX_DEPTH {
             return Err(self.err("containers nest too deeply"));
@@ -538,7 +527,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// The next `<key>` and its value inside a `<dict>` at `depth`, or `None` at `</dict>`.
     fn entry(&mut self, depth: usize) -> Result<Option<(String, PValue)>, String> {
         self.skip_misc()?;
         let key = match self.tag()? {
@@ -577,7 +565,6 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Insert or replace `key` in `entries`.
 fn upsert<V>(entries: &mut Vec<(String, V)>, key: String, value: V) {
     if let Some(slot) = entries.iter_mut().find(|(k, _)| *k == key) {
         slot.1 = value;
@@ -586,7 +573,6 @@ fn upsert<V>(entries: &mut Vec<(String, V)>, key: String, value: V) {
     }
 }
 
-/// Whether `text` has valid plist `<integer>` syntax (signed decimal or `0x` hex).
 fn integer_syntax(text: &str) -> bool {
     let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
     match digits
@@ -598,7 +584,6 @@ fn integer_syntax(text: &str) -> bool {
     }
 }
 
-/// Parse a signed decimal or `0x` hex plist `<integer>` within `i64`.
 fn parse_integer(text: &str) -> Option<i64> {
     // from_str_radix accepts its own sign; only the one outer sign belongs here.
     if !integer_syntax(text) {
@@ -627,7 +612,6 @@ fn parse_integer(text: &str) -> Option<i64> {
     i64::try_from(signed).ok()
 }
 
-/// Parse a plist `<real>`, including `nan` and signed `inf`/`infinity`.
 fn parse_real(text: &str) -> Option<f64> {
     match text.to_ascii_lowercase().as_str() {
         "nan" => Some(f64::NAN),
@@ -641,14 +625,11 @@ fn parse_real(text: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
-    /// Fixture from `defaults -currentHost export -g -` on macOS 27.0.
     const VM_CURRENT_HOST_GLOBAL: &[u8] =
         include_bytes!("../fixtures/prefs/vm-27.0-currenthost-global.plist");
 
-    /// Fixture from `defaults export` covering every plist value type.
     const VM_EVERY_TYPE: &[u8] = include_bytes!("../fixtures/prefs/vm-27.0-every-type.plist");
 
-    /// Output of `defaults export` for a missing domain.
     const VM_MISSING_DOMAIN: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict/>\n</plist>\n";
 
     fn get<'a>(dict: &'a PValue, key: &str) -> &'a PValue {

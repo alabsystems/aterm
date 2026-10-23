@@ -18,9 +18,7 @@ pub(crate) struct ReaderPanic {
 }
 
 std::thread_local! {
-    /// How deep this thread is inside [`guarded`] (the hook asks).
     static DEPTH: Cell<u32> = const { Cell::new(0) };
-    /// The location of the panic [`absorb`] took on this thread.
     static CAUGHT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
@@ -43,9 +41,6 @@ pub(crate) fn inside() -> bool {
     DEPTH.with(Cell::get) > 0
 }
 
-/// Wrap whatever hook is installed with [`absorb`], once per process. The
-/// window's own hook (`logging.rs`) asks [`absorb`] too, so either order of
-/// installation files nothing for a fenced panic.
 fn ensure_hook() {
     static HOOK: Once = Once::new();
     HOOK.call_once(|| {
@@ -85,7 +80,7 @@ pub(crate) fn guarded<T>(read: impl FnOnce() -> T) -> Result<T, ReaderPanic> {
 }
 
 /// [`guarded`] for a caller with no answer of its own to degrade to: the value, or — on a panic,
-/// warned once per `session` per location ([`warn_once`], `what` naming the caller) — `None`.
+/// warned once per `session` per location ([`warn_once`], `what` naming the caller).
 pub(crate) fn read_or_none<T>(
     session: impl std::fmt::Display,
     what: &str,
@@ -101,12 +96,8 @@ pub(crate) fn read_or_none<T>(
     }
 }
 
-/// How many (session, location) pairs are remembered; past it, one last
-/// warn says so and nothing more is logged (a bounded log, whatever the
-/// screens do).
 const WARN_CAP: usize = 256;
 
-/// The (session, location) pairs already warned about.
 static WARNED: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
 
 /// Log ONE warn for `p` per `session` per panic location.
@@ -180,9 +171,6 @@ mod tests {
         lines.iter().map(|s| s.to_string()).collect()
     }
 
-    /// A panic inside the fence is caught with its location and message; the
-    /// value passes through untouched otherwise; the depth is restored after
-    /// either, so a later panic outside the fence is not absorbed.
     #[test]
     fn a_fenced_panic_is_caught_with_its_location_and_the_depth_unwinds() {
         assert_eq!(guarded(|| 7), Ok(7));
@@ -201,7 +189,6 @@ mod tests {
         assert_eq!(DEPTH.with(Cell::get), 0);
     }
 
-    /// `read_or_none` passes a value through and turns a panic into `None`.
     #[test]
     fn read_or_none_degrades_a_panic_to_none() {
         let screen = rows(&["x"]);
@@ -213,9 +200,6 @@ mod tests {
         assert_eq!(DEPTH.with(Cell::get), 0);
     }
 
-    /// One warn per session per location: the same panic again on the same
-    /// session is not logged, the same panic on another session is, and a
-    /// different location on the first session is.
     #[test]
     fn one_warn_per_session_per_location() {
         let screen = rows(&["", "─────", " Bash command", " ❯ 1. Yes", "   2. No"]);
@@ -251,7 +235,6 @@ mod tests {
         ));
     }
 
-    /// The logged shape carries each row's class and none of its text.
     #[test]
     fn the_shape_names_classes_not_text() {
         let screen = rows(&[

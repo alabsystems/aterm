@@ -680,7 +680,6 @@ impl Program {
         matches!(self.editor, Editor::Zle | Editor::Autosuggest)
     }
 
-    /// Emits `text` followed by a fresh prompt, any popped buffer-stack line, and optional right prompt.
     fn prompt_after(&mut self, text: &str) {
         let (a, b) = self.prompt_marks();
         let prompt = self.prompt;
@@ -709,7 +708,6 @@ impl Program {
         }
     }
 
-    /// Pushes the current line onto the buffer stack and clears the prompt line.
     fn push_line(&mut self) {
         let prompt = self.prompt;
         if prompt.chars().count() + self.col_span(&self.line) >= self.cols {
@@ -722,7 +720,6 @@ impl Program {
         self.rprompt = None;
     }
 
-    /// Erases the right prompt before an insert that shifts the row or reaches it.
     fn hide_rprompt_for(&mut self, c: char) {
         let Some(lo) = self.rprompt else {
             return;
@@ -785,7 +782,6 @@ impl Program {
         }
     }
 
-    /// Inserts `c` at the cursor according to the active [`Editor`] mode.
     fn insert(&mut self, c: char, echo_of: Option<KeyId>, choice: u32) {
         if width(c, self.wide) > 0 {
             self.hide_rprompt_for(c);
@@ -861,7 +857,6 @@ impl Program {
         }
     }
 
-    /// Optionally emits an italic dim autosuggestion after an appended echo.
     fn suggest_after(&mut self, choice: u32) {
         if choice % 8 != 3 || self.noecho || self.alt {
             return;
@@ -874,7 +869,6 @@ impl Program {
         }
     }
 
-    /// Appends `c` at the end of the buffer under [`Editor::Autosuggest`].
     fn append_along_suggestion(&mut self, c: char, kind: SegKind, typed: bool, choice: u32) {
         let continues = self.suggestion.first() == Some(&c) && self.suggestion_at == self.col;
         self.put(kind, c);
@@ -904,7 +898,6 @@ impl Program {
         self.suggestion_at = self.col;
     }
 
-    /// Deterministically refetches an autosuggestion after a mid-buffer edit.
     fn refetch_after_edit(&mut self, end: usize) {
         if self.editor != Editor::Autosuggest || self.line.len() % 3 != 2 {
             return;
@@ -987,7 +980,6 @@ impl Program {
         self.reply(back);
     }
 
-    /// Erases `n` characters before the cursor and redraws the shifted tail.
     fn erase_back(&mut self, n: usize) {
         let n = n.min(self.cur);
         if n == 0 {
@@ -1122,7 +1114,6 @@ impl Program {
         self.refetch_after_edit(self.col + rest);
     }
 
-    /// Executes a learned edit key according to the active [`Keymap`] and chord encoding.
     fn learned_key(&mut self, key: EditKey) {
         if self.reading_chord != ChordForm::Byte {
             self.reply("\x07");
@@ -1161,7 +1152,6 @@ impl Program {
         }
     }
 
-    /// Recalls the previous history line on Up arrow.
     fn recall(&mut self) {
         let recalled: Vec<char> = match &self.history {
             None => "ls -la".chars().collect(),
@@ -1193,7 +1183,6 @@ impl Program {
         self.rprompt = None;
     }
 
-    /// Completes the word before the cursor on Tab.
     fn complete(&mut self) {
         if self.completions.is_empty() {
             for c in "ion ".chars() {
@@ -1222,7 +1211,6 @@ impl Program {
         }
     }
 
-    /// Erases from the cursor to the end of the line (`Ctrl-K`).
     fn kill_to_end(&mut self) {
         let tail: Vec<char> = self.line.drain(self.cur..).collect();
         if tail.is_empty() {
@@ -1243,7 +1231,6 @@ impl Program {
         self.rprompt = None;
     }
 
-    /// Echoes `chars` under cooked tty rules (`ECHOCTL` and tab stops).
     fn tty_echo(&mut self, chars: &[char], kind: SegKind) {
         for &c in chars {
             let (shown, cells) = if c == '\t' {
@@ -1271,7 +1258,6 @@ impl Program {
         }
     }
 
-    /// Erases up to `n` characters from the end of the cooked tty line.
     fn tty_erase(&mut self, n: usize) {
         for _ in 0..n {
             let Some(c) = self.line.pop() else {
@@ -2380,7 +2366,6 @@ impl Sim {
         }
     }
 
-    /// Returns the buffer start cell and prompt ID reported to the predictor.
     fn host_input_start(&mut self) -> Option<InputStart> {
         let term = &self.term;
         let kept = |prompt: u64| {
@@ -2477,7 +2462,6 @@ impl Sim {
         }
     }
 
-    /// Synchronizes `self.mirror` with `self.predictor.pending()`.
     fn sync(&mut self, armed: Option<KeyId>, popped_back: bool) -> Result<(), Violation> {
         let pending: Vec<(u16, u16, char)> = self
             .predictor
@@ -2736,7 +2720,6 @@ impl Sim {
         self.observe_engine();
     }
 
-    /// Delivers up to `n` bytes of pending program output and checks echo landings.
     fn deliver(&mut self, mut n: usize) -> Result<(), Violation> {
         while n > 0 {
             let Some(seg) = self.program.pipe.front().cloned() else {
@@ -2818,7 +2801,6 @@ impl Sim {
         Ok(())
     }
 
-    /// Returns whether an earlier key's output arrived past its glitch-window deadline.
     fn late_predecessor(&self, id: KeyId) -> bool {
         let before = self.keys.get(..id).unwrap_or_default();
         let Some(typed) = self.keys.get(id).map(|log| log.typed_at) else {
@@ -2846,7 +2828,6 @@ impl Sim {
         })
     }
 
-    /// Checks frame fidelity once all output caused by key `k` has landed.
     fn settled(&mut self, k: KeyId) -> Result<(), Violation> {
         if !self.checks || self.cfg.mode != PredictMode::Adaptive {
             return Ok(());
@@ -2932,7 +2913,6 @@ impl Sim {
         Ok(())
     }
 
-    /// Checks attribution: every credited guess must have had its own output begin.
     fn attributed(&mut self, credited: &[u64], window: Duration) -> Result<(), Violation> {
         if !self.checks {
             return Ok(());
@@ -2975,7 +2955,6 @@ impl Sim {
         Ok(())
     }
 
-    /// Returns whether an earlier key's output is still in flight past `window`.
     fn overdue_predecessor(&self, k: KeyId, window: Duration) -> bool {
         let window = ECHO_DEADLINE.max(window);
         let before = self.keys.get(..k).unwrap_or_default();
@@ -3011,7 +2990,6 @@ impl Sim {
         })
     }
 
-    /// Checks single-cell fidelity when an echoed glyph lands.
     fn landed(&mut self) -> Result<(), Violation> {
         let Some((id, row, col, space, unprompted)) = self.landing.take() else {
             return Ok(());
@@ -3044,7 +3022,6 @@ impl Sim {
         Ok(())
     }
 
-    /// Reconciles against the authoritative screen, overlays guesses, and checks all clauses.
     fn frame(&mut self) -> Result<(), Violation> {
         self.stats.frames += 1;
         let rows = usize::from(self.term.rows());
@@ -3307,7 +3284,6 @@ impl Sim {
         checked
     }
 
-    /// Checks provenance, secrecy, timeliness, locality, atomicity, and cursor locality for a chain.
     fn check_chain(
         &mut self,
         ids: &[KeyId],
@@ -3381,7 +3357,6 @@ impl Sim {
         Ok(())
     }
 
-    /// Verifies that the displayed state chain matches an independent fold over [`OracleBase`].
     fn oracle_check(
         &mut self,
         ids: &[KeyId],
@@ -3719,7 +3694,6 @@ impl Sim {
         }
     }
 
-    /// Verifies that `d` differs from `self.scratch` only at `shown` cells and never splits a wide glyph.
     fn locality_on_glass(
         &self,
         shown: &[(u16, u16, char)],
@@ -3925,7 +3899,6 @@ impl Sim {
         }
     }
 
-    /// Drains all queued keys and output, advances past [`SETTLE`], and checks eventual convergence.
     fn settle(&mut self) -> Result<(), Violation> {
         for _ in 0..64 {
             if self.program.inbox.is_empty() && self.program.pipe.is_empty() {

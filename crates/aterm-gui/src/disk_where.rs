@@ -15,11 +15,9 @@ use aterm_vitals::model::Hog;
 pub(crate) const EVERY: Duration = Duration::from_secs(3600);
 /// Total wall-clock budget for discovering and sizing build directories.
 pub(crate) const BUDGET: Duration = Duration::from_secs(20);
-/// What finding may spend of it: the rest is the sizing's.
 const FIND_BUDGET: Duration = Duration::from_secs(10);
 /// Maximum number of largest build-directory rows retained.
 pub(crate) const ROWS: usize = 8;
-/// Build directories sharing a folder under `$HOME` that print as one row.
 const GROUP_AT: usize = 3;
 /// Survey worker thread name.
 pub(crate) const THREAD: &str = "aterm-disk-where";
@@ -57,9 +55,6 @@ impl Where {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Claim a survey at `now` (`wall_ms` on the wall clock, where read):
-    /// true, and running from now, when none runs and none started within
-    /// [`EVERY`] of `now` on either clock.
     fn claim(&self, now: Instant, wall_ms: Option<i64>) -> bool {
         let mut s = self.lock();
         let every_ms = EVERY.as_millis() as i64;
@@ -84,8 +79,6 @@ impl Where {
     }
 }
 
-/// A running survey's end, however its thread ends: one that panics frees
-/// the slot too, and the last rows stay.
 struct Running {
     slot: Arc<Where>,
     found: Option<Found>,
@@ -125,8 +118,6 @@ pub(crate) fn start(slot: &Arc<Where>, ask: Ask, now: Instant, wall_ms: Option<i
     .is_some()
 }
 
-/// [`start`] with the survey `run` stands for: the thread's handle where one
-/// started.
 fn start_with(
     slot: &Arc<Where>,
     (now, wall_ms): (Instant, Option<i64>),
@@ -152,9 +143,6 @@ fn start_with(
     }
 }
 
-/// One survey of `ask`, on the survey's thread, beating nothing: the roots
-/// read now, the build directories found within [`FIND_BUDGET`] and sized
-/// until [`BUDGET`] is spent.
 fn survey(ask: &Ask) -> Found {
     aterm_agent::harness::disk::beat::quietly(|| {
         let deadline = Instant::now() + BUDGET;
@@ -221,10 +209,6 @@ fn survey(ask: &Ask) -> Found {
     })
 }
 
-/// Where the survey looks under `home` (canonical): its checkouts, the
-/// working directories `cwds` and the build directories `targets`, each only
-/// where its spelling places it ([`placed`]), on `home`'s device, never
-/// entering a mount point of `table`.
 fn roots(
     home: &Path,
     cwds: Vec<PathBuf>,
@@ -248,11 +232,6 @@ fn roots(
     })
 }
 
-/// Whether the survey may look at `path`, by its spelling alone (nothing is
-/// looked at, not even to resolve it): absolute, outside every place never
-/// looked into ([`checkout::never_looked_at`]: `home`'s privacy-guarded
-/// folders, where removable volumes mount), and on the mount `home` is on in
-/// a complete `table`, one on a local device and not automounted.
 fn placed(path: &Path, home: &Path, table: &Table) -> bool {
     use aterm_sysprobe::volumes::mount_of;
     let local =
@@ -265,11 +244,6 @@ fn placed(path: &Path, home: &Path, table: &Table) -> bool {
         })
 }
 
-/// The rows of the build directories `found` (canonical paths) under `home`:
-/// each one not inside another sized by `size` in turn until `spent` says the
-/// budget is gone, three or more that share a folder under `home` (the folder
-/// holding each one's checkout) as one row, largest first, at most [`ROWS`];
-/// and whether the budget ran out before every one was sized in full.
 fn rows(
     found: &[discover::Found],
     home: &Path,
@@ -331,7 +305,6 @@ fn rows(
     (out, spent())
 }
 
-/// What frees a build directory found by `origin`, in words.
 const fn remedy(origin: &Origin) -> &'static str {
     match origin {
         Origin::Bootstrap { slim: true, .. } => "x.py bootstrap: scripts/slim_build.py",
@@ -345,10 +318,7 @@ const fn remedy(origin: &Origin) -> &'static str {
     }
 }
 
-/// Format `path` for display: `~/…` when under `home`, its names joined by
-/// `/` on every platform (Windows' walk spells them with `\`), else the full
-/// path, never with the verbatim `\\?\` prefix the survey's canonical paths
-/// carry on Windows.
+/// Format `path` for display (`~/…` when under `home`, else full path).
 pub(crate) fn shown(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
         Ok(rel) if !rel.as_os_str().is_empty() => {
@@ -366,8 +336,6 @@ pub(crate) fn shown(path: &Path, home: &Path) -> String {
 mod tests {
     use super::*;
 
-    /// A build directory cargo would lay: its signed tag and `bytes` of
-    /// output in `deps/`.
     fn build_dir(dir: &Path, bytes: usize) {
         std::fs::create_dir_all(dir.join("deps")).expect("deps");
         std::fs::write(
@@ -378,8 +346,6 @@ mod tests {
         std::fs::write(dir.join("deps").join("out.rlib"), vec![7u8; bytes]).expect("output");
     }
 
-    /// Every path under `dir` and its length: what a survey must leave as it
-    /// found it.
     fn tree(dir: &Path) -> Vec<(PathBuf, u64)> {
         let mut out = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
@@ -405,10 +371,6 @@ mod tests {
         }
     }
 
-    /// T-G15: at most one survey an hour on either clock, and never while
-    /// one runs; each runs on its own thread, never the caller's (the loop)
-    /// or the vitals probe's; and a survey that ends, or panics, frees the
-    /// slot.
     #[test]
     fn a_survey_runs_on_its_own_thread_at_most_hourly() {
         let slot = Arc::new(Where::default());
@@ -457,8 +419,6 @@ mod tests {
         handle.join().expect("the survey ends");
     }
 
-    /// A git worktree of the repository at `repo`, named `name`, at `wt`: its
-    /// `.git` file and the repository's `gitdir` naming it.
     fn worktree(repo: &Path, name: &str, wt: &Path) {
         let record = repo.join(".git").join("worktrees").join(name);
         std::fs::create_dir_all(&record).expect("worktree record");
@@ -471,11 +431,6 @@ mod tests {
         .expect("gitdir");
     }
 
-    /// T-G15: a survey of a real tree finds and sizes its build directories,
-    /// groups three under one folder into a row, finds a checkout's worktree
-    /// outside `$HOME`, never looks into `$HOME`'s guarded folders (not even
-    /// through a tab working there, or a worktree a checkout's gitdir puts
-    /// there), and removes nothing.
     #[test]
     fn a_survey_reads_only_and_never_enters_guarded_folders() {
         let dir = aterm_tempfile::tempdir().expect("scratch home");
@@ -536,11 +491,6 @@ mod tests {
         assert_eq!(tree(&root), before, "the survey removed or changed nothing");
     }
 
-    /// T-G15: a working or build directory is a root only where its spelling
-    /// alone places it on `$HOME`'s own local volume, outside the places never
-    /// looked into; nothing is placed by an incomplete mount table, or when
-    /// `$HOME` itself is on a network volume. The table is a Unix one
-    /// (Windows places paths by drive and volume).
     #[test]
     #[cfg(unix)]
     fn roots_are_only_on_homes_own_local_volume() {
@@ -613,10 +563,6 @@ mod tests {
         }
     }
 
-    /// T-G15: the sizing stops once its budget is spent and keeps what it
-    /// sized; a size its walk cut short stays a floor ("≥"); a directory
-    /// inside another is sized with it, never twice; and only the largest
-    /// eight rows are kept, largest first.
     #[test]
     fn sizing_stops_at_its_budget_and_keeps_partial_sizes() {
         let home = Path::new("/h");

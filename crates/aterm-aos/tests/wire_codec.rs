@@ -124,8 +124,79 @@ fn an_artifact_kind_byte_no_kind_uses_is_a_bad_tag() {
     for b in 0..=u8::MAX {
         let kind = ArtifactKind::from_byte(b);
         assert_eq!(kind.map(ArtifactKind::byte), kind.map(|_| b));
-        assert_eq!(kind.is_some(), (1..=5).contains(&b), "byte {b}");
+        assert_eq!(kind.is_some(), (1..=6).contains(&b), "byte {b}");
     }
+}
+
+#[test]
+fn a_policy_artifact_decodes_as_an_artifact_and_fills_no_identity_slot() {
+    let policy = ArtifactId::new(ArtifactKind::Policy, "toy.acceptance", 1, b"rules");
+    assert_eq!(ArtifactKind::Policy.byte(), 6);
+    assert_eq!(ArtifactKind::from_byte(6), Some(ArtifactKind::Policy));
+    let mut e = Enc::new();
+    e.artifact(&policy);
+    let bytes = e.finish();
+    let mut d = Dec::new(&bytes);
+    assert_eq!(d.artifact("policy"), Ok(policy.clone()));
+    assert_eq!(d.finish(), Ok(()));
+
+    let good = identity(Variant::Good);
+    let slots: [(&str, TaskIdentity); 5] = [
+        (
+            "identity.task",
+            TaskIdentity {
+                task: policy.clone(),
+                ..good.clone()
+            },
+        ),
+        (
+            "identity.code",
+            TaskIdentity {
+                code: policy.clone(),
+                ..good.clone()
+            },
+        ),
+        (
+            "identity.contract",
+            TaskIdentity {
+                contract: policy.clone(),
+                ..good.clone()
+            },
+        ),
+        (
+            "identity.schema",
+            TaskIdentity {
+                schema: policy.clone(),
+                ..good.clone()
+            },
+        ),
+        (
+            "identity.profile",
+            TaskIdentity {
+                profile: policy.clone(),
+                ..good.clone()
+            },
+        ),
+    ];
+    for (slot, id) in &slots {
+        let mut e = Enc::new();
+        e.identity(id);
+        let bytes = e.finish();
+        let mut d = Dec::new(&bytes);
+        assert_eq!(
+            d.identity(),
+            Err(WireFault::BadTag {
+                field: slot,
+                tag: ArtifactKind::Policy.byte()
+            }),
+            "{slot}"
+        );
+        assert_eq!(d.position(), 0, "{slot}: a refused identity reads nothing");
+    }
+    let mut e = Enc::new();
+    e.identity(&good);
+    let bytes = e.finish();
+    assert_eq!(Dec::new(&bytes).identity(), Ok(good));
 }
 
 #[test]

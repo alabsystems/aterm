@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE NEGATIVE CONTROLS: defects planted in a copy of the shim, each of which the oracle must
-//! catch, and catch for the planted reason.
+//! Negative controls planted in a copy of the shim for oracle verification.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -209,7 +208,6 @@ impl Edit {
     }
 }
 
-/// `text` with `edits` applied, each anchor checked.
 fn apply(file: &str, text: &str, edits: &[Edit]) -> Result<String, ControlFailure> {
     let mut out = text.to_string();
     for edit in edits {
@@ -236,7 +234,6 @@ fn apply(file: &str, text: &str, edits: &[Edit]) -> Result<String, ControlFailur
     Ok(out)
 }
 
-/// The per-family source the mutations replace in the native cell's module.
 struct Fixture {
     alias: Option<(&'static str, &'static str, Expect)>,
     signature: (&'static str, &'static str),
@@ -294,7 +291,6 @@ const PRIMITIVES: &str = "pub use core::ffi::{\n    c_char, c_double, c_float, c
 const FOREIGN_CFG: &str =
     r#"all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")"#;
 
-/// The primitive block with `c_int` re-exported on every cell but `cfg`'s.
 fn without_c_int_on(cfg: &str) -> String {
     format!(
         "{}\n\n#[cfg(not({cfg}))]\npub use core::ffi::c_int;",
@@ -303,9 +299,6 @@ fn without_c_int_on(cfg: &str) -> String {
 }
 
 const STRLEN_DECL: &str = "    pub fn strlen(cs: *const c_char) -> size_t;";
-
-/// `getpid` still type-checks bound to a symbol libc does not export, so only
-/// the symbol gate can see it.
 const GETPID_DECL: &str = "    pub fn getpid() -> pid_t;";
 const PLANTED_SYMBOL: &str = "getpid$PLANTED";
 
@@ -322,9 +315,6 @@ fn io_failure(what: &str) -> impl Fn(io::Error) -> CouldNotRun + '_ {
     }
 }
 
-/// The sibling-body controls, on the checkout's sources in memory: an edit to
-/// each family's second cell must be reported for that family, whose sections
-/// must compare clean before it.
 fn sibling_controls(sources: &BTreeMap<&'static str, String>, report: &mut ControlsReport) {
     let unplanted = siblings::compare(sources);
     for (os, _, right) in cells::sibling_pairs() {
@@ -362,8 +352,6 @@ fn sibling_controls(sources: &BTreeMap<&'static str, String>, report: &mut Contr
     }
 }
 
-/// Copy what the oracle workspace builds from: its manifests, lockfile and
-/// configs, the two packages, and the shim's sources.
 fn copy_oracle(root: &Path, dest: &Path) -> io::Result<()> {
     let oracle = root.join("libc-oracle");
     let into = dest.join("libc-oracle");
@@ -408,7 +396,6 @@ fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The copy, its workspace, and the native cell's module in it.
 struct Scratch<'t> {
     ws: Workspace<'t>,
     src: std::path::PathBuf,
@@ -416,7 +403,6 @@ struct Scratch<'t> {
 }
 
 impl Scratch<'_> {
-    /// Apply `edits` to `file` (under the shim's `src/`), run `then`, restore.
     fn planted<T>(
         &self,
         file: &str,
@@ -449,8 +435,6 @@ impl Scratch<'_> {
             .and_then(|outcome| expect.judge(&outcome)))
     }
 
-    /// The shim's shape and symbols with `edits` planted, diffed against the
-    /// reference's.
     fn surface(
         &self,
         edits: &[Edit],
@@ -486,14 +470,13 @@ impl Scratch<'_> {
     }
 }
 
-/// The reference over this cell: what a planted shim is judged against.
+/// Reference shape and extern symbols for a cell.
 pub struct Reference {
     pub shape: BTreeSet<ShapeRecord>,
     /// Extern name -> the linker symbol it binds.
     pub symbols: BTreeMap<String, String>,
 }
 
-/// How a planted shim's documentation differs from the reference.
 struct Surface {
     shape: Vec<ShapeDiff>,
     symbols: Vec<SymbolDiff>,
@@ -509,12 +492,10 @@ impl Surface {
     }
 }
 
-/// Whether `diffs` holds `record` on `side`.
 fn has(diffs: &[ShapeDiff], side: Side, record: &ShapeRecord) -> bool {
     diffs.iter().any(|d| d.side == side && &d.record == record)
 }
 
-/// Whether `diffs` holds `si_pid`'s header on `side` with this `is_unsafe`.
 fn si_pid_header(diffs: &[ShapeDiff], side: Side, is_unsafe: bool) -> bool {
     diffs.iter().any(|d| {
         d.side == side
@@ -525,7 +506,6 @@ fn si_pid_header(diffs: &[ShapeDiff], side: Side, is_unsafe: bool) -> bool {
     })
 }
 
-/// A documented control's verdict on one kind of diff.
 fn diff_verdict<D: fmt::Display>(
     diffs: Result<&[D], &ControlFailure>,
     what: &str,

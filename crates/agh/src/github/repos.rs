@@ -61,7 +61,6 @@ impl RepoListKind {
         }
     }
 
-    /// Whether `repo` is of this kind (the client-side filter).
     const fn keeps(self, repo: &RepoObject) -> bool {
         match self {
             RepoListKind::All => true,
@@ -88,16 +87,13 @@ impl<'a> Repos<'a> {
         Repos { how, ..self }
     }
 
-    /// `GET /repos/{o}/{r}`. It memoizes the repository's id.
-    ///
+    /// `GET /repos/{o}/{r}`.
     /// # Errors
-    ///
     /// The call's error.
     pub fn get(&self, slug: &Slug) -> Result<RepoObject> {
         self.read(slug, &self.how)
     }
 
-    /// `GET /repos/{o}/{r}` under `how`, the id memoized.
     fn read(&self, slug: &Slug, how: &How) -> Result<RepoObject> {
         let mut call = how.get(repo_root(slug), RouteTarget::Repo(slug.clone()));
         if how.access != Access::Read {
@@ -113,9 +109,7 @@ impl<'a> Repos<'a> {
     }
 
     /// Reads the repository and the identity's permissions on it under `access`.
-    ///
     /// # Errors
-    ///
     /// The call's error; Forbidden `drafts_unproven` for an unvouched fine-grained writer;
     /// Forbidden `other` when a non-read answer carries no permissions block.
     pub fn permissions(&self, slug: &Slug, access: Access) -> Result<(RepoObject, Permissions)> {
@@ -155,10 +149,8 @@ impl<'a> Repos<'a> {
         Ok((repo, permissions))
     }
 
-    /// Lists an owner's repositories sorted case-insensitively by full name, applying `opts.limit`.
-    ///
+    /// Lists an owner's repositories sorted case-insensitively by full name.
     /// # Errors
-    ///
     /// Usage error for an invalid `owner` before any request, or request failure.
     pub fn list_for_owner(
         &self,
@@ -188,7 +180,6 @@ impl<'a> Repos<'a> {
                 &LinkScope::Owner { id: user.id },
             )?
         } else if let Some(profile) = self.own_login(owner, &target) {
-            // Identity routes are read-only; pin Read to the routed profile.
             let how = self.how.with_access(Access::Read).as_profile(Some(profile));
             let mut first = how
                 .get("/user/repos", RouteTarget::Identity)
@@ -220,7 +211,6 @@ impl<'a> Repos<'a> {
         Ok(listing)
     }
 
-    /// The profile a read of `owner` is routed to, when its bound login is `owner`.
     fn own_login(&self, owner: &str, target: &RouteTarget) -> Option<String> {
         let Decision::Send { profile, .. } = self.gh.decide(&self.how.route(target.clone())) else {
             return None;

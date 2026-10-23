@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The generator behind every generated-input test: xorshift64 (shifts 13, 7, 17) from a fixed
-//! seed, so a failing case reproduces from its seed and case index.
+//! Deterministic `xorshift64` generator for generated-input tests.
 
 /// xorshift64 over a non-zero state.
 #[derive(Clone, Debug)]
@@ -35,7 +34,6 @@ impl XorShift {
     /// A value in `0..n` (modulo bias is immaterial at test sizes).
     ///
     /// # Panics
-    ///
     /// When `n` is zero.
     #[inline]
     pub const fn below(&mut self, n: u64) -> u64 {
@@ -45,7 +43,6 @@ impl XorShift {
     /// An index in `0..n`.
     ///
     /// # Panics
-    ///
     /// When `n` is zero.
     #[inline]
     pub fn index(&mut self, n: usize) -> usize {
@@ -56,7 +53,6 @@ impl XorShift {
     /// A value in `lo..hi`.
     ///
     /// # Panics
-    ///
     /// When `hi <= lo`.
     #[inline]
     pub fn range(&mut self, lo: usize, hi: usize) -> usize {
@@ -66,7 +62,6 @@ impl XorShift {
     /// One element of `from`.
     ///
     /// # Panics
-    ///
     /// When `from` is empty.
     #[inline]
     pub fn pick<'a, T>(&mut self, from: &'a [T]) -> &'a T {

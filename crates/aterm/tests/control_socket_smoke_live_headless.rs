@@ -1,53 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LIVE: THE HEADLESS CONTROL-SOCKET SMOKE — a real `aterm --headless`, one
-//! `cursor` round trip, then a human-shaped typing burst over the control
-//! socket, and one counter off `metrics`, on the suite's own boot (it waits on
-//! the instance's `--ready-fd`, never polls for its socket).
-//!
-//! Two checks, each the only automatic guard of its failure:
-//!
-//! * `cursor` answers `OK <row> <col> <visible:0|1> <style>[ frame=open]`: the preflight every
-//!   `aterm drive` verb sends first, through the `aterm ctl` client, and no other
-//!   test sends it. The shape, not a bare `OK *`, so a verb routed to another
-//!   handler that also answers `OK …` does not pass for it.
-//! * `wake_heals` stays 0 over a burst of which at least half the keys were
-//!   delivered. A heal is a `Wake::Output` whose latch is still armed after a
-//!   user-event drain that began after its post — the lost-wake class, which
-//!   the watchdog turns from a permanent 5 fps into one hiccup per lost wake.
-//!   A burst whose every wake is lost and healed can still clear a window's
-//!   frames floor, so this counter is the one reading that sees the class.
-//!
-//! Every wait is for its event: the instance's own ready word (`--ready-fd`,
-//! `support/headless_boot.rs`), the screen going quiet before the burst (so a
-//! startup-edge repair is never counted as the burst's) and after it (so the
-//! last echo's wake has been judged), each a server-side `await idle` under the
-//! hang detector. The 50 ms between keys is the burst's SHAPE — about twenty
-//! keys a second, a person typing — never a wait.
+//! Headless control-socket smoke test: verifies the `cursor` preflight reply shape and that
+//! `wake_heals` stays `0` across a 20-key/s typing burst.
 
 use std::time::Duration;
 
 use crate::headless_boot::{self, ctl_ok};
 use crate::live_ctl::{AWAIT_MS, Ctl};
 
-/// The burst: 30 keys about 20 a second, a person's light typing, deliberately
-/// not a socket flood.
+/// Burst size (30 keys at 50 ms intervals).
 const BURST_KEYS: usize = 30;
 const BURST_GAP: Duration = Duration::from_millis(50);
 
-/// Keys the burst must deliver ([`is_applied_send`]) before `wake_heals=0`
-/// means anything: each delivered key is one echo and one wake, so a burst
-/// that delivered only a few gave a lost wake only a few chances.
+/// Minimum delivered keys ([`is_applied_send`]) required for `wake_heals=0` to be non-vacuous.
 const ACCEPTED_FLOOR: usize = BURST_KEYS / 2;
 
-/// How long the screen holds still before and after the burst: past the
-/// output watchdog's own expiry (a frame or two plus 100 ms), so the wake of
-/// the last echo has been judged — healed or not — before `metrics` is read.
+/// Quiet window before and after the burst, past the output watchdog expiry.
 const QUIET_MS: u64 = 500;
 
-/// `cursor`'s documented reply (aterm-gui's `control_query::cmd_cursor`), ` frame=open` ending one
-/// read on a DEC 2026 frame still unfinished at its bound.
+/// Whether `reply` matches `cursor`'s `OK <row> <col> <0|1> <style>[ frame=open]` shape.
 fn is_cursor_reply(reply: &str) -> bool {
     let fields: Vec<&str> = reply.split_whitespace().collect();
     matches!(
@@ -57,9 +29,7 @@ fn is_cursor_reply(reply: &str) -> bool {
     )
 }
 
-/// An applied `send` answers `OK`, with the dispatcher adding its sequence
-/// (`OK seq=<n>`). Additive warning fields still describe a write; a skipped
-/// or duplicate answer delivered no new input, so it is not a delivered key.
+/// Whether `reply` is an applied `send` receipt (`OK` or `OK seq=<n>` without `skipped`/`dup=1`).
 fn is_applied_send(reply: &str) -> bool {
     if reply == "OK" {
         return true;
@@ -72,8 +42,7 @@ fn is_applied_send(reply: &str) -> bool {
         && fields.all(|field| field != "skipped" && field != "dup=1")
 }
 
-/// Wait (server-side, the hang detector) for the screen to hold still
-/// [`QUIET_MS`]; `when` names the moment for the failure.
+/// Wait for the screen to hold still for [`QUIET_MS`].
 #[track_caller]
 fn quiet(ctl: &mut Ctl, when: &str) {
     let reply = ctl.ok(&format!("await idle {QUIET_MS} timeout={AWAIT_MS}"));
@@ -97,7 +66,6 @@ fn metric(reply: &str, key: &str) -> Option<u64> {
 fn a_cursor_round_trip_and_a_typing_burst_heal_no_lost_wake() {
     let inst = headless_boot::boot("atsmk", &["--lines", "24", "--columns", "80"]);
 
-    // The `aterm drive` preflight, through the client every verb uses.
     let cursor = ctl_ok(&inst, &["cursor"]);
     assert!(
         is_cursor_reply(cursor.trim()),
@@ -105,8 +73,6 @@ fn a_cursor_round_trip_and_a_typing_burst_heal_no_lost_wake() {
     );
 
     let mut ctl = Ctl::connect(&inst.sock);
-    // The shell's start drawn and the reader lane at its ordinary idle wait,
-    // so a startup-edge repair is not the burst's.
     quiet(&mut ctl, "before the burst");
     ctl.ok("metrics reset");
     let mut accepted = 0usize;
@@ -131,8 +97,7 @@ fn a_cursor_round_trip_and_a_typing_burst_heal_no_lost_wake() {
     );
 }
 
-/// NEGATIVE CONTROL for the cursor shape: a bare `OK`, a reply with a word
-/// where a number goes, and a visibility other than 0 or 1 are not `cursor`'s.
+/// Negative control for [`is_cursor_reply`] and [`metric`].
 #[test]
 fn only_cursors_own_reply_reads_as_one() {
     assert!(is_cursor_reply("OK 3 7 1 block"));
@@ -152,8 +117,7 @@ fn only_cursors_own_reply_reads_as_one() {
     assert_eq!(metric("OK xwake_heals=3", "wake_heals"), None);
 }
 
-/// NEGATIVE CONTROL for the delivered-key count: a skipped or duplicate
-/// answer, a malformed sequence and anything not `OK` deliver nothing.
+/// Negative control for [`is_applied_send`]: skipped, duplicate, or malformed replies do not count.
 #[test]
 fn only_applied_send_receipts_count_as_delivered_keys() {
     for applied in [

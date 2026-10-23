@@ -570,6 +570,46 @@ pub fn delegated_1032(mc: u64, launcher_mc: u64) -> Scene {
     scene
 }
 
+/// The 10:32 moment with a tab 2 (shell pid 1250) and one app server in
+/// coalition 4000 (100 millicores of its own) launching both tabs' delegated
+/// jobs: tab 1's cargo (pid 4010) at 500, tab 2's (pid 4020) at 300.
+#[must_use]
+pub fn shared_launcher_1032() -> Scene {
+    let born = 1_792_517_500_000;
+    let mut scene = spotlight_1032();
+    scene.tabs.push(tab(2, 1250));
+    scene.procs.push(Proc::new(
+        1250,
+        1187,
+        501,
+        1342,
+        USERSPACE_MS + 210_000,
+        "zsh",
+        0,
+    ));
+    scene.busy_mc += 900;
+    scene.coalitions.push(Coal::new(4000, 900));
+    scene
+        .procs
+        .push(Proc::new(4001, 1, 501, 4000, born, "app-server", 100));
+    for (pid, tab, mc) in [(4010, 1, 500), (4020, 2, 300)] {
+        let start = born + i64::from(pid - 4000);
+        scene
+            .procs
+            .push(Proc::new(pid, 4001, 501, 4000, start, "cargo", mc));
+        let key = crate::delegated::ProcessKey {
+            pid,
+            start: u64::try_from(start).unwrap_or(0),
+        };
+        scene.delegated.push(DelegatedJob {
+            root: key,
+            tab: Some(tab),
+            members: vec![key],
+        });
+    }
+    scene
+}
+
 /// The 10:32 moment with tab 1's delegated job detached to launchd inside aterm's coalition.
 #[must_use]
 pub fn delegated_in_aterm_1032(mc: u64) -> Scene {

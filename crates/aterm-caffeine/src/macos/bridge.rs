@@ -12,23 +12,14 @@ use super::awake::{AWAKE_REASON, Awake};
 use crate::paths::Paths;
 use crate::state;
 
-/// The line the bridge prints on its stdout once its activity has begun.
 const HELD: &str = "held";
 
-/// The longest a bridge holds, on the awake clock: the first execs of the new build and of its
-/// copy, each assessed for up to the first-exec hang, and a minute more for launchd and the new
-/// mug's start.
 const MAX: Duration = Duration::from_secs(2 * aterm_uds::deadline::FIRST_EXEC_HANG.as_secs() + 60);
 
-/// How often the bridge looks whether to let go.
 const POLL: Duration = Duration::from_secs(1);
 
-/// How long a restarting mug waits for its bridge's [`HELD`]: the exec of the mug's own copy
-/// (assessed already, as the mug runs from it) and the activity's begin take milliseconds. A
-/// bare build the update replaced may still be assessed then, and misses it ([`start`]).
 const READY_WAIT: Duration = Duration::from_secs(10);
 
-/// The most of [`Paths::bridge_file`] read: a pid is a few digits.
 const PID_CAP: u64 = 32;
 
 /// Starts a bridge process from the current executable and waits until it holds the activity:
@@ -77,9 +68,6 @@ pub(super) fn start() -> bool {
     false
 }
 
-/// Whether a bridge that said `heard` took over: it holds the Mac awake, or it ended with 0
-/// (`ended` waits for its exit) because it found keep-awake saved off (turned off while this
-/// mug was leaving) and so had nothing to hold.
 fn bridged(heard: &Heard, ended: impl FnOnce() -> io::Result<std::process::ExitStatus>) -> bool {
     match heard {
         Heard::Held => true,
@@ -99,8 +87,6 @@ enum Heard {
     Not,
 }
 
-/// What `out`'s first line is within `within`. The line is read on a thread of its own, which
-/// ends with the pipe: at the line, or once the child is killed.
 fn hear(out: impl io::Read + Send + 'static, within: Duration) -> Heard {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -131,8 +117,6 @@ pub(crate) fn run() -> ExitCode {
     }
 }
 
-/// [`run`]'s work for the bridge `me`, the activity begun by `begin`, [`HELD`] said on `out`,
-/// looking again every `poll` for up to `max`.
 fn bridge(
     paths: &Paths,
     me: u32,
@@ -165,16 +149,12 @@ fn bridge(
     Ok(())
 }
 
-/// Whether the bridge `me`, holding for `held` so far, keeps holding: [`Paths::bridge_file`]
-/// names it (`named`; the new mug has not taken over), the saved mode reads `on`, and `held`
-/// is short of `max`.
 fn holds(named: Option<u32>, me: u32, on: bool, held: Duration, max: Duration) -> bool {
     named == Some(me) && on && held < max
 }
 
-/// Whether the saved mode reads on now.
 fn mode_on(paths: &Paths) -> bool {
-    let now = aterm_time::unix_secs().unwrap_or(0);
+    let now = state::clocks().unwrap_or_default();
     state::load(&paths.state_file(), now).is_on(now)
 }
 
@@ -188,14 +168,12 @@ pub(super) fn release(paths: &Paths) {
     }
 }
 
-/// Remove `file` if it still names `me`.
 fn forget(file: &Path, me: u32) {
     if read_pid(file) == Some(me) {
         let _ = std::fs::remove_file(file);
     }
 }
 
-/// The pid `file` names, if it names one.
 fn read_pid(file: &Path) -> Option<u32> {
     let mut text = String::new();
     std::fs::File::open(file)
@@ -206,7 +184,6 @@ fn read_pid(file: &Path) -> Option<u32> {
     text.trim().parse().ok()
 }
 
-/// Write `pid` to `file` whole: a private temporary file beside it, renamed over it.
 fn write_pid(file: &Path, pid: u32) -> io::Result<()> {
     let (tmp, mut out) = aterm_uds::atomic_file::create_temp_beside(file, 0o600)?;
     let written = out
@@ -225,11 +202,8 @@ mod tests {
     use super::*;
     use crate::model::Mode;
 
-    /// The activity name of the test that counts assertions, apart from every other test's in
-    /// this process.
     const REASON: &str = "aterm caffeine bridge test";
 
-    /// What [`bridge`] says, sent on a channel line by line.
     struct Said(mpsc::Sender<String>, Vec<u8>);
 
     impl Write for Said {
@@ -263,7 +237,6 @@ mod tests {
         types
     }
 
-    /// The hang detector for a line [`bridge`] must say.
     const SAYS: Duration = Duration::from_secs(60);
 
     #[test]
@@ -279,8 +252,6 @@ mod tests {
         assert!(MAX > 2 * aterm_uds::deadline::FIRST_EXEC_HANG);
     }
 
-    /// The bridge's whole life: it names itself, holds both idle-sleep assertions while it says
-    /// it does, and once the new mug removes its file, lets go of them at its next look.
     #[test]
     fn a_bridge_holds_the_mac_awake_until_the_new_mug_takes_over() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -314,9 +285,6 @@ mod tests {
         assert!(!paths.bridge_file().exists());
     }
 
-    /// Off saved while no mug runs (`aterm caffeine off` or `quit`) ends a bridge at its next
-    /// look, and so does its bound; either way it forgets itself. The bridge runs on a thread
-    /// of its own, so one that never lets go fails the test at the hang detector.
     #[test]
     fn a_bridge_lets_go_once_the_mode_reads_off_or_at_its_bound() {
         for off in [true, false] {
@@ -384,8 +352,6 @@ mod tests {
         assert!(!paths.bridge_file().exists());
     }
 
-    /// The mug waits for [`HELD`] alone, and tells a bridge that ended without a word (one that
-    /// found keep-awake off) from one that said something else or nothing in time.
     #[test]
     fn the_mug_waits_for_held_alone() {
         assert_eq!(hear(&b"held\n"[..], SAYS), Heard::Held);
@@ -396,8 +362,6 @@ mod tests {
         assert_eq!(hear(&b"\xff\n"[..], SAYS), Heard::Not, "not a line of text");
     }
 
-    /// A bridge took over when it holds, or ended 0 with nothing to hold; one that ended
-    /// otherwise, or said anything else, did not, and is not waited on as an ended one.
     #[test]
     fn a_bridge_takes_over_by_holding_or_by_a_clean_end() {
         use std::os::unix::process::ExitStatusExt as _;

@@ -9,11 +9,8 @@ pub const MASTER_ANCHOR: &str = "PAPER_MASTER_PUBKEYS";
 /// Maximum members in the master rotation window.
 pub const MAX_MASTER_MEMBERS: usize = 2;
 
-/// Base64 characters in an Ed25519 public key (32 bytes, one `=` of padding), checked here so
-/// a wrong length never reaches the file.
 const KEY_B64_LEN: usize = 44;
 
-/// The indent for a freshly opened block, matching `pins.rs`.
 const DEFAULT_INDENT: &str = "    ";
 
 /// The two declaration spellings this writer edits, both legal rustfmt output and both in
@@ -52,8 +49,6 @@ pub struct Anchor {
 }
 
 impl std::fmt::Debug for Anchor {
-    /// The members only: a derived impl would add byte offsets no reader of a panic message
-    /// can use.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Anchor(")?;
         f.write_str(&self.members.join(", "))?;
@@ -101,7 +96,6 @@ pub fn vet_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// What a line inside the bracket block is, when it is something this writer recognises.
 enum Entry {
     /// A blank separator line.
     Blank,
@@ -111,7 +105,6 @@ enum Entry {
     Member(String),
 }
 
-/// Classify one entry line, or `None` for a shape this writer will not edit around.
 fn classify(trimmed: &str) -> Option<Entry> {
     if trimmed.is_empty() {
         return Some(Entry::Blank);
@@ -127,15 +120,11 @@ fn classify(trimmed: &str) -> Option<Entry> {
     Some(Entry::Member(inner.to_string()))
 }
 
-/// The leading whitespace of `text`. `trim_start` returns a suffix, so the length difference
-/// is exactly the leading run and lands on a char boundary. `text.len() - text.trim().len()`
-/// would also count trailing whitespace, cutting into the content or off a char boundary.
 fn leading_ws(text: &str) -> &str {
     let n = text.len() - text.trim_start().len();
     &text[..n]
 }
 
-/// Iterate `src`'s lines as `(text_without_newline, span_including_newline)`.
 fn lines_with_spans(src: &str) -> Vec<(&str, Span)> {
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -158,9 +147,7 @@ fn lines_with_spans(src: &str) -> Vec<(&str, Span)> {
 ///
 /// # Errors
 ///
-/// Absent, declared twice, spelled in a form this writer does not know, unterminated, or
-/// holding a body line that is not a plain quoted literal with its trailing comma, a `//`
-/// comment or blank. None is guessed at.
+/// Absent, duplicate, unrecognised, or unterminated anchor declaration or body line.
 pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
     let lines = lines_with_spans(src);
     let decl_prefix = concat(&["pub const ", name, ":"]);
@@ -274,8 +261,6 @@ pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
     ]))
 }
 
-/// Prints the outcome and members, never the file text: a derived impl would dump all of
-/// `pins.rs` into any panic message that formatted a `Result<Edit, _>`.
 impl std::fmt::Debug for Edit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -439,18 +424,14 @@ pub fn verify_members(src: &str, name: &str, expected: &[String]) -> Result<(), 
 mod tests {
     use super::*;
 
-    /// A fixture constant: the master's two-member ceiling would cramp these shape tests.
     const FIXTURE: &str = "FIXTURE_KEYS";
     const FIXTURE_MAX: usize = 4;
 
-    /// Synthetic 44-character base64 keys, shaped like real anchors so the shape checks pass.
     const K1: &str = "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=";
     const K2: &str = "bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=";
     const NEW: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const NEW2: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
 
-    /// A miniature `pins.rs` with both real shapes: an empty master anchor and a populated,
-    /// commented keyset. Its doc comments are there because preserving them is under test.
     fn fixture() -> String {
         String::from(
             "// Copyright 2026 Andrew Yates\n\
@@ -571,8 +552,6 @@ mod tests {
         );
     }
 
-    /// The doc comment names the constant twice, which is why the locator anchors on a
-    /// column-0 declaration.
     #[test]
     fn the_empty_form_opens_into_a_one_member_list_without_touching_its_doc() {
         let src = fixture();
@@ -605,8 +584,6 @@ mod tests {
         assert!(text.ends_with("];"), "{text:?}");
     }
 
-    /// An indent measured as `text.len() - text.trim().len()` from the start of the line
-    /// would count trailing whitespace and slice into the line's content.
     #[test]
     fn trailing_whitespace_on_a_neighbouring_line_does_not_poison_the_indent() {
         let src = fixture()
@@ -644,8 +621,6 @@ mod tests {
         assert_eq!(read_anchor(&text, FIXTURE).unwrap().members, members);
     }
 
-    /// A miscomputed indent offset inside a UTF-8 character would panic, and `pins.rs`
-    /// comments are full of em-dashes.
     #[test]
     fn a_multibyte_comment_with_trailing_whitespace_does_not_panic() {
         let src = "pub const FIXTURE_KEYS: &[&str] = &[\n\
@@ -666,8 +641,6 @@ mod tests {
         assert_eq!(read_anchor(&text, FIXTURE).unwrap().members.len(), 2);
     }
 
-    /// A trust anchor's diff is read by a human deciding whether to arm a fleet; mixed line
-    /// endings are noise there.
     #[test]
     fn a_crlf_file_keeps_its_line_endings() {
         let src = "pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];\r\n\
@@ -792,7 +765,6 @@ mod tests {
         assert!(append_member(&src, FIXTURE, "", &[], 4).is_err());
     }
 
-    /// The writer enforces the pins tests' ceiling, so it never produces a file they reject.
     #[test]
     fn the_keyset_ceiling_is_enforced_by_the_writer() {
         let src = fixture();
@@ -806,7 +778,6 @@ mod tests {
         assert!(err.contains("rotation window"), "{err}");
     }
 
-    /// Passes on the intended text, fails where the value is absent, altered or reordered.
     #[test]
     fn verification_catches_a_write_that_did_not_land() {
         let src = fixture();
@@ -836,8 +807,6 @@ mod tests {
         assert!(append_member(&src, FIXTURE, NEW, &["two\nlines"], FIXTURE_MAX).is_err());
     }
 
-    /// The real `pins.rs` reads back as what the compiler compiled in; if it changes shape,
-    /// teach the writer the new shape rather than let it guess.
     #[test]
     fn the_shipped_pins_file_is_a_shape_this_writer_understands() {
         let path = concat!(

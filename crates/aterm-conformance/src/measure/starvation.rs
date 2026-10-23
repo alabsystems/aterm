@@ -1,31 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The instrument's account of its own run: was the take evidence?
-//!
-//! A starved driver or a recorder that missed its cadence makes a take that
-//! says nothing about the glass. The account decides that one thing, in one
-//! direction: starvation may take a green away (unproved), never rescue a red.
-//! It reads this process's own scheduling (a fixed-interval timer's lateness,
-//! [`Sampler`]) and the recorder's cadence (the scan's sampling hole against
-//! its nominal interval); neither sees inside the subject, so a clean reading
-//! disowns only driver starvation.
+//! The instrument's account of its own run: whether the take is evidence about paint.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// The lateness floor: about twice the worst lateness a saturated 18-core
-/// machine withheld from a 50 ms sampler (13 ms), and more than one capture
-/// interval, so a trip means the driver lost at least a frame's worth.
+/// Default lateness threshold in microseconds.
 pub const DEFAULT_LATE_THRESHOLD_US: u64 = 25_000;
 /// A take that used 9/10 of its budget was racing its own deadline.
 pub const BUDGET_PRESSURE_NUM: u64 = 9;
 pub const BUDGET_PRESSURE_DEN: u64 = 10;
 
-/// The tier this process family runs in (`qos_class_self`). A `launchctl
-/// submit` job runs at utility, which the subject it launches inherits.
+/// The QoS tier this process family runs in (`qos_class_self`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qos {
     UserInteractive,
@@ -56,8 +45,7 @@ impl Qos {
         })
     }
 
-    /// A tier where every take is starved by construction: the remedy is the
-    /// tier, not another take.
+    /// Whether this tier starves every take by construction.
     #[must_use]
     pub const fn clamped(self) -> bool {
         matches!(self, Self::Utility | Self::Background)
@@ -78,7 +66,6 @@ impl Qos {
 
 #[cfg(target_vendor = "apple")]
 unsafe extern "C" {
-    // `qos_class_t qos_class_self(void)`: reads the calling thread's class.
     safe fn qos_class_self() -> u32;
 }
 
@@ -95,8 +82,7 @@ fn raw_qos() -> Option<u32> {
 /// What the starvation reading of one take is, and why.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Starvation {
-    /// No take was produced: a driver-side reading cannot tell a starved
-    /// subject from a dark one.
+    /// No take was produced.
     NoTake,
     /// The sampler took no ticks.
     NoSamples,
@@ -106,12 +92,11 @@ pub enum Starvation {
         threshold_us: u64,
         qos: Option<Qos>,
     },
-    /// The recorder's capture cadence blew out: the frames scored are not the
-    /// frames asked for.
+    /// The recorder's capture cadence blew out.
     CadenceBlown { hole_us: u64, nominal_us: u64 },
     /// The take used most of its budget.
     BudgetPressure { wall_us: u64, budget_us: u64 },
-    /// The driver kept its cadence. Only driver starvation is disowned.
+    /// The driver kept its cadence.
     KeptCadence {
         late_max_us: u64,
         threshold_us: u64,
@@ -242,8 +227,7 @@ pub struct SchedInputs {
     pub qos: Option<Qos>,
 }
 
-/// Read one take's starvation. Unknown outranks everything: with no samples
-/// the question was not asked.
+/// Classify one take's starvation.
 #[must_use]
 pub const fn classify(i: &SchedInputs) -> Starvation {
     if !i.produced_take {
@@ -279,9 +263,7 @@ pub const fn classify(i: &SchedInputs) -> Starvation {
     }
 }
 
-/// Compose the shape's verdict with the take's standing: a pass the
-/// instrument cannot stand behind is unproved; a fail stays a fail. A function
-/// of one take, so repeating a starved take accumulates nothing.
+/// Compose the shape's verdict with the take's standing.
 #[must_use]
 pub const fn paint_verdict(shape: ShapeVerdict, evidence: Evidence) -> Disposition {
     match (shape, evidence) {
@@ -311,10 +293,7 @@ pub struct SchedReading {
 }
 
 impl SchedReading {
-    /// Book one tick whose deadline fell `deadline` after the origin and which
-    /// woke `woke` after it; `in_window` when the capture window was open at
-    /// either edge of the tick, so a deschedule straddling the open or the
-    /// close counts.
+    /// Book one tick with its `deadline`, `woke` time, and capture-window membership.
     pub fn book(&mut self, deadline: Duration, woke: Duration, in_window: bool) {
         let late = micros(woke.saturating_sub(deadline));
         let at = micros(deadline);
@@ -333,9 +312,7 @@ impl SchedReading {
         }
     }
 
-    /// The reading that decides the standing: the capture window's when it was
-    /// sampled at all (a deschedule outside it cannot change a frame), the
-    /// whole life's otherwise.
+    /// The `(ticks, late_max_us)` that decides the standing (capture window's when sampled).
     #[must_use]
     pub const fn deciding(&self) -> (u64, u64) {
         if self.win_ticks > 0 {
@@ -346,9 +323,7 @@ impl SchedReading {
     }
 }
 
-/// A fixed-interval timer on its own thread, measuring how late each tick
-/// wakes: the time the scheduler withheld from this process. Deadlines run
-/// from a fixed origin, so a late tick is never absorbed into the next one.
+/// A fixed-interval timer on its own thread, measuring how late each tick wakes.
 pub struct Sampler {
     stop: Arc<AtomicBool>,
     window: Arc<AtomicBool>,
@@ -356,8 +331,7 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    /// Start ticking every `tick`. At least one tick is booked however soon
-    /// the sampler is finished.
+    /// Start ticking every `tick`.
     ///
     /// # Panics
     /// The sampler thread could not be started.
@@ -371,8 +345,6 @@ impl Sampler {
             .name("paint-sampler".into())
             .spawn(move || sample(&s, &w, tick, &started))
             .expect("start the scheduling sampler");
-        // The origin is set before this returns, so the sampled span covers
-        // everything the caller does next.
         let _ = ready.recv();
         Self {
             stop,

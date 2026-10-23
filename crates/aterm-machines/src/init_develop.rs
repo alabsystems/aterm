@@ -19,30 +19,20 @@ use std::time::Duration;
 /// The record's id.
 pub const RECORD: &str = "develop.record";
 
-/// The per-checkout ids, each `<id>@<path>`.
 const PER_CHECKOUT: [&str; 3] = [
     "develop.checkout",
     "develop.submodules",
     "develop.workspace-tools",
 ];
 
-/// The families the develop items carry, for `--only`.
 const FAMILIES: [&str; 3] = ["profile", "checkout", "tooling"];
 
-/// The profile file, under the account's home.
 const PROFILE: &str = ".config/aterm/init.toml";
-/// The admission bound init has always read the profile with.
 const PROFILE_MAX: usize = 64 * 1024;
-/// A workspace manifest.
 const MANIFEST_MAX: usize = 1024 * 1024;
-/// The submodule every aterm checkout needs.
 const SUBMODULE: &str = "vendor/astream";
-/// A submodule clone, or the checkout's provision run.
 const LONG_BUDGET: Duration = Duration::from_secs(1800);
-/// Doctor's wait for a checkout's tools `--check`, which prints nothing until it is done: two
-/// minutes, so a cargo that waits on another build's lock on the checkout's build directory, or
-/// builds aterm-verify afresh after a pull, holds doctor's report no longer than that (the run
-/// is stopped, and cargo keeps what it finished for the next).
+/// Doctor's wait for a checkout's tools `--check` before stopping it.
 const DOCTOR_BUDGET: Duration = Duration::from_secs(120);
 
 /// The command that finds the toolset's `targo`.
@@ -51,16 +41,14 @@ pub type Targo = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 /// Who runs a develop item, which decides what its probe may reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reader {
-    /// `aterm init`: a probe asks origin (`git ls-remote`), an apply fetches and fast-forwards,
-    /// and cargo may download what the checkout's lock names.
+    /// `aterm init`: probes ask origin (`git ls-remote`), apply fetches and fast-forwards, and
+    /// cargo may download what the checkout's lock names.
     Init,
-    /// `aterm doctor` (design §5, S9): this Mac alone, never the network (aterm goes online by
-    /// default only for its update check and the package pass, README): the checkout against
-    /// origin as last fetched, cargo `--offline`, and no apply.
+    /// `aterm doctor`: reads this Mac alone against origin as last fetched, runs cargo
+    /// `--offline`, and applies nothing.
     Doctor,
 }
 
-/// Why a develop item doctor reads is never applied, should an engine ask.
 const DOCTOR_CHANGES_NOTHING: &str = "aterm doctor reads the develop items and changes none of \
                                       them: `aterm init --develop` does";
 
@@ -115,7 +103,6 @@ const INVALID: &str = "invalid ~/.config/aterm/init.toml: it must be TOML holdin
                        [github] table (account, owner, token_file, token_key) and a [develop] \
                        table (checkouts = [\"~/<path>\", …])";
 
-/// The profile file as read.
 struct Profile {
     path: PathBuf,
     text: Option<String>,
@@ -1214,15 +1201,10 @@ pub fn layer(sys: &dyn System, ctx: &Ctx, inputs: &Inputs<'_>) -> Composed {
     Composed::of(compose(sys, ctx, inputs))
 }
 
-/// The develop layer as `aterm doctor` reads it for `ctx`'s one user (design §5, S9): on a
-/// develop machine the items of the checkouts `init.toml` records, nothing on a Mac that records
-/// none unless `asked` (an `--only` word named a develop item: its record row), and a profile
-/// that cannot be read is one `develop.record` row saying why. Each item reads this Mac alone:
-/// the record as it is, the checkout against origin as last fetched (no `ls-remote`, no fetch),
-/// the submodule, and the tools' `--check` under `--locked --offline` only where init runs them
-/// ([`checkout::kept_here`]: origin admitted, HEAD on a branch, which may be another than
-/// origin's default, and nothing uncommitted or untracked). None of them applies anything: the
-/// record is what doctor wants, and the other three are `install` (§3.2).
+/// The develop layer as `aterm doctor` reads it for `ctx`'s one user: on a develop machine the
+/// items of the checkouts `init.toml` records, nothing on a Mac that records none unless `asked`,
+/// and a profile that cannot be read is one `develop.record` row saying why. Each item reads this
+/// Mac alone and applies nothing.
 #[must_use]
 pub fn doctor(sys: &dyn System, ctx: &Ctx, asked: bool, targo: Option<Targo>) -> Composed {
     let composed = (|| {
@@ -1238,11 +1220,8 @@ pub fn doctor(sys: &dyn System, ctx: &Ctx, asked: bool, targo: Option<Targo>) ->
     Composed::of(composed)
 }
 
-/// Whether the account whose uid is `uid` and whose home is `home` may have a develop layer for
-/// doctor to read, read before the account's context is built ([`crate::init::Doctor`]): false
-/// only when its `init.toml` is absent or is read with no `[develop]` table, so a Mac that
-/// records none spawns nothing for the layer; a profile that cannot be read is true, so the
-/// layer's composition says why.
+/// Whether the account at `uid` and `home` may have a develop layer for doctor to read: false
+/// only when its `init.toml` is absent or has no `[develop]` table.
 #[must_use]
 pub fn may_record(sys: &dyn System, uid: u32, home: &Path) -> bool {
     let account = User {
@@ -1256,9 +1235,7 @@ pub fn may_record(sys: &dyn System, uid: u32, home: &Path) -> bool {
     read_profile(sys, &account).map_or(true, |profile| profile.table.is_some())
 }
 
-/// The rows of `composed` ([`doctor`]) narrowed to `only` (the record kept whatever it says
-/// when the layer could not be read), each item probed and none applied: a plan, journaling
-/// nothing.
+/// Probes the rows of `composed` ([`doctor`]) narrowed to `only` without applying or journaling.
 ///
 /// # Errors
 /// The composition cannot be ordered ([`aterm_converge::Refusal`]); nothing was read.

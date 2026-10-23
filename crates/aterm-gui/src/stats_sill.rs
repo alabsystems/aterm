@@ -48,7 +48,6 @@ impl Fold {
     }
 }
 
-/// The lanes' rows in sill px: `(y, h)` for Global, aterm and Tab.
 fn lane_rows(s: f32) -> [(f32, f32); 3] {
     let h = (2.0 * s).round().max(2.0);
     let gap = s.round().max(1.0);
@@ -81,7 +80,6 @@ pub(crate) fn sill_paint(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>,
     (prims, hits)
 }
 
-/// The sill's instruments, before any plate.
 fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<Hit>) {
     let inks = input.inks;
     let s = g.scale.max(0.5);
@@ -271,7 +269,6 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
     (p.prims, hits)
 }
 
-/// An empty lane: the groove alone (a scope not measured yet).
 fn groove(p: &mut Painter<'_>, x: f32, y: f32, w: f32, h: f32) {
     let gh = (h / 2.0).round().max(1.0);
     let gy = y + ((h - gh) / 2.0).round();
@@ -280,7 +277,6 @@ fn groove(p: &mut Painter<'_>, x: f32, y: f32, w: f32, h: f32) {
         .push(panel(x, gy, w, gh, (gh / 2.0).floor(), a(track, 0.7)));
 }
 
-/// The ◢ a filling volume shows at the end of its lane.
 fn filling_mark(p: &mut Painter<'_>, x: f32, y: f32, h: f32, ink: aterm_vitals::ink::Rgb) {
     let side = (h + 2.0).round();
     let c = rgba(ink, 0xFF);
@@ -291,7 +287,6 @@ fn filling_mark(p: &mut Painter<'_>, x: f32, y: f32, h: f32, ink: aterm_vitals::
     }
 }
 
-/// The pressure ink when memory pressure is not normal.
 const fn pressure_ink(
     inks: &aterm_vitals::ink::VitalsInks,
     m: &MemView,
@@ -408,7 +403,6 @@ fn memory_lanes(
     }
 }
 
-/// Paints the per-cluster CPU core tiles and the GPU tank.
 fn core_row(
     p: &mut Painter<'_>,
     cpu: &CpuView,
@@ -498,7 +492,6 @@ mod tests {
     use super::*;
     use crate::stats_deck::tests::{input, snapshot};
 
-    /// The owner's window at 2×: a 24 px bottom pad, 2,238 px wide.
     const GEOM: DeckGeom = DeckGeom {
         w: 2238.0,
         h: 24.0,
@@ -515,9 +508,6 @@ mod tests {
         assert_eq!(sill_px(16, 2.0), 16);
     }
 
-    /// On a translucent floor each instrument sits on a plate of the floor
-    /// (α 235), drawn under it, and the floor between instruments stays
-    /// bare; an opaque floor gets no plate, and a plate moves nothing.
     #[test]
     fn a_translucent_floor_puts_a_plate_behind_each_instrument_only() {
         let snap = snapshot();
@@ -538,8 +528,6 @@ mod tests {
         assert_eq!(format!("{:?}", &plated[hits.len()..]), format!("{bare:?}"));
     }
 
-    /// Nothing the sill draws enters a glyph row or the drop border: every
-    /// prim stays inside the pad, the lanes in its top 18 px at 2×.
     #[test]
     fn the_sill_stays_in_the_pad_and_leaves_the_drop_border() {
         let snap = snapshot();
@@ -570,8 +558,6 @@ mod tests {
         assert_eq!(lane_rows(1.0), [(1.0, 2.0), (4.0, 2.0), (7.0, 2.0)]);
     }
 
-    /// The Tab lane lights at two tabs inside the same pad: with one tab it
-    /// is not drawn, and nothing else moves.
     #[test]
     fn the_tab_lane_lights_at_two_tabs_and_moves_nothing_else() {
         let snap = snapshot();
@@ -620,7 +606,6 @@ mod tests {
         assert!(!narrow.contains(&Instrument::Memory) && narrow.contains(&Instrument::Cpu));
     }
 
-    /// One 16 px square a core at 2×, clusters apart: ten squares here.
     #[test]
     fn the_core_row_draws_one_square_a_core() {
         let snap = snapshot();
@@ -632,7 +617,6 @@ mod tests {
         assert!(squares >= 10, "{squares}");
     }
 
-    /// The pinned machine fills the CPU column's end bracket.
     #[test]
     fn a_pinned_machine_fills_the_end_bracket() {
         let mut snap = snapshot();

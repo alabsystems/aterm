@@ -111,9 +111,6 @@ impl HolderRepr {
         *self == Self::default()
     }
 
-    /// Capture `fence` over `anchors`, an anchor below `floor` (the oldest row
-    /// the checkpoint carries) clamped to it, as the restored grid will hold
-    /// it.
     fn capture(fence: &HolderFence, anchors: &AnchorSet, floor: u64) -> Self {
         if fence.is_empty() && anchors.is_empty() && !fence.seed_untrusted {
             return Self::default();
@@ -160,10 +157,6 @@ impl HolderRepr {
         }
     }
 
-    /// The fence and anchor set this describes, or `None` when it is not one
-    /// a fence could have left: a bound broken, a span naming a slot that is
-    /// not a live anchor of its role, a slot two spans share or none holds,
-    /// an open span off the current mark, a token `0` or held twice.
     fn install(&self) -> Option<(HolderFence, AnchorSet)> {
         if self.marks.len() > MAX_HOLDER_MARKS || self.anchors.len() > MAX_ANCHORS {
             return None;
@@ -248,7 +241,6 @@ impl HolderRepr {
     }
 }
 
-/// The most rows a carried seal may name: one per row of the tallest screen.
 const MAX_SEAL_ROWS: usize = aterm_grid::MAX_GRID_ROWS as usize;
 
 impl Terminal {

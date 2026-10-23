@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Whose a group is: the user-private-group rule ([`user_private_group`]) over this
-//! machine's accounts ([`Accounts`]).
-//!
-//! A static executable has no NSS modules to load, so the accounts are read from the files
-//! glibc's `files` source reads, `/etc/passwd` and `/etc/group`, and only when they are the
-//! whole answer: `/etc/nsswitch.conf` names no source for either database but `files` and
-//! `systemd`, and no userdb drop-in gives systemd's source a record of its own. Anything
-//! else (LDAP, SSSD, NIS, a `+` compat line, a line that does not parse) is an enumeration
-//! this reader cannot finish, which admits no group, as the embedded verifier's failed
-//! `getpwent_r` walk admitted none.
+//! User-private-group rule ([`user_private_group`]) over this machine's accounts.
 
 use std::path::Path;
 
@@ -30,11 +21,7 @@ pub struct Group {
     pub members: Vec<Vec<u8>>,
 }
 
-/// Whether group `gid` can hold no account but `uid`: the user-private group Ubuntu's
-/// `useradd` makes (`USERGROUPS_ENAB`), whose `umask 002` leaves this user's directories
-/// group-writable. `account` is uid's passwd entry and `group` the group's, each `None`
-/// when unknown; `primaries` the uids of every passwd entry whose primary group is `gid`.
-/// The rule of crates/aterm-uds/src/shared_write.rs `user_private_group`.
+/// Whether group `gid` can hold no account but `uid`.
 #[must_use]
 pub fn user_private_group(
     uid: u32,
@@ -69,8 +56,6 @@ pub struct Accounts {
     pub groups: Vec<Group>,
 }
 
-/// The sources `nsswitch.conf` lists for `database`, `[...]` actions left out; `None` when
-/// it names none (glibc then reads `files`).
 fn sources<'a>(nsswitch: &'a str, database: &str) -> Option<Vec<&'a str>> {
     nsswitch.lines().find_map(|line| {
         let line = line.split('#').next().unwrap_or_default().trim();
@@ -96,8 +81,7 @@ fn sources<'a>(nsswitch: &'a str, database: &str) -> Option<Vec<&'a str>> {
 }
 
 impl Accounts {
-    /// Whether `nsswitch` (the file's text, `None` when it is absent) leaves `passwd` and
-    /// `group` to the files, and whether it lists systemd's source beside them.
+    /// Whether `nsswitch` leaves `passwd` and `group` to files and lists `systemd` beside them.
     #[must_use]
     pub fn files_answer(nsswitch: Option<&str>) -> Option<bool> {
         let mut systemd = false;
@@ -152,8 +136,7 @@ impl Accounts {
             .collect()
     }
 
-    /// This machine's accounts from `root`'s `etc` and `run` (`/` outside the tests), or
-    /// `None` when the files are not the whole answer.
+    /// This machine's accounts from `root`'s `etc` and `run` (`/` outside the tests).
     #[must_use]
     pub fn read_under(root: &Path) -> Option<Self> {
         let under = |path: &str| root.join(path.trim_start_matches('/'));
@@ -214,9 +197,6 @@ impl Accounts {
     }
 }
 
-/// The fields of each line glibc's `files` source would read: blank and `#` lines left
-/// out; `None` (through the caller's collect) for a NIS compat line, which only the
-/// `compat` source reads.
 fn entries(text: &[u8]) -> impl Iterator<Item = Vec<&[u8]>> {
     text.split(|b| *b == b'\n')
         .map(|line| line.trim_ascii_start())
@@ -230,7 +210,6 @@ fn entries(text: &[u8]) -> impl Iterator<Item = Vec<&[u8]>> {
         })
 }
 
-/// A decimal id.
 fn number(field: &[u8]) -> Option<u32> {
     if field.is_empty() || !field.iter().all(u8::is_ascii_digit) {
         return None;
@@ -238,8 +217,7 @@ fn number(field: &[u8]) -> Option<u32> {
     std::str::from_utf8(field).ok()?.parse().ok()
 }
 
-/// Whether `gid` is `uid`'s private group on this machine: the passwd enumeration admits
-/// it only when this machine's accounts are files this reader can read whole.
+/// Whether `gid` is `uid`'s private group on this machine.
 #[must_use]
 pub fn private_group(uid: u32, gid: u32) -> bool {
     cfg!(target_os = "linux")

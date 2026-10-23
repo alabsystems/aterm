@@ -1,26 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FACTS SEAM IN THE SUPERVISION LOOP (`docs/DESIGN-hung-background-call-2026-10-20.md` R2 and
-//! R3; system awareness §14.4): the session's told episodes, a no-progress fact riding a prompt
-//! the turn-end policy types anyway, and the stuck fact's own line at a break of the agent's
-//! background work (the occupancy design's §2.1 rank 4).
-//!
-//! ONCE PER EPISODE ACROSS BOTH DOORS: one [`FactsState`] for the session, seeded from the
-//! ledger's fact rows at the loop's start (`Session::hold_seed_from`) under every `occupancy`
-//! mode, told only where the act that carries the fact was taken, and forgotten only on a fresh
-//! reading that no longer names the episode ([`FactsState::observe`]).
-//!
-//! THE ROWS: each door books an intent row (`fact-intent@v1`, `kind=no-progress episode=<hex>
-//! door=<break|turn-end>`) before its write and an outcome row of the kind's rule
-//! (`fact-no-progress@v1`, `typed` with the fact as its command, or `skipped why=<word>`) after
-//! it, as the occupancy door books its lines (`occupancy::door`); a restart's seed reads them
-//! back ([`door::seed_rows_in`]).
+//! Supervision-loop facts seam: turn-end riders and stuck-episode break lines.
 
 use std::time::{Duration, Instant};
 
-use super::super::config::{BreakGrant, Occupancy, StuckBreakGrant, SupervisorConfig};
-use super::super::facts::{EpisodeKey, Fact, FactsState};
+use super::super::config::{BreakGrant, StuckBreakGrant, SupervisorConfig};
+use super::super::facts::{EpisodeKey, Fact, FactKind, FactsState};
 use super::super::occupancy::door::{self, AtWrite, FactDoor, StuckVerdict, Told};
 use super::super::occupancy::rules::Books;
 use super::super::occupancy::templates;
@@ -30,8 +16,7 @@ use super::occupancy_loop::ASK_EVERY_MS;
 use super::turn_end_loop::Written;
 use super::*;
 
-/// The session's facts: what it was told, the fact the decided act carries, and the stuck line's
-/// own throttle and last word.
+/// Session facts state, pending turn-end rider, and stuck-line pacing.
 #[derive(Debug, Default)]
 pub(super) struct FactsWatch {
     /// Which episodes the session was told.
@@ -43,9 +28,10 @@ pub(super) struct FactsWatch {
     again: Option<(EpisodeKey, i64)>,
     /// What the stuck line's last `FACT` line said, of which episode: once a change.
     said: Option<(EpisodeKey, StuckSaid)>,
-    /// When (the hold clock's milliseconds) the stuck fact's own line last went, this loop's or
-    /// a predecessor's ([`Session::stuck_lines_seed`]): the pace it keeps where the door types
-    /// nothing ([`Session::stuck_books`]).
+    /// When (the hold clock's milliseconds) a line of aterm's own last went at a break, this
+    /// loop's or a predecessor's ([`Session::stuck_lines_seed`]): the stuck fact's, or the
+    /// door's under `prompt`, and never a line `observe` only would have typed. The pace the
+    /// stuck line keeps ([`Session::stuck_books`], [`Session::break_lined`]).
     pub(super) lined_ms: Option<i64>,
 }
 
@@ -59,11 +45,7 @@ enum StuckSaid {
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// THE FACT THE ACT DECIDED BEFORE THE FINAL PASS MAY CARRY: the session's pending untold one,
-    /// from the host's reading ([`IdleHost::facts`]) folded into what the session was told.
-    /// Asked of the host only where `action` is an act a fact rides
-    /// ([`super::super::policy::turn_end::FACT_RIDES`]) and `[harness] facts` is on, and never on
-    /// a tape from a build without the door.
+    /// Returns the pending untold fact that `action` may carry, if any.
     pub(super) fn fact_for(
         &mut self,
         action: &TurnEndAction,
@@ -87,8 +69,7 @@ impl<C: Ctl> Session<'_, C> {
         self.facts.offered = fact.filter(|f| carries_fact(action, f));
     }
 
-    /// The decision that is about to be carried out: the fact `action` carries, its intent row
-    /// booked before the write. `None` where it carries none.
+    /// Books the intent row for the fact `action` carries before the write.
     pub(super) fn fact_intends(&mut self, action: &TurnEndAction, seq: u64) -> Option<Fact> {
         let fact = self
             .facts
@@ -105,11 +86,7 @@ impl<C: Ctl> Session<'_, C> {
         Some(fact)
     }
 
-    /// THE ACT THAT CARRIED `fact` WAS WRITTEN, or not (`skipped`: why, `not-written`, or
-    /// `not-submitted` where the text stands in the composer unsent): its outcome row, and where
-    /// it was typed the episode told, the person's record of it made as the break's line makes
-    /// one ([`IdleHost::inform`], the same line), and the act's own text kept without it
-    /// ([`super::super::policy::turn_end::TurnEndState::fact_rode`]).
+    /// Books the outcome row for the fact `action` carried and marks it told when typed.
     pub(super) fn fact_rode(
         &mut self,
         fact: &Fact,
@@ -147,19 +124,7 @@ impl<C: Ctl> Session<'_, C> {
         );
     }
 
-    /// THE STUCK FACT AT A BREAK (§2.1's rank 4; `[harness] stuck_break_note`, which ships off):
-    /// at a settled, drawn break of the agent's own background work begun at `at` and standing
-    /// `waited`, where no turn end comes for a fact to ride, the session's untold no-progress fact
-    /// is typed as a line of its own, `[aterm harness] aterm: <fact>.`, through the fenced write
-    /// ([`Self::type_fact`]), once per episode. `line_gone`: this break's one line went already
-    /// (the host's: the upgrade's notice, rank 3). Whether it typed.
-    ///
-    /// With the key off nothing here runs: no host call, no journal line, no row. On, every
-    /// guard the occupancy door's line passes is judged, at the decider from what the loop holds
-    /// and again at the write on its one `status` read and the host's answers
-    /// ([`door::stuck_at_break`]); then the intent row, the write, and the outcome row. Typed, it
-    /// is the door's kind of line ([`super::super::policy::turn_end::TurnEndState::fact_typed`]):
-    /// the agent's taking it answers it, and the next line at a break waits for that.
+    /// Types the session's untold no-progress fact at a settled background break when due.
     pub(super) fn stuck_break(
         &mut self,
         screen: &Screen,
@@ -216,7 +181,7 @@ impl<C: Ctl> Session<'_, C> {
                     Some(&grant),
                     &guards,
                     Self::write_at(host.as_ref()),
-                    &self.stuck_books(cfg),
+                    &self.stuck_books(),
                     clock_ms,
                 ),
             },
@@ -229,8 +194,6 @@ impl<C: Ctl> Session<'_, C> {
         self.stuck_types(screen, &grant, &fact, clock_ms, cfg, host.as_ref(), review)
     }
 
-    /// The stuck line judged at the decider: the guards from what the loop holds, `gone`, and
-    /// the session's pace.
     fn stuck_verdict(
         &self,
         grant: &StuckBreakGrant,
@@ -241,16 +204,10 @@ impl<C: Ctl> Session<'_, C> {
         rows: &[String],
     ) -> StuckVerdict {
         let guards = self.occupancy_guards(now, cfg, rows);
-        door::stuck_at_break(Some(grant), &guards, gone, &self.stuck_books(cfg), clock_ms)
+        door::stuck_at_break(Some(grant), &guards, gone, &self.stuck_books(), clock_ms)
     }
 
-    /// The books the stuck line keeps the session's pace by: the door's where the door really
-    /// types (`occupancy = "prompt"`), else its own lines alone, since under `observe` the
-    /// door's books hold lines that would have gone and never did.
-    fn stuck_books(&self, cfg: &SupervisorConfig) -> Books {
-        if cfg.occupancy == Occupancy::Prompt {
-            return self.hold_books().clone();
-        }
+    fn stuck_books(&self) -> Books {
         let mut own = Books::default();
         if let Some(at_ms) = self.facts.lined_ms {
             own.lined(at_ms);
@@ -258,18 +215,24 @@ impl<C: Ctl> Session<'_, C> {
         own
     }
 
-    /// THE STUCK LINES A LOOP BEFORE THIS ONE TYPED AT A BREAK (`body`, the ledger read once at
-    /// the loop's start at wall `now_ms`, its clock placed at `start_ms`): each still inside the
-    /// session's pace counts toward it, as the door's own lines do through its seed.
+    /// Records that a line of aterm's own went at a break at `at_ms`.
+    pub(super) fn break_lined(&mut self, at_ms: i64) {
+        self.facts.lined_ms = Some(self.facts.lined_ms.map_or(at_ms, |l| l.max(at_ms)));
+    }
+
+    /// Seeds break-line pacing from `body`, the ledger read at loop start.
     pub(super) fn stuck_lines_seed(&mut self, body: &str, start_ms: i64, now_ms: i64) {
-        for row_ms in door::stuck_lines_in(body, self.setup.sid.as_deref()) {
+        use super::super::occupancy::rules::SESSION_PACE_MS;
+        for (row_ms, kind) in door::break_lines_in(body, self.setup.sid.as_deref()) {
             let ago = now_ms.saturating_sub(row_ms);
-            if !(0..super::super::occupancy::rules::SESSION_PACE_MS).contains(&ago) {
+            if !(1 - SESSION_PACE_MS..SESSION_PACE_MS).contains(&ago) {
                 continue;
             }
-            let at_ms = start_ms.saturating_sub(ago);
-            self.door_lined(at_ms);
-            self.facts.lined_ms = Some(self.facts.lined_ms.map_or(at_ms, |l| l.max(at_ms)));
+            let at_ms = start_ms.saturating_sub(ago.max(0));
+            if kind == FactKind::NoProgress {
+                self.door_lined(at_ms);
+            }
+            self.break_lined(at_ms);
         }
     }
 
@@ -317,7 +280,7 @@ impl<C: Ctl> Session<'_, C> {
             self.facts.state.told(fact.key, at_ms);
             self.facts.again = None;
             self.door_lined(clock_ms);
-            self.facts.lined_ms = Some(clock_ms);
+            self.break_lined(clock_ms);
             self.hold_line(seq, Some(cfg), review);
             host.break_taken();
             host.inform(&line);
@@ -344,8 +307,6 @@ impl<C: Ctl> Session<'_, C> {
         Ok(why.is_none())
     }
 
-    /// The stuck line's `FACT` line for a verdict that typed nothing, once a change of what it
-    /// says of its episode: `held:<guard>` or `paced`. A key that is off says nothing.
     fn stuck_said(
         &mut self,
         seq: u64,

@@ -3,8 +3,6 @@
 
 use super::*;
 
-/// The zone rules' two lines of calendar agree with the civil calendar at known dates, and
-/// each inverts the other.
 #[test]
 fn the_calendar_is_civil() {
     assert_eq!(days_from_civil(1970, 1, 1), 0);
@@ -17,13 +15,9 @@ fn the_calendar_is_civil() {
     }
 }
 
-/// 2026-03-08T07:00:00Z: the US spring-forward instant (2:00 EST).
 const US_SPRING_2026: i64 = 1_772_953_200;
-/// 2026-11-01T06:00:00Z: the US fall-back instant (2:00 EDT).
 const US_FALL_2026: i64 = 1_793_512_800;
 
-/// A POSIX `TZ` rule says the offset either side of each change, in both hemispheres, with
-/// a half-hour zone and a quoted name; a string that does not parse says nothing.
 #[test]
 fn a_posix_rule_says_the_offset_either_side_of_each_change() {
     let us = "EST5EDT,M3.2.0,M11.1.0";
@@ -31,14 +25,10 @@ fn a_posix_rule_says_the_offset_either_side_of_each_change() {
     assert_eq!(posix_offset_at(us, US_SPRING_2026), Some(-4 * 3600));
     assert_eq!(posix_offset_at(us, US_FALL_2026 - 1), Some(-4 * 3600));
     assert_eq!(posix_offset_at(us, US_FALL_2026), Some(-5 * 3600));
-    // No rule after the daylight name: tzcode's US default, the same changes.
     assert_eq!(posix_offset_at("EST5EDT", US_SPRING_2026), Some(-4 * 3600));
-    // Sydney: daylight from the first Sunday of October (2:00) to the first Sunday of
-    // April (3:00 daylight). 2026-01-15 and 2026-07-15, noon UTC.
     let sydney = "AEST-10AEDT,M10.1.0,M4.1.0/3";
     assert_eq!(posix_offset_at(sydney, 1_768_478_400), Some(11 * 3600));
     assert_eq!(posix_offset_at(sydney, 1_784_116_800), Some(10 * 3600));
-    // 2026-04-04T16:00:00Z is 3:00 AEDT on 2026-04-05: standard time from then.
     assert_eq!(posix_offset_at(sydney, 1_775_318_400 - 1), Some(11 * 3600));
     assert_eq!(posix_offset_at(sydney, 1_775_318_400), Some(10 * 3600));
     assert_eq!(posix_offset_at("IST-5:30", 0), Some(19_800));
@@ -56,8 +46,6 @@ fn a_posix_rule_says_the_offset_either_side_of_each_change() {
     }
 }
 
-/// A TZif file of `version` with transitions at `times` to the types `kinds` of `utoffs`
-/// (version 2 and later repeat it as the 64-bit block and end with `footer`).
 fn tzif(version: u8, times: &[i64], kinds: &[u8], utoffs: &[i32], footer: &str) -> Vec<u8> {
     let header = |out: &mut Vec<u8>| {
         out.extend_from_slice(b"TZif");
@@ -95,10 +83,6 @@ fn tzif(version: u8, times: &[i64], kinds: &[u8], utoffs: &[i32], footer: &str) 
     out
 }
 
-/// A TZif file says the type of the last transition at or before the instant, type 0 before
-/// the first, and its footer's rule from the last on; version 1 has no footer and keeps the
-/// last type. NEGATIVE CONTROLS: bytes that are no TZif, a transition naming no type and a
-/// file cut short say nothing.
 #[test]
 fn a_tzif_file_says_the_type_in_force_and_its_footer_after() {
     let times = [-1_000, 0, 1_000];
@@ -117,7 +101,6 @@ fn a_tzif_file_says_the_type_in_force_and_its_footer_after() {
         assert_eq!(tzif_offset_at(&file, 1_000), Some(last), "{version}");
         assert_eq!(tzif_offset_at(&file, 1 << 40), Some(last), "{version}");
     }
-    // No transitions: the footer for every instant, or type 0 without one.
     assert_eq!(
         tzif_offset_at(&tzif(b'2', &[], &[], &[0], "EST5"), 5),
         Some(-5 * 3600)
@@ -135,8 +118,6 @@ fn a_tzif_file_says_the_type_in_force_and_its_footer_after() {
     assert_eq!(tzif_offset_at(&whole[..60], 5), None);
 }
 
-/// A name that is no plain zone name never reads a file, and a zone the tree has no file
-/// for says nothing.
 #[test]
 fn only_a_plain_zone_name_reads_a_zone_file() {
     let dir = aterm_tempfile::TempDir::new().expect("scratch");

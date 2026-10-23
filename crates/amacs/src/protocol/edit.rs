@@ -56,8 +56,7 @@ pub const EDIT_USAGE: &str = "edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<
 /// The `await edit` request's usage line.
 pub const AWAIT_EDIT_USAGE: &str = "await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]";
 
-/// `edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]`: open a fresh Editor view of
-/// the file beside the asking session.
+/// Parsed `edit` request (`edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditRequest {
     /// The file, as a `file://` URI ([`super::uri::path_to_file_uri`]).
@@ -66,8 +65,7 @@ pub struct EditRequest {
     pub line: Option<(u32, Option<u32>)>,
     /// Admit a missing file as empty; the first save creates it.
     pub create: bool,
-    /// The program the edit is for (`git`), shown in the view's header row: `[A-Za-z0-9._-]`, at
-    /// most 32 characters.
+    /// Program name shown in the view header (`[A-Za-z0-9._-]{1,32}`).
     pub for_word: Option<String>,
     /// Whether the asker will wait on the ticket (`await edit`).
     pub wait: bool,
@@ -157,8 +155,7 @@ impl EditRequest {
     }
 }
 
-/// `OK edit ticket=<t> view=<v> doc=<d> uri=<canonical-uri>`: the fresh view is installed and the
-/// ticket is open.
+/// `OK edit ticket=<t> view=<v> doc=<d> uri=<canonical-uri>` admission reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditOk {
     pub ticket: Ticket,
@@ -232,8 +229,7 @@ impl EditResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EditOutcome {
     pub result: EditResult,
-    /// A save of the document was acknowledged durable during the edit, and the file holds the text
-    /// the view last showed.
+    /// Whether a durable save occurred and the file holds the view's last text.
     pub saved: bool,
     /// The document's durable checkpoint sequence when the ticket resolved.
     pub seq: u64,
@@ -273,8 +269,7 @@ impl EditOutcome {
 pub enum AwaitKey {
     /// One ticket's outcome.
     Ticket(Ticket),
-    /// The file: done when no view an `edit` opened of it remains (the form a client re-arms with
-    /// after a seamless update replaced its server).
+    /// Canonical file URI, done when no `edit`-opened view of it remains.
     Uri(String),
 }
 
@@ -282,8 +277,7 @@ pub enum AwaitKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AwaitEdit {
     pub key: AwaitKey,
-    /// The wait's bound; the server holds it to the `await` family's (600 s at most, 30 s when
-    /// absent).
+    /// Wait bound in milliseconds (capped at 600 s, defaulting to 30 s).
     pub timeout_ms: Option<u64>,
 }
 
@@ -342,7 +336,6 @@ impl AwaitEdit {
     }
 }
 
-/// `<L>` or `<L>:<C>`, both 1-based.
 fn parse_line(value: &str) -> Result<(u32, Option<u32>), EditError> {
     let bad = || EditError::BadLine(value.to_string());
     let (line, col) = match value.split_once(':') {
@@ -369,7 +362,6 @@ fn format_line(line: u32, col: Option<u32>) -> String {
     }
 }
 
-/// `[A-Za-z0-9._-]{1,32}`: what a client may name the program it edits for.
 fn is_for_word(word: &str) -> bool {
     (1..=32).contains(&word.len()) && word.bytes().all(for_word_byte)
 }
@@ -410,7 +402,6 @@ verify_island! {
     }
 }
 
-/// `value` is one non-empty, whitespace-free wire token.
 fn token(field: &'static str, value: &str) -> Result<(), EditError> {
     if value.is_empty() || value.chars().any(char::is_whitespace) {
         return Err(EditError::Whitespace(field));
@@ -418,7 +409,6 @@ fn token(field: &'static str, value: &str) -> Result<(), EditError> {
     Ok(())
 }
 
-/// A decimal `u64` field, digits only.
 fn number(text: &str, field: &'static str) -> Result<u64, EditError> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
         return Err(EditError::BadField(field, text.to_string()));
@@ -427,7 +417,6 @@ fn number(text: &str, field: &'static str) -> Result<u64, EditError> {
         .map_err(|_| EditError::BadField(field, text.to_string()))
 }
 
-/// The `key=value` words of a reply line after its fixed leading words.
 fn reply_fields<'a>(
     line: &'a str,
     leading: &[&str],
@@ -442,7 +431,6 @@ fn reply_fields<'a>(
     Ok(words.collect())
 }
 
-/// Exactly the keys `keys`, in order, each once: their values.
 fn keyed<'a, const N: usize>(
     fields: &[&'a str],
     keys: [&'static str; N],

@@ -27,7 +27,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// `(decoded length, SHA-256)`, the form a row records.
 fn answer(bytes: &[u8]) -> (usize, String) {
     (bytes.len(), sha256_hex(bytes))
 }
@@ -36,8 +35,6 @@ fn recorded(r: &SweepRow) -> (usize, String) {
     (r.decoded_len, r.sha256.clone())
 }
 
-/// Each row's input regenerates to the recorded answer, so the inputs the
-/// tests below rebuild are the ones the CLI compressed.
 #[test]
 fn every_sweep_input_regenerates_to_its_recorded_answer() {
     for r in sweep() {
@@ -60,8 +57,6 @@ fn the_decoder_decodes_every_sweep_frame_to_its_recorded_answer() {
     }
 }
 
-/// Read a few bytes at a time through `Decoder::new`'s own buffer, every
-/// frame that decodes to under 20 KB gives the same bytes.
 #[test]
 fn the_decoder_reads_every_small_sweep_frame_in_steps() {
     for r in sweep().iter().filter(|r| r.decoded_len < 20_000) {
@@ -79,14 +74,12 @@ fn the_decoder_reads_every_small_sweep_frame_in_steps() {
     }
 }
 
-/// All 147 frames back to back are one stream: every input, in order.
 #[test]
 fn the_whole_sweep_is_one_stream() {
     let want: Vec<u8> = sweep().iter().flat_map(|r| input(&r.input)).collect();
     assert!(ours(SWEEP).expect("one stream") == want);
 }
 
-/// A skippable frame of `payload` under magic `0x184D2A50 + n`.
 fn skippable(n: u8, payload: &[u8]) -> Vec<u8> {
     let mut f = (0x184D_2A50u32 + u32::from(n)).to_le_bytes().to_vec();
     f.extend((payload.len() as u32).to_le_bytes());
@@ -94,10 +87,6 @@ fn skippable(n: u8, payload: &[u8]) -> Vec<u8> {
     f
 }
 
-/// Frames back to back, with skippable frames (empty and not) and empty
-/// zstd frames among them, read as one stream; and the edge streams: only
-/// skippable frames is an empty stream (libzstd 1.5.7 agreed when the lane
-/// ran on it), no bytes at all is an early end.
 #[test]
 fn multi_frame_streams_with_skippable_and_empty_frames() {
     let rows = sweep();
@@ -139,10 +128,6 @@ fn multi_frame_streams_with_skippable_and_empty_frames() {
     );
 }
 
-/// The sweep is not vacuous: its frames hold every block type, every
-/// literals type, every table mode (an RLE table of each kind whose code
-/// carries extra bits among them), both frame layouts, and frames with and
-/// without the checksum and the content size.
 #[test]
 fn the_sweep_reaches_every_block_literals_and_table_mode() {
     let mut c = Census::default();
@@ -163,9 +148,6 @@ fn the_sweep_reaches_every_block_literals_and_table_mode() {
     );
 }
 
-/// Cut anywhere, a frame is an early end: never a panic, never a partial
-/// success. Cuts: the first 64 bytes, 32 spread through the rest, and the
-/// last 16.
 #[test]
 fn every_cut_of_a_sweep_frame_is_an_early_end() {
     support::on_every_core(&sweep(), |r| {
@@ -189,7 +171,6 @@ fn every_cut_of_a_sweep_frame_is_an_early_end() {
     });
 }
 
-/// One frame of the flip lane and libzstd's recorded verdict on each flip.
 struct Flips {
     row: usize,
     checksum: bool,
@@ -202,8 +183,6 @@ struct Flips {
     wrong: Vec<String>,
 }
 
-/// The flip lane's frames, the flips drawn exactly as when recorded, and
-/// the recorded verdicts.
 fn flips() -> Vec<Flips> {
     let rows = sweep();
     let recorded: Vec<Vec<&str>> = include_str!("recorded/flips-libzstd-1.5.7.tsv")
@@ -267,7 +246,6 @@ fn flipped(zst: &[u8], bit: usize) -> Vec<u8> {
     bad
 }
 
-/// A decoder's verdict on a damaged frame, in the recording's terms.
 fn verdict(decoded: &io::Result<Vec<u8>>, input: &[u8]) -> (u8, Option<String>) {
     match decoded {
         Err(_) => (b'E', None),
@@ -276,11 +254,6 @@ fn verdict(decoded: &io::Result<Vec<u8>>, input: &[u8]) -> (u8, Option<String>) 
     }
 }
 
-/// Bit flips across six levels' frames, with and without the checksum:
-/// never a panic, and every flip gets libzstd's recorded verdict. Where
-/// libzstd refused, so does this decoder; where it decoded the input, so
-/// does this one; where it decoded other bytes, this one decodes the same
-/// bytes, or refuses with `InvalidData`.
 #[test]
 fn bit_flips_get_libzstd_s_recorded_verdicts() {
     let mut mismatches = Vec::new();

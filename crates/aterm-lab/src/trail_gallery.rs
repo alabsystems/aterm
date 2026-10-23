@@ -22,7 +22,7 @@ use crate::{Fail, Res};
 /// The verb's own help (`trail-gallery --help`).
 pub const HELP: &str = "\
 usage: targo --unverified lab trail-gallery [--aterm PATH] [--theme dark|light|both] [--scenario NAME[,NAME]]...
-         [--extra 'key = value']... [--columns N] [--lines N] [--font-px N] [--no-clean] <out_dir> [style ...]
+         [--extra 'key = value']... [--columns N] [--lines N] [--font-px N] [--no-clean] [--keep] <out_dir> [style ...]
 
 Photograph cursor trail styles: one fresh private headless aterm per style, theme and scenario (a scratch HOME and XDG
 dirs, a private control socket, a lifeline; ended by its process group, never by name), a frame after every key
@@ -42,6 +42,7 @@ dirs, a private control socket, a lifeline; ended by its process group, never by
                 the style, motion = \"full\", trail_sounds = false, and on light the theme)
   --columns --lines --font-px   the grid (default 72x14 cells of 22 px; settings 110x40 of 16 px)
   --no-clean    skip each frame's `image clean` twin
+  --keep        retain every instance's scratch world, including a roster probe's
 
 Per instance <name> = <style-slug>-<theme>[-<scenario>] (typing has no suffix): <name>.<frame>.png and its
 .clean.png, .cursor.txt and .text.txt; <name>.frames.tsv (frame, ms since the instance came up, @event rows);
@@ -169,6 +170,7 @@ pub struct Args {
     pub lines: Option<u32>,
     pub font_px: Option<u32>,
     pub clean: bool,
+    pub keep: bool,
     pub aterm: Option<String>,
 }
 
@@ -279,6 +281,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     };
     let (columns, lines, font_px) = (dim("--columns")?, dim("--lines")?, dim("--font-px")?);
     let clean = !take_flag(&mut a, "--no-clean");
+    let keep = take_flag(&mut a, "--keep");
     if let Some(flag) = a.iter().find(|x| x.starts_with('-') && x.len() > 1) {
         return Err(usage(format!(
             "unknown option '{flag}' (trail-gallery --help)"
@@ -302,6 +305,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
         lines,
         font_px,
         clean,
+        keep,
         aterm,
     })
 }
@@ -636,7 +640,7 @@ struct Live {
     _world: World,
 }
 
-/// What every `ctl` reply leaves in a sidecar: its stdout, then its stderr.
+/// A human-readable `ctl` diagnostic: its stdout, then its stderr.
 fn reply_text(r: &Reply) -> String {
     format!("{}{}", r.stdout, r.stderr)
 }
@@ -668,7 +672,10 @@ impl Shot<'_> {
     }
 
     fn keep(&self, suffix: &str, r: &Reply) {
-        let _ = std::fs::write(self.path(suffix), reply_text(r));
+        let _ = std::fs::write(self.path(suffix), &r.stdout);
+        if !r.stderr.is_empty() {
+            let _ = std::fs::write(self.path(&format!("{suffix}.stderr")), &r.stderr);
+        }
     }
 
     fn row(&mut self, line: &str) {
@@ -1009,6 +1016,7 @@ struct Gallery {
     /// pid, socket, name of every instance launched.
     launched: Vec<(i32, String, String)>,
     clean: bool,
+    keep: bool,
     instances: u32,
     frames: u32,
     fails: u32,
@@ -1025,7 +1033,10 @@ impl Gallery {
         (columns, lines, font_px): (u32, u32, u32),
         config: &[String],
     ) -> Result<Live, String> {
-        let world = World::new(&instance::config_with(config))?;
+        let mut world = World::new(&instance::config_with(config))?;
+        if self.keep {
+            world.keep();
+        }
         let script = world.dir.join("paint.sh");
         std::fs::write(&script, paint(scenario, theme))
             .map_err(|e| format!("cannot write {}: {e}", script.display()))?;
@@ -1075,7 +1086,7 @@ impl Gallery {
         })
     }
 
-    /// Stop it by its group, keep its log as `<name>.gui.log`, remove its world.
+    /// Stop it by its group and keep its log as `<name>.gui.log`; `--keep` retains its world.
     fn end(&self, mut live: Live, name: &str) {
         live.inst.stop();
         let _ = std::fs::copy(&live.inst.log, self.out.join(format!("{name}.gui.log")));
@@ -1283,6 +1294,7 @@ pub fn cmd_trail_gallery(args: &[String]) -> Res {
         pids: Some(pids),
         launched: Vec::new(),
         clean: a.clean,
+        keep: a.keep,
         instances: 0,
         frames: 0,
         fails: 0,

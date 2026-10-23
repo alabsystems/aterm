@@ -115,8 +115,6 @@ pub fn path_dependants(root: &Path, rel_root: &str) -> Vec<String> {
     out
 }
 
-/// Every `path = "…"` value in a manifest: a key scan rather than a TOML
-/// parse, since only relative directories are wanted.
 fn path_deps(manifest: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (i, _) in manifest.match_indices("path") {
@@ -135,8 +133,6 @@ fn path_deps(manifest: &str) -> Vec<String> {
     out
 }
 
-/// Lexically resolve `.` and `..`. Not `canonicalize`, so classification is
-/// the same whether or not the checkout sits behind a symlink.
 fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {

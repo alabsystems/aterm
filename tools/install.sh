@@ -1045,7 +1045,24 @@ home_account() { # <euid> <sudo_uid> <home_uid> <home_account>
 # for BSD and GNU, where stat's flags differ), through a symlink, since the
 # files land in the folder it names.
 home_owner_uid() {
-	/bin/ls -ndL -- "$HOME" 2>/dev/null | awk '{print $3}' || true
+	ls_entry -ndL -- "$(home_anchor)" 2>/dev/null | awk '{print $3}' || true
+}
+
+# HOME, or when it does not exist yet the nearest folder above it that does
+# (mkdir -p's anchor): the files land under it, so a HOME still to be made in
+# an account's own home is judged as that account's.
+home_anchor() {
+	local h="$HOME"
+	while [[ "$h" == */* && ! -e "$h" ]]; do
+		h="${h%/*}"
+	done
+	echo "${h:-/}"
+}
+
+# `ls` by its fixed path, which PATH cannot shadow, else PATH's where there is
+# none (NixOS, Guix).
+ls_entry() {
+	if [[ -x /bin/ls ]]; then /bin/ls "$@"; else command ls "$@"; fi
 }
 
 # The homes of the accounts whose uid is <uid>, one per line: getpwuid's, and
@@ -1100,17 +1117,18 @@ in_folder() { # <a> <b>
 }
 
 # Whether HOME is in the home of an account here: `ls` prints its owner's name
-# (for a uid no account here has, the bare number `ls -n` prints), and HOME is
-# the own home of an account with that uid, or a folder in it. A uid an image's
-# account happens to share (a CI container's HOME, owned by the host runner's
-# uid) is not one. A named owner with no home found, or a HOME that cannot be
-# entered, counts as one, so the run refuses.
+# (for a uid no account here has, the bare number `ls -n` prints), and HOME
+# (home_anchor's folder while it does not exist yet) is the own home of an
+# account with that uid, or a folder in it. A uid an image's account happens to
+# share (a CI container's HOME, owned by the host runner's uid) is not one. A
+# named owner with no home found, or a HOME that cannot be entered, counts as
+# one, so the run refuses.
 home_owner_named() {
 	local uid name here d found=0
 	uid="$(home_owner_uid)"
-	name="$(/bin/ls -ldL -- "$HOME" 2>/dev/null | awk '{print $3}')" || return 1
+	name="$(ls_entry -ldL -- "$(home_anchor)" 2>/dev/null | awk '{print $3}')" || return 1
 	[[ -n "$name" && "$name" != "$uid" ]] || return 1
-	here="$(cd -P -- "$HOME" 2>/dev/null && pwd)" || return 0
+	here="$(cd -P -- "$(home_anchor)" 2>/dev/null && pwd)" || return 0
 	while IFS= read -r d; do
 		[[ -n "$d" ]] || continue
 		found=1
@@ -1187,8 +1205,9 @@ run_as_home_account() { # <arg>...
 mine() { [[ -O "$1" || -w "$1" ]]; }
 
 # FOREIGN_FOLDERS: the folders aterm writes below HOME (the link and store, the
-# man page, which shell-setup rewrites in place, and the completions, aterm.toml,
-# atpkg's hooks, prefix, state and logs)
+# man page and, on Linux, the icons, which shell-setup rewrites in place, the
+# desktop entry, the completions, aterm.toml, atpkg's hooks, prefix, state and
+# logs)
 # that exist and are not this account's, each the outermost such on its way
 # down from HOME, once, and inside aterm's own trees (where every entry is the
 # account's) each outermost entry another uid owns. An install under sudo
@@ -1206,14 +1225,16 @@ foreign_home_folders() {
 	local -a trees
 	FOREIGN_FOLDERS=()
 	[[ "$(id -u)" != 0 && -O "$HOME" ]] || return 0
+	local -a desktop=()
 	if [[ "$(uname -s)" == Darwin ]]; then
 		trees=("$HOME/Library/Application Support/aterm" "$HOME/Library/Logs/aterm")
 	else
 		trees=("$data/aterm" "$HOME/.local/share/aterm/pkg" "${XDG_STATE_HOME:-$HOME/.local/state}/aterm")
+		desktop=("$data/applications/aterm.desktop" "$data"/icons/hicolor/*/apps/aterm.png)
 	fi
 	trees+=("$STORE_DIR" "$cfg/aterm" "$HOME/.aterm")
 	for p in "$BIN_DIR" "${ATERM_MAN_DIR:-$HOME/.local/share/man}/man1/aterm.1" "$data/zsh/site-functions" \
-		"$data/bash-completion/completions" "$cfg/fish/completions" "${trees[@]}"; do
+		"$data/bash-completion/completions" "$cfg/fish/completions" ${desktop[@]+"${desktop[@]}"} "${trees[@]}"; do
 		home_folder_top "$p" || continue
 		[[ -z "$FOLDER_TOP" ]] || foreign_add "$FOLDER_TOP"
 	done
@@ -1275,9 +1296,25 @@ foreign_home_note() {
 	[[ ${#FOREIGN_FOLDERS[@]} -gt 1 ]] || it=it
 	for f in "${FOREIGN_FOLDERS[@]}"; do
 		list+="${list:+, }$f"
-		args+=" $(printf '%q' "$f")"
+		args+=" $(shell_word "$f")"
 	done
-	echo "install.sh: NOTE: not yours, so aterm cannot change what is in $it: $list (an install under sudo makes such folders root's) — give $it back with: sudo chown -R $(printf '%q' "$(id -un 2>/dev/null || id -u)")$args" >&2
+	echo "install.sh: NOTE: not yours, so aterm cannot change what is in $it: $list (an install under sudo makes such folders root's) — give $it back with: sudo chown -R $(shell_word "$(id -un 2>/dev/null || id -u)")$args" >&2
+}
+
+# <word> spelled so bash, zsh and fish (the shells aterm wires) all read it back
+# as one word: bare when it is plain, else in single quotes, which fish reads as
+# the others do unless the word holds a quote, a backslash or a control
+# character; such a word gets printf %q's spelling, which bash and zsh read.
+shell_word() { # <word>
+	case "$1" in
+	*[!A-Za-z0-9_@%+=:,./-]* | "")
+		case "$1" in
+		*[\'\\]* | *[[:cntrl:]]*) printf '%q' "$1" ;;
+		*) printf "'%s'" "$1" ;;
+		esac
+		;;
+	*) printf '%s' "$1" ;;
+	esac
 }
 
 # The way out for a folder ensure_dirs_writable refused: the NOTE's when one
@@ -1291,6 +1328,25 @@ unwritable_remedy() { # <dir> <setting>
 		fi
 	done
 	echo "set $2 to a writable dir"
+}
+
+# The build's target dir and cargo's home, when an install under sudo left
+# anything in them root's (or any other uid's), fail the build minutes in on a
+# permission error with no way out named: say so before it starts, with the
+# chown that gives them back. Root changes anything; a folder whose parent is
+# not this account's is never named (it is someone else's to give).
+source_build_preflight() {
+	local d stale=""
+	[[ "$(id -u)" != 0 ]] || return 0
+	for d in "$ROOT/target" "${CARGO_HOME:-$HOME/.cargo}"; do
+		[[ -d "$d" && -O "${d%/*}" ]] || continue
+		[[ -n "$(find "$d/" \( -name "*"$'\n'"*" -prune \) -o \( ! -type l ! -user "$(id -u)" -print \) 2>/dev/null |
+			head -n 1)" ]] || continue
+		stale+=" $(shell_word "$d")"
+	done
+	[[ -n "$stale" ]] || return 0
+	echo "install.sh: the source build would fail: not yours, so cargo cannot change what is in$stale (an install under sudo makes such folders root's) — give them back with: sudo chown -R $(shell_word "$(id -un 2>/dev/null || id -u)")$stale" >&2
+	exit 1
 }
 
 # --- the cargo that honours the pin (source-build lane) ----------------------
@@ -2714,6 +2770,11 @@ app_dest_verdict() { # <app-dir>
 	echo "foreign no readable CFBundleIdentifier and no binary that answers as aterm — if it is a damaged aterm install, move it aside (mv '$app' '$app.broken') and re-run"
 }
 
+# Whether <bundle> and everything in it is root's.
+bundle_is_roots() { # <bundle>
+	[[ -d "$1" && -z "$(find "$1" ! -user 0 -print 2>/dev/null | head -n 1)" ]]
+}
+
 # Whether a bin entry is a symlink this installer places: into an aterm.app
 # bundle, or into the store.
 bin_entry_is_ours() { # <path> <store-dir>
@@ -2740,11 +2801,60 @@ bin_aterm_verdict() { # <path> <store-dir>
 		echo ours
 	elif [[ -L "$p" ]]; then
 		echo "foreign symlink points outside an aterm bundle or store ($(readlink "$p" 2>/dev/null || true))"
+	elif [[ -f "$p" && -x "$p" ]] && ! may_run "$p"; then
+		echo "foreign another account can change it, so root does not run it to ask what it is"
 	elif [[ -f "$p" && -x "$p" ]] && first_line_bounded "$p" --version | grep -q '^aterm '; then
 		echo pre-store
 	else
 		echo "foreign not a symlink — a hand-built binary this installer did not place"
 	fi
+}
+
+# Whether this run may run <program>: a run as anyone but root may run any;
+# root only one no other account can change, so the file and every folder on
+# its way from /, as written and through each link it passes, are root's, and
+# none of those folders lets every account write in it unless it is sticky.
+# Over a HOME another account owns (a CI container's, a folder outside its
+# owner's own home), root would otherwise run, as root, what that account left
+# there (~/.local/bin/aterm, ~/Applications/aterm.app).
+may_run() { # <program>
+	[[ "$(id -u)" == 0 ]] || return 0
+	local p="$1" t hops=0
+	[[ "$p" == /* ]] || p="$PWD/$p"
+	while :; do
+		root_folders "${p%/*}" || return 1
+		[[ -L "$p" ]] || break
+		hops=$((hops + 1))
+		[[ "$hops" -le 40 ]] || return 1
+		t="$(readlink "$p")" || return 1
+		[[ "$t" == /* ]] || t="${p%/*}/$t"
+		p="$t"
+	done
+	[[ -f "$p" ]] && root_entry "$p"
+}
+
+# Whether <dir> and each folder above it are root_entry ones, as written and as
+# cd -P resolves it.
+root_folders() { # <dir>
+	local d
+	for d in "${1:-/}" "$(cd -P -- "${1:-/}" 2>/dev/null && pwd)"; do
+		[[ -n "$d" ]] || return 1
+		while :; do
+			root_entry "${d:-/}" || return 1
+			[[ -n "$d" && "$d" != / ]] || break
+			d="${d%/*}"
+		done
+	done
+}
+
+# Whether <path> itself is root's and, unless it is a sticky folder or a link,
+# not one every account can write. A link's mode is nothing (Linux shows every
+# link as lrwxrwxrwx, /bin among them): no account rewrites a link in place,
+# only through its folder, and the walks judge that folder and where it leads.
+root_entry() { # <path>
+	local mode links uid rest
+	read -r mode links uid rest <<<"$(ls_entry -nd -- "$1" 2>/dev/null)"
+	[[ "$uid" == 0 && ( "${mode:0:1}" == l || "${mode:8:1}" != w || "${mode:9:1}" == [tT] ) ]]
 }
 
 # first_line_bounded <exe> [args…] -> the first line a run that finished printed,
@@ -2755,6 +2865,7 @@ bin_aterm_verdict() { # <path> <store-dir>
 # VERIFY_WAIT_SECS. A run cut off answered nothing, whatever it printed first.
 first_line_bounded() {
 	local out s=0
+	may_run "$1" || return 0
 	out="$(mktemp "${TMPDIR:-/tmp}/aterm-probe.XXXXXX")" || return 0
 	bounded "$VERIFY_WAIT_SECS" "$@" >"$out" 2>/dev/null || s=$?
 	[[ "$s" -eq 124 ]] || head -n 1 "$out"
@@ -2796,7 +2907,7 @@ find_bundle_cli() {
 		for b in aterm-cli aterm-ctl atpkg aterm-fleet aterm-drive; do
 			[[ -x "$m/$b" ]] || { ok=0; break; }
 		done
-		if [[ "$ok" -eq 1 ]] && bounded "$VERIFY_WAIT_SECS" "$m/aterm-cli" --version >/dev/null 2>&1; then
+		if [[ "$ok" -eq 1 ]] && may_run "$m/aterm-cli" && bounded "$VERIFY_WAIT_SECS" "$m/aterm-cli" --version >/dev/null 2>&1; then
 			echo "$m/aterm-cli"
 			return 0
 		fi
@@ -3504,7 +3615,11 @@ if [[ "$DO_APP" -eq 1 ]]; then
 				fi
 				SKIP_STATUS=0
 				installed_bundle_verified "$DEST/aterm.app" "$SKIP_TEAM" || SKIP_STATUS=$?
-				if [[ "$SKIP_STATUS" -eq 0 ]]; then
+				if [[ "$SKIP_STATUS" -eq 0 && "$(id -u)" == 0 ]] && ! bundle_is_roots "$DEST/aterm.app"; then
+					# A root run's bundle is root's (install_app): one an earlier
+					# root run left the builder's uid is installed again.
+					echo "install.sh: installed aterm matches the elected version but another account owns files in it — reinstalling it as root's" >&2
+				elif [[ "$SKIP_STATUS" -eq 0 ]]; then
 					APP_ALREADY="${TAG#v}"
 				elif [[ "$SKIP_STATUS" -eq 124 ]]; then
 					APP_SKIP="macOS's code-signing service (trustd) did not answer within $VERIFY_WAIT_SECS s, so the installed aterm was not checked — run install.sh again once it answers (a restart clears a wedged trustd)"
@@ -3832,6 +3947,18 @@ install_app() {
 	# the swap. Same rule for the set-aside path.
 	STAGE="$DEST/aterm.app.installing.$(random_suffix)"
 	ditto "$MNT/aterm.app" "$STAGE"
+	# Under root, ditto keeps the owner the container recorded (the release
+	# builder's, 501:staff), which on this Mac may be any account or none, and
+	# that account could change the app every account and root run: a root
+	# run's bundle is root's, as writable as $DEST and no more (/Applications:
+	# its admin group, as an admin's updater swaps it).
+	if [[ "$(id -u)" == 0 ]]; then
+		local mode links uid gid rest
+		read -r mode links uid gid rest <<<"$(ls_entry -nd -- "$DEST")"
+		chown -R "0:${gid:-0}" "$STAGE"
+		chmod -R go-w "$STAGE"
+		[[ "${mode:5:1}" != w ]] || chmod -R g+w "$STAGE"
+	fi
 	if [[ -e "$DEST/aterm.app" ]]; then
 		OLD="$DEST/.aterm.app.old.$(random_suffix)"
 		mv "$DEST/aterm.app" "$OLD"
@@ -4018,6 +4145,7 @@ install_cli() {
 }
 
 install_cli_from_source() {
+	source_build_preflight
 	echo "install.sh: building aterm from $ROOT at $(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo '(not a git checkout)')"
 	# Pin the target dir (a global CARGO_TARGET_DIR / build.target-dir redirect
 	# would strand the fresh binaries elsewhere) but NEVER a --target triple:
@@ -4232,6 +4360,10 @@ install_toolchain() {
 	fi
 	if [[ -z "$aterm_bin" || ! -x "$aterm_bin" ]]; then
 		echo "install.sh: SKIPPED the ALab toolset: no installed \`aterm\` to drive it" >&2
+		return 0
+	fi
+	if ! may_run "$aterm_bin"; then
+		echo "install.sh: SKIPPED the ALab toolset: another account can change $aterm_bin (or a folder or link on its way), so root does not run it — run the install as that account, or set ATERM_BIN_DIR and ATERM_STORE_DIR to folders root owns" >&2
 		return 0
 	fi
 

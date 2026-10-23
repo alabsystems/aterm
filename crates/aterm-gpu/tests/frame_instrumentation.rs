@@ -171,14 +171,15 @@ fn the_frame_shape_counts_streams_passes_and_bytes() {
     );
 }
 
-/// The ablation seam prices the Unorm light a glow frame pays for, and only it: with the light
-/// dropped the same frame runs one pass and still stages the glow instances; thinned, it keeps
-/// every pass; with the seam off again the passes come back. The shape says what the arm's plan
-/// took, so an arm that ignored the seam reads as the plan it ran.
+/// The ablation seam prices the Unorm light a glow frame pays for on the split, and only it: with
+/// the light dropped the same frame runs one pass and still stages the glow instances; thinned, it
+/// keeps every pass; with the seam off again the passes come back. The shape says what the arm's
+/// plan took, so an arm that ignored the seam reads as the plan it ran.
 #[test]
 fn the_unorm_ablation_saves_the_glow_frames_passes() {
     use aterm_gpu::UnormAblation;
     let mut gpu = crate::common::gpu(18.0, Theme::default());
+    gpu.set_unorm_route(aterm_gpu::UnormRoute::Split);
     let input = glow_scene(&gpu);
     let under = |gpu: &mut aterm_gpu::GpuRenderer, ablation| {
         gpu.set_unorm_ablation(ablation);
@@ -211,4 +212,44 @@ fn the_unorm_ablation_saves_the_glow_frames_passes() {
     assert_eq!(thinned.instances, full.instances);
     assert_eq!(again.passes, full.passes, "the seam turns off cleanly");
     assert_eq!(again.ablation, UnormAblation::Off);
+}
+
+/// On a device whose framebuffer-fetch probe passed, the glow frame's light draws through its
+/// twin inside the one sRGB pass, and the shape says so; the split, chosen by the seam, opens
+/// its passes again for the same draws. Elsewhere the route stays the split whatever the seam
+/// wants.
+#[test]
+fn the_fetch_route_draws_the_glow_frames_light_in_one_pass() {
+    use aterm_gpu::{FetchProbe, UnormRoute};
+    let mut gpu = crate::common::gpu(18.0, Theme::default());
+    let input = glow_scene(&gpu);
+    let under = |gpu: &mut aterm_gpu::GpuRenderer, route| {
+        gpu.set_unorm_route(route);
+        let mut win = aterm_gpu::WindowGpu::new();
+        assert!(gpu.present_virtual(&mut win, &input, false, None, None));
+        gpu.frame_shape()
+    };
+    let fetch = under(&mut gpu, UnormRoute::Fetch);
+    let split = under(&mut gpu, UnormRoute::Split);
+    assert_eq!(split.route, UnormRoute::Split);
+    assert_eq!((split.unorm_draws, split.unorm_instances), (1, 8));
+    assert_eq!(
+        (fetch.unorm_draws, fetch.unorm_instances, fetch.instances),
+        (split.unorm_draws, split.unorm_instances, split.instances),
+        "the route changes where the light draws, not what draws"
+    );
+    let probe = gpu.fetch_probe().expect("the frames above minted the arm");
+    if probe == FetchProbe::Passed {
+        assert_eq!(fetch.route, UnormRoute::Fetch);
+        assert_eq!(fetch.passes, 1, "the light draws inside the one sRGB pass");
+        assert!(
+            split.passes > fetch.passes,
+            "the split pays passes for the same light: {} vs {}",
+            split.passes,
+            fetch.passes
+        );
+    } else {
+        assert_eq!(fetch.route, UnormRoute::Split, "{probe:?} keeps the split");
+        assert_eq!(fetch.passes, split.passes);
+    }
 }

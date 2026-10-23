@@ -519,7 +519,7 @@ fn volume_term(name: &str, op: Op, value: &str) -> Result<VolumeTerm, String> {
     }
 }
 
-/// A decimal number.
+/// A finite decimal number.
 fn number(text: &str) -> Option<(f64, &str)> {
     let end = text
         .bytes()
@@ -529,7 +529,8 @@ fn number(text: &str) -> Option<(f64, &str)> {
     if n.is_empty() || n.starts_with('.') || n.ends_with('.') || n.matches('.').count() > 1 {
         return None;
     }
-    Some((n.parse().ok()?, rest))
+    let n = n.parse::<f64>().ok()?;
+    n.is_finite().then_some((n, rest))
 }
 
 /// A size unit's bytes.
@@ -593,6 +594,9 @@ fn want(metric: &Metric, op: Op, value: &str) -> Result<Want, String> {
                 ),
                 _ => return Err(usage()),
             };
+            if !v.is_finite() {
+                return Err(usage());
+            }
             Ok(Want::Num { op, v, cores })
         }
     }
@@ -689,14 +693,12 @@ fn term(tok: &str) -> Result<Tok, String> {
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b == b'_') =>
             {
+                let label = label.to_ascii_lowercase();
                 let index = label
                     .strip_prefix('l')
                     .and_then(|d| d.parse::<usize>().ok())
                     .filter(|i| *i < 8);
-                Metric::CpuLevel {
-                    index,
-                    label: label.to_ascii_lowercase(),
-                }
+                Metric::CpuLevel { index, label }
             }
             _ => return Err(USAGE.to_owned()),
         },
@@ -1788,6 +1790,7 @@ mod tests {
             "sys cpu<25%",
             "sys cpu<2.5c",
             "sys cpu.l0>50%",
+            "sys cpu.L0>50%",
             "sys cpu.super<=80%",
             "sys aterm<1c and tab<0.5c for=10s",
             "sys wait<0.25",
@@ -1810,6 +1813,7 @@ mod tests {
             assert_eq!(machine(&spelled).canonical(), spelled, "{text}");
         }
         for (a, b) in [
+            ("sys cpu.L0>50%", "sys cpu.l0>50%"),
             ("sys avail>=8GiB", "sys avail>=8589934592B"),
             ("sys cores_idle>=4c", "sys cores_idle>=4"),
             ("sys slots>=1 for=20m", "sys slots>=1 for=1200s"),
@@ -1828,6 +1832,33 @@ mod tests {
             ("sys quiet", "sys quiet cpu<25%"),
         ] {
             assert_ne!(machine(a).canonical(), machine(b).canonical(), "{a} | {b}");
+        }
+    }
+
+    #[test]
+    fn machine_numbers_stay_finite_through_parsing_and_unit_scaling() {
+        let finite = format!("1{}", "0".repeat(300));
+        let too_large = "9".repeat(400);
+        for term in [
+            format!("load>{too_large}"),
+            format!("avail>={finite}TB"),
+            format!("swap<{finite}TiB/s"),
+        ] {
+            assert_eq!(
+                AwaitSys::parse(&format!("sys {term}")),
+                Err(USAGE.to_owned())
+            );
+        }
+
+        for text in [
+            format!("sys load<{finite}"),
+            "sys avail>=1.5TB".to_owned(),
+            "sys swap<1.5MB/s".to_owned(),
+        ] {
+            let wait = machine(&text);
+            let spelled = wait.canonical();
+            assert_eq!(machine(&spelled), wait);
+            assert_eq!(machine(&spelled).canonical(), spelled);
         }
     }
 

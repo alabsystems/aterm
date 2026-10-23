@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The static verifier held to the corpus the embedded one is held to ([`crate::chain`]),
-//! reached as a release reaches it: install.sh's own `linux_verifier_ready` holds the
-//! executable to its SHA-256 (the test seam, `ATERM_INSTALL_VERIFIER`), and its
-//! `linux_release_verify` runs it. The facts the command line does not answer on its own
-//! (the durable policy, the walk, a manifest at another second) are asked of the library
-//! the executable is built from.
+//! Static verifier test harness against the [`crate::chain`] corpus.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -63,8 +58,6 @@ impl Built {
         lib
     }
 
-    /// One answer per command line, each run by `linux_release_verify` under its own
-    /// trust anchor, the lines split across batches on threads.
     fn ask(&self, scratch: &Scratch, lines: &[(String, String)]) -> Vec<Answer> {
         let chunks: Vec<&[(String, String)]> = lines.chunks(32).collect();
         let answers = Mutex::new(vec![Vec::new(); chunks.len()]);
@@ -113,7 +106,6 @@ pub fn answer(rec: &Rec) -> Answer {
     }
 }
 
-/// A library verdict as an answer.
 fn verdict<T>(said: aterm_bootstrap_verify::Verdict<T>) -> Answer {
     match said {
         Ok(_) => "ok\t".into(),
@@ -121,7 +113,6 @@ fn verdict<T>(said: aterm_bootstrap_verify::Verdict<T>) -> Answer {
     }
 }
 
-/// The command line over a laid case, quoted for the batch.
 fn main_args(case: &Case, laid: &Laid) -> String {
     [
         q(s(&laid.release)),
@@ -212,9 +203,6 @@ fn the_static_verifier_agrees_with_the_updater_on_a_generated_corpus() {
     chain::agrees_with_the_updater_on_a_generated_corpus(&scratch, &Built::new());
 }
 
-/// Negative control: a verifier that never reads the store's durable policy (a stand-in
-/// that hands the real one an empty store) is caught by the corpus, on the case the
-/// embedded verifier's control breaks.
 #[test]
 fn the_differential_catches_a_verifier_that_drops_the_durable_policy() {
     let scratch = Scratch::new();
@@ -238,8 +226,6 @@ fn the_differential_catches_a_verifier_that_drops_the_durable_policy() {
     );
 }
 
-/// Negative control: a verifier that admits everything is caught on what the updater
-/// refuses.
 #[test]
 fn the_differential_catches_a_verifier_that_admits_everything() {
     let scratch = Scratch::new();
@@ -256,9 +242,6 @@ fn the_differential_catches_a_verifier_that_admits_everything() {
     );
 }
 
-/// The verifier trusts exactly the paper master the updater pins: its compiled-in anchor
-/// is `PAPER_MASTER_PUBKEYS`, and with no test anchor named it refuses a roster the
-/// corpus's own master signed.
 #[test]
 fn the_static_verifier_trusts_the_updaters_paper_master() {
     assert_eq!(
@@ -351,9 +334,6 @@ fn the_install_path_walk_is_the_updaters_on_this_machine() {
     chain::the_install_path_walk_is_the_updaters_on_this_machine(&scratch, &Built::new());
 }
 
-/// The user-private-group rule is the updater's, fact for fact: over every combination of
-/// an account, a group and the accounts that have it as their primary group (each fact
-/// known or not), the verifier's `user_private_group` and the updater's answer alike.
 #[test]
 fn the_user_private_group_rule_is_the_updaters() {
     use aterm_bootstrap_verify::{Account, Group, user_private_group};

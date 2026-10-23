@@ -96,8 +96,6 @@ struct Hit {
     inner: (usize, usize),
 }
 
-/// `PREFIX` `[^"]*` `SUFFIX`, every non-overlapping match left to right; the inner
-/// span is the quoted value.
 fn quoted(text: &str, prefix: &str, suffix: &str) -> Vec<Hit> {
     let mut hits = Vec::new();
     let mut from = 0;
@@ -124,33 +122,25 @@ fn quoted(text: &str, prefix: &str, suffix: &str) -> Vec<Hit> {
 const ANCHOR: &str = "<a class=\"download\" href=\"";
 const GET_ANCHOR: &str = "<a class=\"get download\" href=\"";
 
-/// The download anchors' hrefs (`<a class="download" href="…"`).
 fn anchors(text: &str) -> Vec<Hit> {
     quoted(text, ANCHOR, "\"")
 }
 
-/// `/terminal`'s header anchors' hrefs (`<a class="get download" href="…"`).
 fn get_anchors(text: &str) -> Vec<Hit> {
     quoted(text, GET_ANCHOR, "\"")
 }
 
-/// `\d+` at `at`: its end.
 fn digits(text: &str, at: usize) -> Option<usize> {
     let n = text[at..].bytes().take_while(u8::is_ascii_digit).count();
     (n > 0).then_some(at + n)
 }
 
-/// `\d+\.\d+\.\d+` at `at`: its end.
 fn triple(text: &str, at: usize) -> Option<usize> {
     let a = digits(text, at)?;
     let b = digits(text, a + text[a..].strip_prefix('.').map(|_| 1)?)?;
     digits(text, b + text[b..].strip_prefix('.').map(|_| 1)?)
 }
 
-/// The note lines: `<p class="install-note"[^>]*>` then `<code>aterm[^<]*</code>`,
-/// then optionally a version cell (an older page shape) and optionally a size cell.
-/// Both are consumed, so the rewrite drops a version cell. The inner span is everything
-/// after the `<p …>` opening tag.
 fn notes(text: &str) -> Vec<Hit> {
     const OPEN: &str = "<p class=\"install-note\"";
     let mut hits = Vec::new();
@@ -202,8 +192,6 @@ fn notes(text: &str) -> Vec<Hit> {
     hits
 }
 
-/// `<span class="title">aterm v` `\d+\.\d+\.\d+` `&nbsp;`; the inner span is the
-/// version.
 fn titles(text: &str) -> Vec<Hit> {
     const OPEN: &str = "<span class=\"title\">aterm v";
     let mut hits = Vec::new();
@@ -222,7 +210,6 @@ fn titles(text: &str) -> Vec<Hit> {
     hits
 }
 
-/// The download anchor's whole opening tag: `<a class="(get )?download" href="…"…>`.
 fn platform_anchors(text: &str) -> Vec<Hit> {
     let mut hits = Vec::new();
     let mut from = 0;
@@ -251,7 +238,6 @@ fn platform_anchors(text: &str) -> Vec<Hit> {
     }
 }
 
-/// `text` with the one hit of `hits` replaced through `with`, or the refusal.
 fn exactly_once(
     page: &str,
     text: &str,
@@ -275,8 +261,7 @@ fn exactly_once(
     ))
 }
 
-/// The platform attributes the `/aterm` and `/terminal` anchors carry, in the order they are
-/// written, each with its value — `None` removes it.
+/// The platform attributes the `/aterm` and `/terminal` anchors carry.
 #[must_use]
 pub fn platform_attributes(
     facts: &Facts,
@@ -306,7 +291,6 @@ pub fn platform_attributes(
     out
 }
 
-/// `\s+ATTR="[^"]*"` in `tag`: each match's span (from the first whitespace before).
 fn attribute_spans(tag: &str, attr: &str) -> Vec<(usize, usize)> {
     let needle = format!("{attr}=\"");
     let mut spans = Vec::new();
@@ -331,8 +315,7 @@ fn attribute_spans(tag: &str, attr: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// The anchor's opening `tag` with every platform attribute removed and the known
-/// ones written once, at the end.
+/// Rewrite the anchor's opening `tag` with each platform attribute written once.
 fn with_platform_attributes(
     page: &str,
     tag: &str,
@@ -689,10 +672,6 @@ mod tests {
         }
     }
 
-    /// A Linux pick is the installer command, written only for an architecture with a
-    /// signed executable — plain when that executable is the head's (what an unpinned
-    /// install.sh installs), pinned to its release when it trails the head — and never
-    /// for a checksum-only tarball, which the installer does not install.
     #[test]
     fn the_install_command_is_written_only_for_a_signed_executable() {
         let mut f = facts(Some(1));

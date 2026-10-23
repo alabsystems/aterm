@@ -45,6 +45,13 @@ aterm-spec-anchor = { workspace = true }
 # Aos hosted execution: the momentum glow's task schema, boundary publication and replay.
 aterm-aos = { workspace = true }
 
+[features]
+# Aos M4 candidate generation (docs/DESIGN-aos-hosted-execution-2026-10-21.md §10):
+# schedule plans, their interpreter and the plan-only presentation fallback in a
+# release build. Test and debug builds have them without it; a release build
+# without it has none of them and runs exactly the prebuilt codes.
+aos-candidates = []
+
 [target.'cfg(unix)'.dependencies]
 # Native config-referenced visual feeds are opened O_NONBLOCK/O_NOFOLLOW on
 # Unix before their same-handle regular-file check.

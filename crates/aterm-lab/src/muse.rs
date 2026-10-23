@@ -19,7 +19,6 @@ fn lab(args: &[String]) -> Result<(Run, Vec<String>), Fail> {
 }
 
 /// Checks that the lab has a Muse Code binary to run.
-///
 /// # Errors
 /// None is there.
 pub fn need_muse(run: &Run) -> Result<(), Fail> {
@@ -33,7 +32,6 @@ pub fn need_muse(run: &Run) -> Result<(), Fail> {
 }
 
 /// Rejects arguments that initiate login, credential storage, external servers, or egress.
-///
 /// # Errors
 /// What was refused.
 pub fn safe_args(args: &[String]) -> Result<(), String> {
@@ -143,7 +141,6 @@ pub struct Launch {
 }
 
 /// Parse `muse`'s options.
-///
 /// # Errors
 /// An unknown option, `-e` with no value, or one that is the lab's to set ([`safe_env`]).
 pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
@@ -169,7 +166,6 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
 }
 
 /// Launch Muse Code in the lab's first tab; the `launched: …` line.
-///
 /// # Errors
 /// No Muse Code, no witness, a refused argument, or the launch line could not be typed.
 pub fn launch(run: &Run, l: &Launch) -> Result<String, Fail> {
@@ -297,7 +293,6 @@ mod tests {
         );
     }
 
-    /// NEGATIVE CONTROL: an ordinary variable passes.
     #[test]
     fn an_extra_variable_never_replaces_the_lab_s_own() {
         for bad in [

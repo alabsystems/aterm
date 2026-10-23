@@ -623,14 +623,22 @@ mod unix {
     use zeroize::Zeroize;
 
     /// What an open vault means, said where one is made or shown.
-    const OPEN_VAULT: &str = "this vault is open: every machine that reaches its server and asks to join is let in within seconds, with no password and no code, and reads [everyone]'s entries, except a machine you let go (aterm secrets password set closes it)";
+    const OPEN_VAULT: &str = "this vault is open: every machine that reaches its server and asks to join is let in within seconds, with no password and no code, and reads [everyone]'s entries, except by a key you let go; a machine that makes a new key asks as a new machine (aterm secrets password set closes it)";
 
     /// What a vault at a path says where one served at a URL says whom its `[join]` lets in: a
     /// path has no join queue, so nothing lets a machine in by itself there.
     const PATH_JOINS: &str = "a vault at a path has no join queue: a machine joins it only when an admin approves its key: aterm secrets approve <age1…> --name <host>";
 
-    /// What a publish that let a machine go from an open vault says.
-    const KEPT_OUT: &str = "the vault stays open, but not to a machine you let go: its key is a `code-only` line in [join], so whatever it asks, it is let back in only by its code (aterm secrets approve)";
+    /// What a publish that let a machine go from an open vault says: only its key is kept out,
+    /// since an open vault lets in any new key that reaches the server (§7).
+    const KEPT_OUT: &str = "the vault stays open, but not to the key you let go: it is a `code-only` line in [join], so that key is let back in only by its code (aterm secrets approve). The vault still lets in any new key that reaches its server, so if the machine was lost or compromised, close the vault now (aterm secrets password set), let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
+
+    /// [`KEPT_OUT`] for a vault at a path. No server's queue reaches a path no server serves,
+    /// so nothing lets a machine in there but an admin's approve of its key, which a
+    /// `code-only` line does not stop. Whether a server serves the file is not knowable here;
+    /// one that does serves this version from its next request (`server::take_from_store`),
+    /// and the open vault's queue then makes [`KEPT_OUT`]'s steps the ones to take.
+    const KEPT_OUT_AT_A_PATH: &str = "at a path no server serves, the key you let go, like any other, comes back only when an admin approves it (aterm secrets approve <age1…> --name <host>), so if the machine was lost or compromised, rotate what it could read. If aterm secrets serve serves this file, it serves this version from its next request, and the vault still lets in any new key that reaches it: if the machine was lost or compromised, close the vault now (aterm secrets password set), let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
 
     /// What marks a request whose key a `code-only` line names, where requests are listed.
     const CODE_ONLY_MARK: &str =
@@ -801,7 +809,14 @@ mod unix {
             print!("{}", LONG_CHAIN_NOTE);
         }
         if done.kept_out {
-            println!("{KEPT_OUT}");
+            println!(
+                "{}",
+                if done.queued {
+                    KEPT_OUT
+                } else {
+                    KEPT_OUT_AT_A_PATH
+                }
+            );
         }
         if !done.held.is_empty() {
             println!(

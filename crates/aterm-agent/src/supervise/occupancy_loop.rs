@@ -722,6 +722,7 @@ impl<C: Ctl> Session<'_, C> {
         let told_ms = self.hold_wall_ms(due.now_ms);
         self.facts.state.told(key, told_ms);
         self.hold.door.books.fired(rule, due.now_ms, true);
+        self.break_lined(due.now_ms);
         self.hold_line(due.seq, Some(cfg), review);
         host.break_taken();
         host.inform(text);
@@ -936,11 +937,6 @@ impl<C: Ctl> Session<'_, C> {
             &rules::held_reason(rule, episode, ordinal, held_ms, hold.declared, guard),
             seq,
         );
-    }
-
-    /// The door's books, which the stuck fact's line obeys the session's pace by.
-    pub(super) const fn hold_books(&self) -> &Books {
-        &self.hold.door.books
     }
 
     /// A line of the stuck fact's went at `at_ms` (the clock's): it counts toward the session's

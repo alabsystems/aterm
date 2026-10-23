@@ -7,8 +7,7 @@ use super::Damage;
 use super::rect::LineDamageBounds;
 use crate::row_u16;
 
-/// Iterator over damaged rows: a counter for `Full`, a `trailing_zeros()`
-/// bitset scan for `Partial`.
+/// Iterator over damaged rows.
 #[non_exhaustive]
 pub enum DamagedRowIterator<'a> {
     /// Full damage - iterate all rows.
@@ -53,8 +52,7 @@ impl Iterator for DamagedRowIterator<'_> {
     }
 }
 
-/// Iterator over the set bits of a bitset, skipping clean rows via
-/// `trailing_zeros()`.
+/// Iterator over the set bits of a bitset, skipping clean rows via `trailing_zeros()`.
 pub struct BitsetRowIterator<'a> {
     /// Reference to the bitset words.
     bits: &'a [u64],
@@ -88,7 +86,6 @@ impl Iterator for BitsetRowIterator<'_> {
         loop {
             if self.current_word != 0 {
                 let bit_pos = self.current_word.trailing_zeros() as usize;
-                // A tracker has at most u16::MAX rows (1024 words), so this <= 65535.
                 let row = row_u16(self.word_idx * 64 + bit_pos);
 
                 self.current_word &= !(1u64 << bit_pos);
@@ -109,8 +106,6 @@ impl Iterator for BitsetRowIterator<'_> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // Upper bound: the set bits left; `.get()` because an exhausted iterator's
-        // word_idx is past the end.
         let remaining: usize = self.current_word.count_ones() as usize
             + self
                 .bits
@@ -123,8 +118,7 @@ impl Iterator for BitsetRowIterator<'_> {
     }
 }
 
-/// Iterator over damaged rows with their damaged column range (the renderer's
-/// iterator).
+/// Iterator over damaged rows with their damaged column range (the renderer's iterator).
 pub struct DamageBoundsIterator<'a> {
     damage: &'a Damage,
     row_iter: DamagedRowIterator<'a>,
@@ -161,7 +155,6 @@ impl Iterator for DamageBoundsIterator<'_> {
                     right,
                 });
             }
-            // Row's column bounds are entirely out of visible range — skip it.
         }
     }
 }

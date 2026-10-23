@@ -2796,27 +2796,29 @@ impl<C: Ctl> Session<'_, C> {
         false
     }
 
-    /// Type and submit `text` using the server's guarded `turn` verb.
+    /// Type and submit `text` using the server's guarded `turn` verb: how far it went
+    /// ([`Written::Left`] where the server typed it and its Enter did not go: the guard skipped
+    /// it, a hold landed before it, or the sink took none of it).
     fn type_guarded(
         &mut self,
         point: &Turn,
         text: &str,
         rule: &str,
         review: &mut dyn Review,
-    ) -> Result<bool, Fail> {
+    ) -> Result<Written, Fail> {
         let seq = point.screen.seq;
         if self.caps.guarded_submit == Some(false) {
             review.note(&format!(
                 "SKIPPED seq={seq} rule={rule} this aterm is too old for a guarded submit"
             ));
-            return Ok(false);
+            return Ok(Written::Not);
         }
         let reader = self.reader(&point.screen.rows);
         let Some(caret) = reader.caret_on(&point.screen.rows) else {
             review.note(&format!(
                 "SKIPPED seq={seq} rule={rule} no composer this policy types into"
             ));
-            return Ok(false);
+            return Ok(Written::Not);
         };
         let drawn = reader.folded_paste(text);
         let submit = format!(
@@ -2835,39 +2837,56 @@ impl<C: Ctl> Session<'_, C> {
             )));
         }
         let why = one_line(r.err_text());
+        if r.is_err("busy sink") {
+            // `turn` answers this only from its guarded Enter, after the paste and a guard that
+            // matched it: the text stands in the composer unsent, as a fenced write's refused
+            // Enter leaves it.
+            review.note(&format!(
+                "SKIPPED seq={seq} rule={rule} not submitted: {why}"
+            ));
+            self.left_typed(point, text, &why, review)?;
+            return Ok(Written::Left);
+        }
         if r.is_err("halted") || r.is_err("busy") || r.is_err("rate") {
             self.write_refused(r.is_err("halted"), &why, seq, review)?;
-            return Ok(false);
+            return Ok(Written::Not);
         }
         if r.is_err("yield") {
             review.note(&format!(
                 "SKIPPED seq={seq} rule={rule} a person is typing: {why}"
             ));
             self.redecide_soon("a person was typing");
-            return Ok(false);
+            return Ok(Written::Not);
         }
         if r.unknown_form() {
             self.caps.guarded_submit = Some(false);
             review.note(&format!(
                 "SKIPPED seq={seq} rule={rule} this aterm is too old for a guarded submit: {why}"
             ));
-            return Ok(false);
+            return Ok(Written::Not);
         }
         self.caps.guarded_submit = Some(true);
         if r.submitted() {
-            return Ok(true);
+            return Ok(Written::Submitted);
         }
         let verdict = r.turn_verdict().unwrap_or("").to_string();
         if r.pressed_unverified() {
             review.note(&format!(
                 "UNVERIFIED seq={seq} rule={rule} Enter written, the submit not seen: {verdict}"
             ));
-            return Ok(true);
+            return Ok(Written::Submitted);
         }
         let verdict = if verdict.is_empty() { why } else { verdict };
         review.note(&format!(
             "SKIPPED seq={seq} rule={rule} not submitted: {verdict}"
         ));
+        if verdict.split_whitespace().any(|w| w == "reason=halted") {
+            // The hold came after the server pasted the text and before its Enter: the text
+            // stands in the composer unsent, as the fenced write's halted Enter leaves it.
+            self.park_on_hold(&verdict, seq, review)?;
+            self.left_typed(point, text, "the session is halted", review)?;
+            return Ok(Written::Left);
+        }
         if r.skipped() || verdict.contains("reason=guard") {
             self.left_typed(
                 point,
@@ -2875,8 +2894,9 @@ impl<C: Ctl> Session<'_, C> {
                 &format!("the guard missed ({verdict})"),
                 review,
             )?;
+            return Ok(Written::Left);
         }
-        Ok(false)
+        Ok(Written::Not)
     }
 
     /// Journal and escalate a fenced write skipped because the guard matched no row on the
@@ -3001,8 +3021,7 @@ impl<C: Ctl> Session<'_, C> {
             .map(|written| written == Written::Submitted)
     }
 
-    /// [`Self::type_text`], saying how far the text went: a guarded write that typed nothing
-    /// is [`Written::Not`].
+    /// [`Self::type_text`], saying how far the text went, the guarded write's as well.
     pub(super) fn type_text_written(
         &mut self,
         point: &Turn,
@@ -3012,13 +3031,7 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<Written, Fail> {
         self.under_hand(|s| match s.type_fenced(point, text, rule, review)? {
             Some(written) => Ok(written),
-            None => s.type_guarded(point, text, rule, review).map(|typed| {
-                if typed {
-                    Written::Submitted
-                } else {
-                    Written::Not
-                }
-            }),
+            None => s.type_guarded(point, text, rule, review),
         })
     }
 
@@ -3044,13 +3057,7 @@ impl<C: Ctl> Session<'_, C> {
         self.under_hand(|s| match s.type_fenced(point, text, rule, review)? {
             Some(written) => Ok(Some(written)),
             None if armed(Fault::DoorGuardedFallback) => {
-                s.type_guarded(point, text, rule, review).map(|typed| {
-                    Some(if typed {
-                        Written::Submitted
-                    } else {
-                        Written::Not
-                    })
-                })
+                s.type_guarded(point, text, rule, review).map(Some)
             }
             None => Ok(None),
         })

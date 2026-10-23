@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 
 //! `agh auth add` and `agh auth remove` (design §6.7).
 
@@ -78,8 +77,8 @@ const OFF_UNIX: &str =
 
 /// Provision `req`.
 /// # Errors
-/// Refused for a loose `--file` (with its remedy), a fault the edit would make, or a tier
-/// change; Unauthenticated when `GET /user` refuses the token; could_not_run on I/O.
+/// Refused for a loose `--file` (with its remedy), a fault the edit would make, or a tier change;
+/// Unauthenticated when `GET /user` refuses the token; could_not_run on I/O.
 pub fn add(
     gh: &Github,
     dirs: &Dirs,
@@ -137,8 +136,8 @@ pub fn remove(dirs: &Dirs, name: &str) -> Result<Removed> {
 
 /// The pure edit `add` makes (aterm-toml's `edit` document, comments kept).
 /// # Errors
-/// Usage when the text does not parse, when `profiles` or the profile's row is not a table,
-/// or, for a non-empty `req.owners`, when `owners` is not `[[owners]]` tables.
+/// Usage when the text does not parse, when `profiles` or the profile's row is not a table, or, for
+/// a non-empty `req.owners`, when `owners` is not `[[owners]]` tables.
 pub fn edit_config(
     text: &str,
     req: &AddRequest,
@@ -222,8 +221,8 @@ pub fn edit_config(
 
 /// The pure edit `remove` makes: the new text and the owners whose rows changed.
 /// # Errors
-/// Usage when the text does not parse, names no profile `name`, or has an `owners` that is
-/// neither `[[owners]]` tables nor an array of inline tables.
+/// Usage when the text does not parse, names no profile `name`, or has an `owners` that is neither
+/// `[[owners]]` tables nor an array of inline tables.
 pub fn remove_from_config(text: &str, name: &str) -> Result<(String, Vec<String>)> {
     let mut doc = parse_document(text)?;
     let present = doc
@@ -275,10 +274,6 @@ pub fn remove_from_config(text: &str, name: &str) -> Result<(String, Vec<String>
     Ok((doc.to_string(), edited))
 }
 
-/// The document `text` holds. An error names only where it is (`line N`): the parser's
-/// message quotes the raw value it refused, which may be an unprefixed token no shape rule
-/// knows, and the source line it would quote is never shown. `agh policy check` gives the
-/// masked reason.
 fn parse_document(text: &str) -> Result<DocumentMut> {
     text.parse::<DocumentMut>().map_err(|e| {
         let at = e.span().map_or_else(String::new, |span| {
@@ -288,7 +283,6 @@ fn parse_document(text: &str) -> Result<DocumentMut> {
     })
 }
 
-/// `key = value` in `table`, the old value's decor kept on the new one.
 fn set_value(table: &mut dyn TableLike, key: &str, mut value: Value) {
     if let Some(old) = table.get(key).and_then(Item::as_value) {
         *value.decor_mut() = old.decor().clone();
@@ -296,18 +290,14 @@ fn set_value(table: &mut dyn TableLike, key: &str, mut value: Value) {
     table.insert(key, Item::Value(value));
 }
 
-/// `["a", "b"]`, on one line.
 fn read_array(names: &[String]) -> Value {
     Value::from(names.iter().map(String::as_str).collect::<Array>())
 }
 
-/// A table's `name`.
 fn owner_name(table: &dyn TableLike) -> Option<&str> {
     table.get("name").and_then(Item::as_str)
 }
 
-/// `name` dropped from an owner's `read`, and its `write` removed when it is `name`; the
-/// owner's name pushed onto `edited` when either step touched it.
 fn unlist(table: &mut dyn TableLike, name: &str, edited: &mut Vec<String>) {
     let mut touched = drop_from_read(table, name);
     if table.get("write").and_then(Item::as_str) == Some(name) {
@@ -319,12 +309,10 @@ fn unlist(table: &mut dyn TableLike, name: &str, edited: &mut Vec<String>) {
     }
 }
 
-/// The usage error for an `owners` that is not `[[owners]]` tables.
 fn not_owner_tables() -> Error {
     Error::usage("agh.toml's owners is not [[owners]] tables").with_next(config::POLICY_CHECK)
 }
 
-/// A table's `read` entries that are strings.
 fn read_names(table: &dyn TableLike) -> Vec<String> {
     table
         .get("read")
@@ -339,7 +327,6 @@ fn read_names(table: &dyn TableLike) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `name` dropped from the table's `read`; whether it was there.
 fn drop_from_read(table: &mut dyn TableLike, name: &str) -> bool {
     let read = read_names(table);
     if !read.iter().any(|step| step == name) {
@@ -350,7 +337,6 @@ fn drop_from_read(table: &mut dyn TableLike, name: &str) -> bool {
     true
 }
 
-/// A clone of every `[[owners]]` table; none when there is no `owners`.
 fn owner_tables(doc: &DocumentMut) -> Result<Vec<Table>> {
     match doc.get("owners") {
         None => Ok(Vec::new()),
@@ -361,7 +347,6 @@ fn owner_tables(doc: &DocumentMut) -> Result<Vec<Table>> {
     }
 }
 
-/// `owners` set back whole, at its own position.
 fn set_owner_tables(doc: &mut DocumentMut, tables: Vec<Table>) {
     let mut array = ArrayOfTables::new();
     for table in tables {
@@ -431,9 +416,8 @@ fn would_break(faults: &[ConfigFault], verb: &str) -> Error {
     .with_next(format!("fix agh.toml, then run agh auth {verb} again"))
 }
 
-/// An error about `dir` (or a file in it) without the absolute path aterm-uds names it by:
-/// its `the directory {dir}: ` lead is dropped, since the caller names the path, and any
-/// other mention of `dir` is written `~/…`.
+/// An error about `dir` (or a file in it) without the absolute path aterm-uds names it by: its
+/// `the directory {dir}: ` lead is dropped.
 #[cfg(unix)]
 fn io_text(e: &std::io::Error, dir: &Path, home: &Path) -> String {
     let text = e.to_string();
@@ -445,10 +429,7 @@ fn io_text(e: &std::io::Error, dir: &Path, home: &Path) -> String {
     text.replace(&absolute, &tilde(dir, home))
 }
 
-/// `create_private_dir(dir)`: an existing directory that is not private is Refused, never
-/// narrowed, with the chmod that makes it private and its inverse. A directory that could
-/// not be made (mkdir's own EACCES under a parent agh cannot write) is CouldNotRun, as
-/// `config_dir`'s `create_dir_all` answers it: there is no entry to chmod.
+/// `create_private_dir(dir)`: an existing directory that is not private is Refused.
 #[cfg(unix)]
 fn private_dir(dir: &Path, home: &Path) -> Result<()> {
     let shown = tilde(dir, home);
@@ -528,8 +509,7 @@ fn new_token_name(name: &str) -> String {
 #[cfg(unix)]
 const STAGED_SUFFIX: &str = ".agh-new";
 
-/// One cooperative auth edit, including its network login binding. The persistent
-/// empty file is never removed: interrupted processes release only their kernel lock.
+/// One cooperative auth edit.
 #[cfg(unix)]
 struct AuthEdit(std::fs::File);
 
@@ -593,8 +573,7 @@ impl Drop for AuthEdit {
     }
 }
 
-/// A staging name this transaction created exclusively. Only this exact file may be
-/// placed or cleaned up; an occupied name, including one left by an interruption, stays.
+/// A staging name this transaction created exclusively.
 #[cfg(unix)]
 struct StagedToken {
     path: std::path::PathBuf,
@@ -637,9 +616,7 @@ impl Drop for StagedToken {
     }
 }
 
-/// Whether `path` is (or resolves to) a staged token of agh's: a `*.token.agh-new` in
-/// `dirs.tokens()`, the directories compared after `canonicalize`. Such names are reserved
-/// for a transaction's owned stage, so agh.toml never names one.
+/// Whether `path` is (or resolves to) a staged token of agh's.
 #[cfg(unix)]
 fn is_staged(dirs: &Dirs, path: &Path) -> bool {
     let Ok(tokens) = std::fs::canonicalize(dirs.tokens()) else {
@@ -668,8 +645,7 @@ fn names_file(config: &Validated, path: &Path) -> bool {
     })
 }
 
-/// Validate stdin before making any directory or taking the transaction lock. The
-/// returned stack buffer is scrubbed on every way out, including a busy refusal.
+/// Validate stdin before making any directory or taking the transaction lock.
 #[cfg(unix)]
 fn read_stdin_token(
     dirs: &Dirs,
@@ -852,8 +828,7 @@ fn add_unix(
     }
 }
 
-/// Steps 5 and 6: the login bound through a one-profile router over `source`, then the edit
-/// made and judged. `token_file` is where agh.toml will name the token.
+/// Steps 5 and 6.
 #[cfg(unix)]
 fn bind_and_edit(
     gh: &Github,
@@ -911,8 +886,7 @@ fn bind_and_edit(
     Ok((added, new_text, meter))
 }
 
-/// Step 8: agh.toml written whole, 0600, in its private directory. After a stdin token was
-/// put in place (`placed`), a failure says so: the new token stays, agh.toml as it was.
+/// Step 8.
 #[cfg(unix)]
 fn write_config(dirs: &Dirs, text: &str, placed: Option<&Path>) -> Result<()> {
     let written = config_dir(dirs).and_then(|()| {

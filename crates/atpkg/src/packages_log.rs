@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The package log: `packages.log`, beside `aterm.log` in the per-user log directory ([`aterm_types::dirs::logs_dir`]).
+//! Per-user `packages.log` writer, sanitizer, rotator, and tail reader.
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -9,26 +9,23 @@ use std::path::{Path, PathBuf};
 use crate::Status;
 use crate::store::Layout;
 
-/// The file's name inside the log directory.
+/// File name inside the log directory.
 pub const LOG_NAME: &str = "packages.log";
 
-/// Rotate once the file reaches this size (1 MiB — a few thousand passes).
+/// File size threshold at which the log rotates (1 MiB).
 pub const ROTATE_AT_BYTES: u64 = 1024 * 1024;
 
-/// Rotated files kept: `packages.log.1` (newest) … `packages.log.5` (oldest).
+/// Number of rotated log files kept (`packages.log.1` .. `packages.log.5`).
 pub const KEEP_ROTATED: u32 = 5;
 
-/// How many events Settings ▸ Packages' Activity reads, of the kinds it shows.
+/// Number of events read by the Settings ▸ Packages Activity view.
 pub const ACTIVITY_EVENTS: usize = 50;
 
-/// The longest value a line carries, in characters; the rest is `…`.
 const MAX_VALUE_CHARS: usize = 400;
 
-/// The most a tail reads from the end of one file: far more than [`ACTIVITY_EVENTS`] lines,
-/// and never the whole of a file someone grew by hand.
 const TAIL_READ_BYTES: u64 = 128 * 1024;
 
-/// The kinds of line.
+/// Record kind identifiers.
 pub mod kind {
     /// A pass began: it holds the store lock.
     pub const PASS_START: &str = "pass-start";
@@ -44,7 +41,7 @@ pub mod kind {
     pub const INDEX_RESOLVED: &str = "index-resolved";
 }
 
-/// Where the log lives: `<logs dir>/packages.log`, or `None` when no log directory resolves (no home).
+/// Path to `<logs dir>/packages.log`, or `None` if no log directory resolves.
 #[must_use]
 pub fn log_path() -> Option<PathBuf> {
     log_dir().map(|dir| dir.join(LOG_NAME))
@@ -106,7 +103,7 @@ pub(crate) mod test_bind {
     }
 }
 
-/// One program's row moving, as the log records it.
+/// One program row transition recorded in the log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transition {
     /// The program.
@@ -123,7 +120,7 @@ pub struct Transition {
     pub reason: String,
 }
 
-/// One event.
+/// One package-log event.
 #[derive(Clone, Copy, Debug)]
 pub enum Event<'a> {
     /// A pass took the store lock.
@@ -185,7 +182,7 @@ pub enum Event<'a> {
     },
 }
 
-/// Append `event` about `layout`'s store when this log records it ([`records`]), rotating first when due and this process holds the store lock.
+/// Append `event` for `layout` when recorded by this log.
 pub fn append(layout: &Layout, event: &Event<'_>) {
     if !records(layout) {
         return;
@@ -226,7 +223,6 @@ pub(crate) fn stop_pass_clock() {
     pass_clock::set(None);
 }
 
-/// Milliseconds since this process's pass began, when it is inside one.
 fn pass_ms() -> Option<u64> {
     pass_clock::get().map(|start| u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
 }
@@ -273,7 +269,7 @@ pub(crate) fn note_rows(layout: &Layout, before: Option<&Status>, after: &Status
     }
 }
 
-/// The transitions from `before` to `after`, in program order: a moved build (installed, updated, rolled back, removed), a row that became not current or changed its reason ([`crate::state::not_current`]), or one current again.
+/// Compute program transitions from `before` to `after` in program order.
 #[must_use]
 pub fn transitions(before: Option<&Status>, after: &Status) -> Vec<Transition> {
     let empty = std::collections::BTreeMap::new();
@@ -332,13 +328,12 @@ fn transition(
     })
 }
 
-/// `event` as its one line, `\n` included.
+/// Format `event` as a single log line including trailing newline.
 #[must_use]
 pub fn render(unix: i64, pid: u32, event: &Event<'_>) -> String {
     render_at(unix, pid, None, event)
 }
 
-/// [`render`], with the line's offset into its pass (`t_ms`) when it was written inside one.
 fn render_at(unix: i64, pid: u32, t_ms: Option<u64>, event: &Event<'_>) -> String {
     let (exit, secs, build, ms, counts);
     let (kind, fields): (&str, Vec<(&str, &str)>) = match *event {
@@ -436,7 +431,7 @@ fn render_at(unix: i64, pid: u32, t_ms: Option<u64>, event: &Event<'_>) -> Strin
     render_record(unix, kind, pid, &fields, MAX_VALUE_CHARS)
 }
 
-/// One line of the grammar, `\n` included: the stamp (`-` for a clock before the epoch or `now_unix`'s fail-closed `i64::MAX`), `kind`, the pid, then `\t<key>=<value>` per field, each value [`sanitize_capped`] to `max_chars` and an empty one left out.
+/// Format a single tab-separated record line with sanitized fields.
 #[must_use]
 pub fn render_record(
     unix: i64,
@@ -462,7 +457,6 @@ pub fn render_record(
     line
 }
 
-/// `\t<key>=<sanitized value>`, or nothing for an empty value.
 fn push_field(line: &mut String, key: &str, value: &str, max_chars: usize) {
     let value = sanitize_capped(value, max_chars);
     if value.is_empty() {
@@ -481,7 +475,7 @@ pub(crate) fn sanitize(value: &str) -> String {
     sanitize_capped(value, MAX_VALUE_CHARS)
 }
 
-/// `sanitize`, capped at `max_chars` characters instead: a caller that keeps a whole diagnostic in one value.
+/// Sanitize and redact a field value, capping at `max_chars` characters.
 #[must_use]
 pub fn sanitize_capped(value: &str, max_chars: usize) -> String {
     let plain: String = value
@@ -516,8 +510,6 @@ pub fn sanitize_capped(value: &str, max_chars: usize) -> String {
     out
 }
 
-/// The Unicode bidirectional formatting characters (LRM/RLM/ALM, the embeddings and
-/// overrides, the isolates): invisible, and able to make a line read as something else.
 const fn is_bidi_control(c: char) -> bool {
     matches!(
         c,
@@ -525,15 +517,10 @@ const fn is_bidi_control(c: char) -> bool {
     )
 }
 
-/// The zero-width characters (ZWSP, ZWNJ, ZWJ, the word joiner, the BOM): invisible, and
-/// able to hide a word from a reader and split one from the redactor.
 const fn is_zero_width(c: char) -> bool {
     matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}')
 }
 
-/// Every `scheme://…` in `text` cut to `scheme://host/path`: the userinfo (`user:pass@`) is
-/// dropped, and a query or fragment (where signed download URLs carry credentials) becomes
-/// `?…`.
 fn redact_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -564,19 +551,8 @@ fn redact_urls(text: &str) -> String {
     out
 }
 
-/// What a redacted credential reads as.
 const REDACTED: &str = "[redacted]";
 
-/// Every credential in `text` replaced by `[redacted]`, word by word (split on spaces; the
-/// controls are spaces by now):
-///
-/// * a word shaped like a token ([`is_secret_shaped`]) — GitHub's, Anthropic's and OpenAI's
-///   `sk-…`, GitLab's, Slack's, npm's, an AWS key id, or a long random-looking run;
-/// * the value of a credential-named key, glued (`token=…`, `password:…`, `"api_key":"…"`)
-///   or as the next word (`token: …`) — [`is_credential_key`];
-/// * the word after `Bearer` or `token`, and after `Authorization:` its scheme word (kept,
-///   when it is one) AND the credential after it — `Authorization: Bearer [redacted]`,
-///   where hiding only the next word used to redact `Bearer` and print the token.
 fn redact_tokens(text: &str) -> String {
     /// What the words that follow owe the redactor.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -659,8 +635,6 @@ fn redact_tokens(text: &str) -> String {
     out
 }
 
-/// Whether `key` (lowercase, unquoted) names a credential. A bare `key` counts only glued
-/// with `=` (`key=…`): `the refused key: x` is prose atpkg writes.
 fn is_credential_key(key: &str, equals: bool) -> bool {
     const NAMES: [&str; 12] = [
         "token",
@@ -690,9 +664,6 @@ fn is_credential_key(key: &str, equals: bool) -> bool {
         .any(|suffix| key.ends_with(suffix))
 }
 
-/// Whether `word` looks like a credential by shape alone: a known token prefix (GitHub, `sk-`,
-/// GitLab, Slack, npm), an AWS access key id, or a run of 32 or more `[A-Za-z0-9_-]` with
-/// upper case, lower case and a digit.
 fn is_secret_shaped(word: &str) -> bool {
     const INSIDE: [&str; 6] = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
     const LEADING: [(&str, usize); 8] = [
@@ -728,14 +699,13 @@ fn is_secret_shaped(word: &str) -> bool {
     aws || random
 }
 
-/// Append `line` to `<dir>/packages.log`: the directory made private when missing, the file rotated first when `may_rotate` and due ([`rotate_if_due`]), then one write on an `O_APPEND` descriptor opened for this line (`0600`, never through a link).
+/// Append `line` to `<dir>/packages.log`, rotating first when `may_rotate` and due.
 /// # Errors
-/// The directory, the rotation's renames, the open or the write failed.
+/// Returns an error if directory creation, rotation, opening, or writing fails.
 pub fn append_line(dir: &Path, line: &str, may_rotate: bool) -> io::Result<()> {
     aterm_types::fs_restricted::ensure_private_dir(dir)?;
     let path = dir.join(LOG_NAME);
     if may_rotate {
-        // A rotation that fails leaves the file where it is: the line still lands.
         let _ = rotate_if_due(&path);
     }
     open_append(&path)?.write_all(line.as_bytes())
@@ -760,7 +730,7 @@ fn open_append(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
-/// `packages.log.<n>` beside `path`.
+/// Path to `packages.log.<n>` beside `path`.
 #[must_use]
 pub fn rotated_path(path: &Path, n: u32) -> PathBuf {
     let mut name = path.file_name().map_or_else(
@@ -772,9 +742,9 @@ pub fn rotated_path(path: &Path, n: u32) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Rotate `path` when it is a regular file of at least [`ROTATE_AT_BYTES`]: `.4` → `.5` … `.1` → `.2`, then the file → `.1` (the oldest, `.5`, is replaced).
+/// Rotate `path` when it is a regular file of at least [`ROTATE_AT_BYTES`].
 /// # Errors
-/// A rename failed (a missing rotated file is not a failure).
+/// Returns an error if renaming an existing log file fails.
 pub fn rotate_if_due(path: &Path) -> io::Result<bool> {
     let due = std::fs::symlink_metadata(path)
         .is_ok_and(|m| m.file_type().is_file() && m.len() >= ROTATE_AT_BYTES);
@@ -791,7 +761,7 @@ pub fn rotate_if_due(path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-/// One line read back.
+/// Parsed package-log record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     /// When (Unix seconds); `None` for a line whose clock was unusable.
@@ -805,7 +775,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// The value of `key`, if the line carried it.
+    /// Value of `key`, if present on the line.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
         self.fields
@@ -815,7 +785,7 @@ impl Entry {
     }
 }
 
-/// `line` (with or without its `\n`) read back; `None` for anything this module did not write — a torn line, a foreign one, an unknown kind.
+/// Parse a package-log line of a known [`kind`].
 #[must_use]
 pub fn parse_line(line: &str) -> Option<Entry> {
     parse_record(line).filter(|entry| {
@@ -831,7 +801,7 @@ pub fn parse_line(line: &str) -> Option<Entry> {
     })
 }
 
-/// Any line of the grammar ([`render_record`]) read back, whatever its `[a-z-]` kind; `None` for a torn or foreign line.
+/// Parse any tab-separated record line produced by [`render_record`].
 #[must_use]
 pub fn parse_record(line: &str) -> Option<Entry> {
     let mut parts = line.trim_end_matches(['\n', '\r']).split('\t');
@@ -863,13 +833,13 @@ pub fn parse_record(line: &str) -> Option<Entry> {
     })
 }
 
-/// The newest `max` events of the log in `dir`, newest first: the tail of `packages.log`, then of `packages.log.1` when that is not enough.
+/// Read the newest `max` events from `dir`, newest first.
 #[must_use]
 pub fn read_tail(dir: &Path, max: usize) -> Vec<Entry> {
     read_tail_of(dir, max, |_| true)
 }
 
-/// [`read_tail`] of the events `keep` admits: `max` of those, read past every other kind — so a reader that shows some kinds is not short of them where another kind is frequent (each discovery's `index-resolved` line beside every pass's two).
+/// Read the newest `max` events in `dir` matching `keep`, newest first.
 #[must_use]
 pub fn read_tail_of(dir: &Path, max: usize, keep: impl Fn(&Entry) -> bool) -> Vec<Entry> {
     let path = dir.join(LOG_NAME);
@@ -891,19 +861,20 @@ pub fn read_tail_of(dir: &Path, max: usize, keep: impl Fn(&Entry) -> bool) -> Ve
     out
 }
 
-/// The package log's newest `max` events ([`read_tail`] of [`log_path`]'s directory).
+/// Read the newest `max` events from [`log_path`].
 #[must_use]
 pub fn tail(max: usize) -> Vec<Entry> {
     tail_of(max, |_| true)
 }
 
-/// The package log's newest `max` events that `keep` admits ([`read_tail_of`] of [`log_path`]'s directory).
+/// Read the newest `max` events from [`log_path`] matching `keep`.
 #[must_use]
 pub fn tail_of(max: usize, keep: impl Fn(&Entry) -> bool) -> Vec<Entry> {
     log_dir().map_or_else(Vec::new, |dir| read_tail_of(&dir, max, keep))
 }
 
 /// Every record ([`parse_record`]) in the last `read_bytes` of `path`, oldest first; a line cut by that window, torn or foreign is skipped.
+///
 /// # Errors
 /// `path` exists but is not a regular file, or opening, seeking or reading it failed.
 #[cfg(test)]
@@ -925,8 +896,6 @@ pub(crate) fn read_records(path: &Path, read_bytes: u64) -> io::Result<Vec<Entry
         .collect())
 }
 
-/// The whole lines of the last `read_bytes` of `path`, oldest first; empty when it is
-/// absent, unreadable or not a regular file.
 fn tail_lines(path: &Path, read_bytes: u64) -> Vec<String> {
     let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file());
     if !regular {
@@ -935,7 +904,6 @@ fn tail_lines(path: &Path, read_bytes: u64) -> Vec<String> {
     read_tail_lines(path, read_bytes).unwrap_or_default()
 }
 
-/// [`tail_lines`]' read, its failures kept.
 fn read_tail_lines(path: &Path, read_bytes: u64) -> io::Result<Vec<String>> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let mut file = std::fs::File::open(path)?;
@@ -972,8 +940,6 @@ mod tests {
         }
     }
 
-    /// A stamp, a kind, the pid, then tab-separated `key=value` fields on one line, empty
-    /// fields left out; it reads back field for field.
     #[test]
     fn a_line_is_one_tab_separated_record_that_reads_back() {
         let t = transition();
@@ -1080,8 +1046,6 @@ mod tests {
         }
     }
 
-    /// No value forges a field or a line, reorders the display or carries a credential, and
-    /// a long one is capped.
     #[test]
     fn values_lose_controls_bidi_credentials_and_length() {
         let forged = sanitize("ok\tresult=installed\nfake line\u{1b}[31m");
@@ -1160,8 +1124,6 @@ mod tests {
         assert_eq!(entry.get("reason"), Some("error: a b c https://h/x?…"));
     }
 
-    /// At 1 MiB the file becomes `.1`, the older ones shift, `.5` is the last kept; a writer
-    /// without the store lock only appends.
     #[test]
     fn the_log_rotates_at_its_bound_keeping_five() {
         let dir = scratch("rotate");
@@ -1204,8 +1166,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Any `[a-z-]` kind round-trips through `render_record`/`parse_record` under the
-    /// caller's cap; `parse_line` admits only the package log's own kinds.
     #[test]
     fn the_grammar_is_shared_by_any_kind_with_its_own_cap() {
         let long = "e".repeat(1000);
@@ -1257,7 +1217,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The tail reads newest first across the rotation boundary, bounded by `max`.
     #[test]
     fn the_tail_is_newest_first_across_the_rotation() {
         let dir = scratch("tail");
@@ -1305,8 +1264,6 @@ mod tests {
         }
     }
 
-    /// A transition is a moved build or a change into, out of or within not-current; never a
-    /// re-pin of the same build, a rebuilt record's `active`, or a bookkeeping row.
     #[test]
     fn transitions_are_moves_and_changes_of_reason() {
         use crate::state;
@@ -1420,8 +1377,6 @@ mod tests {
         assert_eq!(result_of("ay"), Some("installed"));
     }
 
-    /// A row written through `status::write` for the bound store lands in the log; one for
-    /// any other store does not.
     #[test]
     fn a_status_write_for_the_bound_store_logs_its_transitions() {
         let dir = scratch("hook");
@@ -1451,10 +1406,6 @@ mod tests {
         }
     }
 
-    /// THE PASS CLOCK: a pass over THE store stamps every line written inside it with `t_ms`,
-    /// its offset from the pass's start — the fetcher's layout-free `index-resolved` line too,
-    /// which reads back as the log's own kind — and nothing outside a pass, or inside a pass
-    /// over another store, is stamped or written that way.
     #[test]
     fn lines_inside_a_pass_carry_their_offset_into_it() {
         let dir = scratch("clock");

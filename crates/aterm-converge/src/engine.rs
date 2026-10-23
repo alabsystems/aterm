@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The engine: every item through probe, plan, apply and read-back, in the order its `after` edges give, the items that share an activation read back only after it ran once (design §3.3).
+//! Convergence engine ordering and executing items through probe, plan, apply, and read-back.
 
 use crate::model::{Explain, ItemReport, Mode, Outcome, Probe, Remedy, Requires, StoodAside};
 use crate::scope::Scope;
@@ -35,7 +35,7 @@ impl Journal for NoJournal {
     }
 }
 
-/// The journal of a surface that only reads (`aterm pkg doctor`): it refuses every record, so a plan never asks it and an apply that reached a change could not make it.
+/// Read-only journal that refuses every write.
 #[derive(Debug, Default)]
 pub struct ReadOnly;
 
@@ -101,9 +101,9 @@ pub fn named_by<'a>(
         .map(|(other, _)| other)
 }
 
-/// The order `items` run in: each after every item its `after` names, and otherwise in the order given, so a composition that is already ordered keeps its order.
+/// Return a topological execution order for `items` preserving composition order.
 /// # Errors
-/// An edge that names no other item ([`Refusal::Dangling`]; an item that names itself exactly waits on itself, a [`Refusal::Cycle`]), or items that wait on each other.
+/// [`Refusal::Dangling`] for an unknown dependency or [`Refusal::Cycle`] for a dependency cycle.
 pub fn order(items: &[Box<dyn Item + '_>]) -> Result<Vec<usize>, Refusal> {
     let ids: Vec<String> = items.iter().map(|item| item.id()).collect();
     let activations: Vec<Option<String>> = items
@@ -166,7 +166,7 @@ pub fn run(
     run_with(items, mode, journal, &mut |_| {})
 }
 
-/// [`run`], handing each row to `on_row` as soon as its item finishes: the machines agent's run job streams them to `progress.ndjson`.
+/// Run `items` in [`order`] and pass each completed row to `on_row`.
 /// # Errors
 /// As [`run`].
 pub fn run_with(
@@ -178,7 +178,7 @@ pub fn run_with(
     run_scoped(items, mode, Scope::EVERY, journal, on_row)
 }
 
-/// [`run_with`] within what a surface allows (design §3.2, [`Scope`]).
+/// Run `items` within `scope` and pass each completed row to `on_row`.
 /// # Errors
 /// As [`run`].
 pub fn run_scoped(
@@ -279,9 +279,6 @@ pub fn run_scoped(
     Ok(rows)
 }
 
-/// Run `activation` once for the rows `awaiting` it (each a row and its item), its line
-/// journaled first, then read each of those items back, but for one whose part of it
-/// failed.
 fn settle(
     activation: &dyn Activation,
     awaiting: &[(usize, usize)],
@@ -329,8 +326,6 @@ fn settle(
     }
 }
 
-/// Probe `item` again after its change: only an `Ok` read-back makes `row` `Changed`; any
-/// other fails it, saying what the read-back found.
 fn read_back(item: &dyn Item, row: &mut ItemReport) -> Probe {
     let back = item.probe();
     match &back {
@@ -355,8 +350,6 @@ fn read_back(item: &dyn Item, row: &mut ItemReport) -> Probe {
     back
 }
 
-/// Complete `row` once its outcome is known: the item's detail, and for a row that is not
-/// `Ok` or `Changed` its explanation, by the probe `last` that judged it.
 fn finish(item: &dyn Item, row: &mut ItemReport, last: &Probe) {
     row.detail = item.detail();
     if !matches!(row.outcome, Outcome::Ok | Outcome::Changed) {
@@ -367,8 +360,6 @@ fn finish(item: &dyn Item, row: &mut ItemReport, last: &Probe) {
     }
 }
 
-/// The first earlier row `item` must wait for that did not end `Ok` or `Changed`, and
-/// what it stood aside on, if it did.
 fn unmet_prerequisite(
     item: &dyn Item,
     rows: &[ItemReport],
@@ -383,7 +374,6 @@ fn unmet_prerequisite(
     None
 }
 
-/// `item`'s row before anything is known.
 fn blank(item: &dyn Item) -> ItemReport {
     ItemReport {
         id: item.id(),
@@ -404,7 +394,6 @@ fn blank(item: &dyn Item) -> ItemReport {
     }
 }
 
-/// One item through probe, plan, apply and read-back; `earlier` are the rows before it.
 fn run_one(
     item: &dyn Item,
     mode: Mode,
@@ -494,8 +483,6 @@ fn run_one(
             row.why = Some(why);
         }
         Probe::Unusable { why } => match item.read_aside() {
-            // The read needed what the run lacks (the network): it stood aside, with its
-            // kind on the row, rather than reading as unmeasured.
             Some(aside) => {
                 row.outcome = Outcome::Blocked;
                 row.why = Some(aside.why().to_owned());
@@ -555,8 +542,6 @@ fn run_one(
     (row, false)
 }
 
-/// A stood-aside row's explanation: the line the apply stood aside with, and the remedy
-/// its kind gives.
 fn explain_aside(item: &dyn Item, aside: &StoodAside) -> Explain {
     let why = aside.why().to_owned();
     let remedy = match aside {
@@ -670,8 +655,6 @@ pub(crate) mod tests {
         )
     }
 
-    /// The row carries its item's `essential`, so a reader of the report knows which rows
-    /// decide the surface's exit; an item that does not say is advisory.
     #[test]
     fn a_row_says_whether_its_item_is_essential() {
         struct Essential;
@@ -711,8 +694,6 @@ pub(crate) mod tests {
         assert!(!row.essential && !row.fails_surface(), "{row:?}");
     }
 
-    /// A surface that only reads runs on [`ReadOnly`]: a plan never asks it, and an apply
-    /// that reached a change could not make it, the record being refused first.
     #[test]
     fn a_read_only_journal_refuses_every_change() {
         let item = Scripted::new(vec![change()], Ok(()));
@@ -1075,7 +1056,6 @@ pub(crate) mod tests {
         assert!(rows[0].why.as_deref().unwrap().contains("disk full"));
     }
 
-    /// [`Named`], counting its probes.
     struct Counted {
         named: Named,
         probes: Arc<AtomicU32>,
@@ -1216,11 +1196,8 @@ pub(crate) mod tests {
         assert_eq!(probes.load(Ordering::SeqCst), 2);
     }
 
-    /// [`Scripted`] whose apply stands aside, and whose remedy for a change put off to
-    /// its next run is its own command.
     struct Aside(Scripted, StoodAside);
 
-    /// What [`Aside`] gives as its own remedy.
     fn retry() -> Remedy {
         Remedy::Command("aterm pkg install --default-set".into())
     }
@@ -1312,7 +1289,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// [`Scripted`] whose unreadable probe says the run lacked what the read needs.
     struct ReadAside(Scripted, Option<StoodAside>);
 
     impl Item for ReadAside {
@@ -1345,10 +1321,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A probe that could not read because the network is down stands aside: `Blocked`
-    /// with its line and kind (69), explained by the network, never applied, in a plan and
-    /// in an apply; what waits on it in an apply stands aside with it. Negative control:
-    /// the same unreadable probe with no aside is `Unknown` with its own reason.
     #[test]
     fn an_unreadable_probe_that_lacked_the_network_stands_aside_offline() {
         let offline = StoodAside::Offline("origin could not be reached".into());
@@ -1460,11 +1432,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// What the activation fixtures did, in order: `probe <id>`, `apply <id>`,
-    /// `pending <activation>`, `activate <activation>`, `journal <id>`, `row <id>`.
     type Events = Arc<std::sync::Mutex<Vec<String>>>;
 
-    /// An [`Activation`] that records what the engine asks of it.
     struct Relaunch {
         id: &'static str,
         events: Events,
@@ -1492,8 +1461,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// An item whose probes answer from a list (the last repeats), which records its
-    /// probes and applies, and which may share an activation.
     struct Writer {
         id: &'static str,
         probes: std::sync::Mutex<Vec<Probe>>,
@@ -1564,7 +1531,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A journal that records each line's id among the events, refusing those it names.
     struct Recorded {
         events: Events,
         refuses: &'static [&'static str],
@@ -1595,7 +1561,6 @@ pub(crate) mod tests {
         })
     }
 
-    /// Run `items` with a [`Recorded`] journal, recording each row as it is handed out.
     fn recorded(
         items: &[Box<dyn Item + '_>],
         mode: Mode,
@@ -1613,9 +1578,6 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    /// The Dock read what `init.desktop` and `init.dock` wrote, and was relaunched after
-    /// each; the one relaunched after the first could write what it read at its start
-    /// back over the second.
     #[test]
     fn items_sharing_an_activation_are_applied_before_it_runs_once_and_read_back_after_it() {
         let events = Events::default();
@@ -1673,9 +1635,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The activation is what makes the change felt, so an activation that fails, cannot
-    /// say what awaits it, or whose line the journal refuses (it is then not run) fails
-    /// every item it was to activate, with why; their read-back is not taken for success.
     #[test]
     fn an_activation_that_does_not_run_fails_every_item_it_was_to_activate() {
         for (pending, result, refuses, ran, refused) in [
@@ -1734,10 +1693,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Each item settles alone: an activation whose part for one item failed (a consumer
-    /// of only that item's keys did not start again) fails that item, with why, and reads
-    /// the others back, so one consumer's trouble does not unverify, and so roll back, a
-    /// change another consumer took.
     #[test]
     fn an_activation_that_fails_for_one_item_fails_only_that_item() {
         let events = Events::default();
@@ -1773,9 +1728,6 @@ pub(crate) mod tests {
         assert_eq!(events.iter().filter(|event| *event == "probe b").count(), 2);
     }
 
-    /// An activation runs only for a change that was applied: nothing pending, every item
-    /// already as wanted, or the one apply failing leaves it unrun and unjournaled; an
-    /// item whose apply fails is failed at once, and the others are still activated.
     #[test]
     fn an_activation_runs_only_when_an_applied_item_awaits_it_and_something_is_pending() {
         let events = Events::default();
@@ -1843,8 +1795,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// An item a run selects (`--only`, [`crate::select`]) keeps its activation: the two
-    /// selected items of one activation still apply first and run it once, after both.
     #[test]
     fn a_selected_item_keeps_its_activation() {
         let events = Events::default();
@@ -1881,8 +1831,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// An item that waits on an activated item runs once that item is read back: after
-    /// every item of its activation, whatever the composition order.
     #[test]
     fn an_item_waiting_on_an_activated_item_runs_after_its_whole_activation() {
         let events = Events::default();

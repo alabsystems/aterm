@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BEAT: the disk watch's sign that it is making progress (design
-//! `docs/DESIGN-disk-awareness-2026-10-17.md` §3.1).
+//! Disk watch progress beat.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,10 +21,8 @@ thread_local! {
     static QUIET: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Run `f` with this thread's beats silenced: every [`beat`] and [`tick`] it makes is no sign of
-/// the watch's progress and counts toward none.
+/// Run `f` with this thread's beats silenced ([`beat`], [`tick`]).
 pub fn quietly<T>(f: impl FnOnce() -> T) -> T {
-    /// The flag as it was, put back however `f` ends.
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -46,8 +43,7 @@ pub fn set_handler(handler: Handler) {
     *HANDLER.lock().unwrap_or_else(PoisonError::into_inner) = Some(handler);
 }
 
-/// Beat now: a step of a pass finished (a look began or ended, a directory was sized, a unit's step
-/// was taken).
+/// Beat now: a step of a pass finished.
 pub fn beat() {
     if quiet() {
         return;
@@ -73,8 +69,7 @@ pub fn tick(n: usize) {
     }
 }
 
-/// Whether counting `n` more entries past `before` crosses a multiple of
-/// [`EVERY`]: one beat for the count, however many it crosses.
+/// Whether counting `n` more entries past `before` crosses a multiple of [`EVERY`]: one beat.
 #[must_use]
 const fn crosses(before: usize, n: usize) -> bool {
     before.saturating_add(n) / EVERY > before / EVERY
@@ -84,9 +79,6 @@ const fn crosses(before: usize, n: usize) -> bool {
 mod tests {
     use super::*;
 
-    /// A beat every [`EVERY`] entries, wherever the counts fall: one entry
-    /// short of it is none, the entry that reaches it is one, and a count
-    /// that crosses several is one beat, not one per thousand.
     #[test]
     fn a_walk_beats_every_four_thousand_entries() {
         assert!(!crosses(0, EVERY - 1));
@@ -96,10 +88,6 @@ mod tests {
         assert!(!crosses(0, 0));
     }
 
-    /// A quiet thread's beats and entries reach no handler, however many it
-    /// counts, and its beats are heard again once the quiet call returns,
-    /// even one that panicked. Only this thread's beats are counted: other
-    /// tests walk on threads of their own.
     #[test]
     fn a_quiet_thread_never_beats() {
         static HEARD: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());

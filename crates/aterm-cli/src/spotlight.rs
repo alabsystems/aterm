@@ -7,10 +7,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// How long one Spotlight query may take (each answers in about a second).
 const QUERY: Duration = Duration::from_secs(10);
 
-/// Where a toolchain keeps its `rust-docs` pages, under the toolchain's folder.
 const RUST_DOCS: &str = "share/doc/rust/html/";
 
 /// What Spotlight's index holds under the home.
@@ -27,8 +25,7 @@ pub(crate) struct Spotlit {
 pub(crate) struct Pages {
     /// `rust-docs` pages (a toolchain's `share/doc/rust/html`), per toolchain.
     pub docs: Vec<(String, usize)>,
-    /// Every other page, per what it is: `the <component> component` whose manifest lists it, else
-    /// the folder it is in.
+    /// Every other page.
     pub other: Vec<(String, usize)>,
 }
 
@@ -94,7 +91,6 @@ impl Tally {
         }
     }
 
-    /// Most first, ties by name.
     fn most_first(mut self) -> Vec<(String, usize)> {
         self.0
             .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -135,8 +131,6 @@ pub(crate) fn pages<'a>(
     }
 }
 
-/// A toolchain's component manifests (`lib/rustlib/manifest-<component>`), each with its
-/// `file:`/`dir:` entries; unreadable ones are left out, so their files go by folder.
 fn read_manifests(toolchain: &Path) -> Vec<(String, String)> {
     let Ok(dir) = std::fs::read_dir(toolchain.join("lib/rustlib")) else {
         return Vec::new();
@@ -151,9 +145,6 @@ fn read_manifests(toolchain: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// A component's text is optional classification evidence, so a malformed
-/// manifest must not block the doctor or consume unbounded memory. Prove the
-/// opened handle regular, refusing final links and nonblocking on Unix.
 fn manifest_text(path: &Path) -> Option<String> {
     use std::io::Read as _;
     const LIMIT: u64 = 16 * 1024 * 1024;
@@ -192,7 +183,6 @@ pub(crate) fn installed_by(manifests: &[(String, String)], rest: &str) -> Option
     })
 }
 
-/// `mdfind -onlyin <dir>` for files named `pattern`: the paths, NUL-separated.
 fn mdfind(dir: &Path, pattern: &str) -> Result<String, String> {
     let mut cmd = aterm_uds::spawnfd::command("/usr/bin/mdfind");
     cmd.arg("-onlyin").arg(dir).arg("-0");
@@ -230,7 +220,6 @@ pub(crate) fn build_root(path: &str) -> String {
     parts[..parts.len().saturating_sub(1)].join("/")
 }
 
-/// `path` with the home written `~`.
 fn tilde(home: &Path, path: &str) -> String {
     let home = home.to_string_lossy();
     match path.strip_prefix(home.as_ref()) {
@@ -239,7 +228,6 @@ fn tilde(home: &Path, path: &str) -> String {
     }
 }
 
-/// The three largest of `counts`, `<name> <n>` each, then how many `more` there are.
 fn largest(counts: &[(String, usize)], more: &str) -> String {
     let mut top: Vec<String> = counts
         .iter()
@@ -342,9 +330,6 @@ mod tests {
         );
     }
 
-    /// A crate file is counted under the folder that would be deleted or renamed: a
-    /// checkout's `target` (every lane inside it), another repository's `build`, a
-    /// toolchain's sysroot, else the folder above its profile.
     #[test]
     fn a_crate_file_is_counted_under_the_folder_that_holds_its_build() {
         for (path, root) in [
@@ -374,9 +359,6 @@ mod tests {
         assert_eq!(tilde(Path::new("/U/a"), "/U/ab/x"), "/U/ab/x");
     }
 
-    /// Only a toolchain's `share/doc/rust/html` counts as `rust-docs`; any other page in
-    /// rustup's home is named by the component whose manifest lists it (a `file:` or
-    /// under a `dir:`), else by its folder.
     #[test]
     fn only_rust_docs_pages_count_as_rust_docs() {
         let root = "/U/a/.rustup";
@@ -439,9 +421,6 @@ mod tests {
         );
     }
 
-    /// No crate builds and no rust-docs is the one clean answer, which still names any
-    /// other indexed HTML; build folders name the three largest and how many more,
-    /// rust-docs name `aterm init`, and an unmeasured count says why.
     #[test]
     fn the_row_names_what_spotlight_holds_and_the_remedy() {
         let clean = Spotlit {

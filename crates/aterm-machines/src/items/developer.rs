@@ -115,8 +115,6 @@ pub fn pick(labels: &[Label]) -> Option<&Label> {
     newest(false).or_else(|| newest(true))
 }
 
-/// The version that follows the label's last `Xcode`, after a space or hyphen
-/// (`… for Xcode 26.4-26.4.1` is 26.4, `… for Xcode-15.3` is 15.3).
 fn version_after_xcode(label: &str) -> Vec<u32> {
     label
         .rsplit_once("Xcode")
@@ -124,7 +122,6 @@ fn version_after_xcode(label: &str) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// The dotted number `text` starts with.
 fn leading_version(text: &str) -> Vec<u32> {
     let digits: String = text
         .chars()
@@ -142,13 +139,10 @@ enum Planned {
     Select,
 }
 
-/// The one item.
 struct CommandLineTools {
     planned: Mutex<Option<Planned>>,
 }
 
-/// `xcode-select -p`: the selected directory, `None` when none is (exit 2), an error when
-/// it answered anything else.
 fn selected(sys: &dyn System) -> Result<Option<String>, String> {
     let cmd = Cmd::new(XCODE_SELECT).arg("-p");
     let ran = sys
@@ -168,7 +162,6 @@ fn selected(sys: &dyn System) -> Result<Option<String>, String> {
     Err(format!("{}: {}", cmd.display(), ran.describe()))
 }
 
-/// Whether the tools' `git` is on disk (`lstat`, never run).
 fn installed(sys: &dyn System) -> Result<bool, String> {
     match sys.stat(Path::new(CLT_GIT)) {
         Ok(_) => Ok(true),
@@ -177,7 +170,6 @@ fn installed(sys: &dyn System) -> Result<bool, String> {
     }
 }
 
-/// The receipt's version, for the report.
 fn receipt_version(sys: &dyn System) -> Option<String> {
     let ran = sys
         .run(&Cmd::new("/usr/sbin/pkgutil").arg(format!("--pkg-info={CLT_RECEIPT}")))
@@ -188,7 +180,6 @@ fn receipt_version(sys: &dyn System) -> Option<String> {
         .find_map(|l| l.strip_prefix("version: ").map(|v| v.trim().to_owned()))
 }
 
-/// Removes the marker this install successfully created, whatever the install did.
 struct Placeholder<'a> {
     sys: &'a dyn System,
 }
@@ -251,7 +242,6 @@ impl CommandLineTools {
     }
 }
 
-/// The lines `softwareupdate` prints before it says anything about the run.
 const SOFTWAREUPDATE_BOILERPLATE: [&str; 2] =
     ["Software Update Tool", "Finding available software"];
 
@@ -283,7 +273,6 @@ impl Item for CommandLineTools {
             }
             (true, None) => Planned::Select,
             (false, _) => {
-                // A plan must not promise a download from a catalog this Mac cannot reach.
                 let probe = Cmd::new("/usr/bin/curl")
                     .args([
                         "--disable",
@@ -375,8 +364,6 @@ mod tests {
         }
     }
 
-    /// `softwareupdate -l` in the macOS 27.0 VM, as root, with the placeholder in place.
-    /// Each line ends `\n\` so the Title lines keep their trailing `, `.
     const VM_LIST: &str = "Software Update Tool\n\
 \n\
 Finding available software\n\
@@ -387,9 +374,6 @@ Software Update found the following new or updated software:\n\
 \tTitle: macOS 27.0.1, Version: 27.0.1, Size: 3235867KiB, Recommended: YES, Action: restart, \n\
 ";
 
-    /// The hyphen form labels had before macOS 26. Not captured here (no 27 Mac lists it):
-    /// written in the layout of the capture above, with the labels Homebrew's install.sh
-    /// documents.
     const OLD_LIST: &str = "Software Update Tool\n\
 \n\
 Finding available software\n\
@@ -402,7 +386,6 @@ Software Update found the following new or updated software:\n\
 \tTitle: Command Line Tools beta 2 for Xcode, Version: 16.0, Size: 721000KiB, Recommended: YES, \n\
 ";
 
-    /// `xcode-select -p` in the VM with no tools.
     fn none_selected() -> Ran {
         Ran::exit(
             2,
@@ -421,7 +404,6 @@ Software Update found the following new or updated software:\n\
         }
     }
 
-    /// The catalog probe's answer in the VM (headers abridged): any HTTP answer is a route.
     fn reachable() -> Ran {
         Ran::ok("HTTP/1.1 404 Not Found\r\nServer: Apple\r\nContent-Length: 0\r\n\r\n")
     }
@@ -429,10 +411,8 @@ Software Update found the following new or updated software:\n\
     const CURL: &str =
         "/usr/bin/curl --disable --proto =https -sSI --max-time 20 https://swscan.apple.com/";
 
-    /// This Mac's receipt (macOS 27.0.1, read-only).
     const RECEIPT: &str = "package-id: com.apple.pkg.CLTools_Executables\nversion: 27.0.0.0.1788430756\nvolume: /\nlocation: /\ninstall-time: 1792019691\n";
 
-    /// `pkgutil --pkg-info=com.apple.pkg.CLTools_Executables` in the VM, no tools.
     fn no_receipt() -> Ran {
         Ran::exit(
             1,
@@ -442,7 +422,6 @@ Software Update found the following new or updated software:\n\
 
     const PKGUTIL: &str = "/usr/sbin/pkgutil --pkg-info=com.apple.pkg.CLTools_Executables";
 
-    /// `softwareupdate -i` in the VM, short of disk space: exit 0, the refusal on stderr.
     fn no_space() -> Ran {
         Ran {
             status: Some(0),
@@ -451,8 +430,6 @@ Software Update found the following new or updated software:\n\
         }
     }
 
-    /// `softwareupdate -i`'s standard output in the VM; a run that installs prints more,
-    /// but the receipt, not the words, is what the item reads.
     fn installed_quietly() -> Ran {
         Ran::ok("Software Update Tool\n\nFinding available software\n")
     }

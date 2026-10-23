@@ -7,8 +7,6 @@ use aterm_slog::{Actor, Close, Conf, Cursor, GapWhy, Log, Op, Out, SessionOut, S
 
 use crate::support::{at, realistic_log};
 
-/// A realistic session, closed: `turns` agent turns with their steps and
-/// commands, and the session's close.
 fn closed_session(turns: u64) -> Log {
     let mut log = realistic_log(turns);
     log.close_session(
@@ -19,10 +17,6 @@ fn closed_session(turns: u64) -> Log {
     log
 }
 
-/// A KEPT COPY READS AS THE LOG DID: from any cursor, the copy shows a
-/// subset of what the log showed past it, in the same seqs, and its gap
-/// counts exactly what it left out on top of what the log had already lost.
-/// The epoch, head and session records are the log's.
 #[test]
 fn a_kept_copy_reads_like_the_log_it_was_from_any_cursor() {
     let log = closed_session(300);
@@ -89,10 +83,6 @@ fn a_kept_copy_reads_like_the_log_it_was_from_any_cursor() {
     assert_eq!(kept.window().last().map(|r| r.op), Some(Op::Close));
 }
 
-/// ITS BOUNDS: the skeleton keeps to its bytes, the newest records first
-/// (the policy a live ring runs), and the summary (0 bytes) keeps only the
-/// session's open and close, with the whole of its accounting and fold.
-/// NEGATIVE CONTROL: a budget the log already fits leaves it whole.
 #[test]
 fn a_kept_copy_keeps_to_its_bytes_and_the_summary_to_its_session() {
     let log = closed_session(700);
@@ -132,10 +122,6 @@ fn a_kept_copy_keeps_to_its_bytes_and_the_summary_to_its_session() {
     );
 }
 
-/// A FENCED LOG'S COPY SHOWS EVERYTHING: an update's read fence holds a
-/// live log's readers back; the copy of a session that closed under it has
-/// no reader the fence protects, so it reads to the head. CONTROL: the
-/// fenced log itself reads only to its fence.
 #[test]
 fn a_fenced_logs_copy_reads_to_its_head() {
     let mut log = realistic_log(5);
@@ -152,15 +138,6 @@ fn a_fenced_logs_copy_reads_to_its_head() {
     assert_eq!(kept.reader_last_seq(), log.last_seq());
 }
 
-/// THE CLOSED SUMMARY IS AT MOST A KILOBYTE AND READS AS THE LOG DID: for
-/// closed sessions small and full, carried across updates (overlaps in its
-/// seqs) or not, the text keeps to `CLOSED_SUMMARY_BYTES`, and the log it
-/// reads back as answers every cursor as the closed log did, the gap
-/// counting exactly the records the summary left out: the same epoch,
-/// head, `oldest=`, session open and close, and the fold's totals and the
-/// session's close as they stood. NEGATIVE CONTROL: the summary the index
-/// kept before (the log evicted to its session's open and close, a `Log`
-/// with its fold) is several times that on the heap.
 #[test]
 fn a_closed_summary_keeps_to_a_kilobyte_and_reads_as_the_log_did() {
     use aterm_slog::CLOSED_SUMMARY_BYTES;

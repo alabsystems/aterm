@@ -64,12 +64,9 @@ pub const fn pad_to(pos: usize, align: usize) -> usize {
 }
 
 /// Encode `values` back to back starting at message offset `offset`.
-///
 /// # Errors
-///
-/// [`Error::Invalid`] for a value the specification forbids, among them
-/// values whose types no signature can carry (see [`decode`]) and an offset
-/// past the longest message.
+/// [`Error::Invalid`] for a value the specification forbids, among them values whose types no
+/// signature can carry (see [`decode`]) and an offset past the longest message.
 pub fn encode(values: &[Value], endian: Endian, offset: usize) -> Result<Vec<u8>> {
     check_types(
         &values.iter().map(Value::type_of).collect::<Vec<_>>(),
@@ -88,23 +85,17 @@ pub(crate) fn encode_checked(values: &[Value], endian: Endian, offset: usize) ->
 }
 
 /// Decode `bytes` as the sequence `types` starting at message offset `offset`.
-///
 /// # Errors
-///
-/// [`Error::Invalid`] for `types` no signature can carry (an empty struct, a
-/// dict keyed by a container, past the length or nesting limits of [`sig`])
-/// or an offset past the longest message; [`Error::Malformed`] unless `bytes`
-/// hold exactly one value of each type; [`Error::Unsupported`] for a variant
-/// holding a unix descriptor.
+/// [`Error::Invalid`] for `types` no signature can carry (an empty struct, a dict keyed by a
+/// container, past the length or nesting limits of [`sig`]) or an offset past the longest message;
+/// [`Error::Malformed`] unless `bytes` hold exactly one value of each type; [`Error::Unsupported`]
+/// for a variant holding a unix descriptor.
 pub fn decode(bytes: &[u8], types: &[Type], endian: Endian, offset: usize) -> Result<Vec<Value>> {
     check_types(types, offset)?;
     decode_checked(bytes, types, endian, offset)
 }
 
-/// Holds caller-built `types` to what a signature on the wire can say, with
-/// the signature parser as the one judge: [`Type`]'s constructors take any
-/// tree, and one the parser would refuse can stall the reader (an empty
-/// struct reads no bytes, so an array of them never ends).
+/// Holds caller-built `types` to what a signature on the wire can say ([`Type`]).
 fn check_types(types: &[Type], offset: usize) -> Result<()> {
     if offset > MAX_MESSAGE {
         return Err(Error::Invalid("offset past the longest message"));
@@ -236,8 +227,6 @@ impl Writer {
         self.depth = self.depth.saturating_sub(1);
     }
 
-    /// Writes an array: its length, the padding to its first element, and the
-    /// elements `each` writes.
     fn array(
         &mut self,
         elem_align: usize,
@@ -359,8 +348,6 @@ impl<'a> Reader<'a> {
     #[inline]
     pub(crate) fn align(&mut self, align: usize) -> Result<()> {
         let at = self.at();
-        // No value of a message starts past its end, and the bound is the
-        // one `pad_to` requires.
         if at > MAX_MESSAGE {
             return Err(Error::malformed("offset past the longest message", at));
         }
@@ -546,8 +533,6 @@ impl<'a> Reader<'a> {
             }
             Type::Struct(fields) => {
                 if fields.is_empty() {
-                    // Only a caller builds one (the parser refuses `()`), and
-                    // it reads nothing: refused as the writer refuses it.
                     return Err(Error::Invalid("empty struct"));
                 }
                 self.enter()?;

@@ -11,7 +11,7 @@ use aterm_time::Instant;
 
 use super::test_fixtures::{
     BUILD, LANE, Seen, attached, burst, cfg, draw, geom, hosted, hosted_mut, ms, replay_log,
-    run_lane,
+    run_lane, strand,
 };
 use super::{
     HOT_HAS_WAKE, MOMENTUM_QUEUE_CAP, MomentumCode, MomentumEvent, MomentumHost,
@@ -22,31 +22,7 @@ use crate::cursor_momentum::{MOMENTUM_GLOW_TAU_S, MomentumGlow};
 const TAU: f32 = MOMENTUM_GLOW_TAU_S;
 
 fn stranded(t0: Instant, dark: bool) -> (MomentumHost, Instant, (u16, u16)) {
-    let mut host = attached(t0, MomentumCode::DemoStrandedSettle);
-    let c = cfg(dark);
-    let mut seen = Vec::new();
-    let (last, cell) = burst(&mut host, t0, 24, &c, &mut seen);
-    let parked = run_lane(&mut host, last, LANE, cell, &c, &mut seen);
-    assert!(
-        parked.stranded,
-        "fixture: the demonstration fault parks a hot glow"
-    );
-    assert!(host.settling(), "fixture: parked while settling");
-    assert_eq!(
-        host.next_change_deadline(parked.at, LANE),
-        None,
-        "the fault names no wake"
-    );
-    match parked.last {
-        Some(Seen::Frame { frame, out, under }) => {
-            assert!(
-                frame.hot && out.len() + under.len() > 0,
-                "fixture: light on glass"
-            );
-        }
-        _ => panic!("fixture: the lane drew"),
-    }
-    (host, parked.at, cell)
+    strand(attached(t0, MomentumCode::DemoStrandedSettle), t0, dark)
 }
 
 #[test]
@@ -95,7 +71,7 @@ fn the_stranded_glow_is_repaired_live_and_fresh_keys_heat_and_clear_with_no_rese
         assert_eq!(w.candidate_code().name, "momentum-glow.shipped");
         assert_eq!(commit.revision.0, 1);
         assert!(commit.delivered.is_empty());
-        assert_eq!(host.aos_code(), MomentumCode::Shipped);
+        assert_eq!(host.aos_code(), Some(MomentumCode::Shipped));
         assert!(!host.aos_paused());
 
         assert!(host.settling(), "the accepted state is the settling glow");
@@ -290,7 +266,7 @@ fn keys_while_paused_are_delivered_once_to_the_old_pair_on_resume() {
         ]
     );
     assert!(!host.aos_paused());
-    assert_eq!(host.aos_code(), MomentumCode::DemoStrandedSettle);
+    assert_eq!(host.aos_code(), Some(MomentumCode::DemoStrandedSettle));
     assert!(
         host.aos_resume().is_empty(),
         "a second resume delivers nothing"
@@ -442,7 +418,7 @@ fn re_attaching_re_anchors_and_another_code_starts_afresh() {
     host.aos_attach(t0, MomentumCode::DemoStrandedSettle, BUILD, 3);
     let b = &hosted(&host).boundary;
     assert_eq!(b.checkpoint().map(|c| c.provenance().parent), Some(None));
-    assert_eq!(host.aos_code(), MomentumCode::DemoStrandedSettle);
+    assert_eq!(host.aos_code(), Some(MomentumCode::DemoStrandedSettle));
     let probe = t0 + ms(400);
     assert_eq!(
         hosted(&host).state().glow().value(probe, TAU),

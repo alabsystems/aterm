@@ -4,8 +4,7 @@
 
 //! Cursor style types for terminal emulation.
 
-/// Cursor style: the six DECSCUSR shapes plus frontend-only `Hidden` (DECTCEM off),
-/// `HollowBlock` (outline, for unfocused windows and vi normal mode) and `Bolt`.
+/// Cursor style: the six DECSCUSR shapes plus `Hidden`, `HollowBlock`, and `Bolt`.
 #[non_exhaustive]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -24,13 +23,11 @@ pub enum CursorStyle {
     BlinkingBar = 5,
     /// Steady bar - Ps = 6.
     SteadyBar = 6,
-    /// Hidden cursor. Not a DECSCUSR parameter: DECTCEM off or the frontend's "no cursor".
+    /// Hidden cursor.
     Hidden = 7,
-    /// Hollow block cursor (outline only). Not a DECSCUSR parameter.
+    /// Hollow block cursor (outline only).
     HollowBlock = 8,
-    /// Lightning-bolt cursor (a jagged silhouette filling the cell). Not a DECSCUSR parameter;
-    /// the frontend's override while the `laser` cursor glow owns a block cursor. Steady, and
-    /// paints over the glyph like the bar and underline shapes (no block cut-out).
+    /// Lightning-bolt cursor (a jagged silhouette filling the cell).
     Bolt = 9,
 }
 
@@ -50,9 +47,7 @@ impl CursorStyle {
         }
     }
 
-    /// Whether this style is one of the three blinking DECSCUSR shapes. The rendered blink
-    /// follows the style, so this is the answer `CSI ? 12 $ p` (DEC mode 12) reports. The
-    /// frontend-only shapes (`Hidden`, `HollowBlock`, `Bolt`) never blink.
+    /// Whether this style is one of the three blinking DECSCUSR shapes.
     #[inline]
     #[must_use]
     pub const fn blinks(self) -> bool {
@@ -62,8 +57,7 @@ impl CursorStyle {
         )
     }
 
-    /// The same shape with its blink bit set to `blink`: DEC mode 12 (`CSI ? 12 h` blinking,
-    /// `CSI ? 12 l` steady) never changes the shape. The frontend-only shapes pass through.
+    /// The same shape with its blink bit set to `blink`.
     #[inline]
     #[must_use]
     pub const fn with_blink(self, blink: bool) -> Self {

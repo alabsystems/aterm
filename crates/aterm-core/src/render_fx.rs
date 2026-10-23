@@ -569,6 +569,8 @@ pub struct FxContent {
     palette: Vec<FxInk>,
     extent: PxRect,
     class: FxClass,
+    /// [`Self::draws_opaque`], decided at seal.
+    opaque: bool,
 }
 
 /// [`fx_layer_builds`]'s counter.
@@ -628,6 +630,7 @@ impl Clone for FxContent {
             palette: self.palette.clone(),
             extent: self.extent,
             class: self.class,
+            opaque: self.opaque,
         }
     }
 }
@@ -640,6 +643,7 @@ impl Default for FxContent {
             palette: Vec::new(),
             extent: PxRect::EMPTY,
             class: FxClass::Empty,
+            opaque: true,
         }
     }
 }
@@ -744,6 +748,13 @@ impl FxContent {
         }
     }
 
+    /// Whether every pixel an item draws is opaque: rects, ramps and Index8 sprites over a palette whose every entry has alpha 255 (no RGBA sprite, whose texels this does not read). Under [`FxBlend::Exact`] such a pixel is its entry's colour whatever lies beneath (`over_premul` at `a = 255`), so a renderer may store it rather than blend it (the GPU's pass economy, `docs/DESIGN-card-engine-2026-10-19.md` §5 route (1)). An empty content is opaque.
+    #[must_use]
+    #[inline]
+    pub const fn draws_opaque(&self) -> bool {
+        self.opaque
+    }
+
     fn seal(&mut self, refuse: bool) {
         FX_LAYER_BUILDS.fetch_add(1, Ordering::Relaxed);
         count_here(1, 0);
@@ -769,6 +780,11 @@ impl FxContent {
         }
         self.extent = extent;
         self.class = class;
+        self.opaque = self.palette.iter().all(|ink| ink.alpha == 255)
+            && self.items.iter().all(|item| match item {
+                FxItem::Rect(_) | FxItem::Ramps(_) => true,
+                FxItem::Sprite(s) => s.art.texels == FxTexels::Index8,
+            });
     }
 
     /// The debug refusals of [`Self::edit`] for one item.
@@ -1147,6 +1163,66 @@ mod tests {
         assert!(content.items().is_empty());
         assert_eq!(content.extent(), PxRect::EMPTY);
         assert!(content.accepts(FxBlend::Exact) && content.accepts(FxBlend::Linear));
+    }
+
+    /// A content draws opaque exactly when every palette entry is alpha 255 and no item reads RGBA texels; the seal decides it again on every edit.
+    #[test]
+    fn a_content_draws_opaque_only_over_an_opaque_palette_without_rgba_texels() {
+        let rect = FxItem::Rect(FxRect {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 2,
+            ink: 0,
+        });
+        let ramps = FxItem::Ramps(FxRamps {
+            x: 0,
+            y: 2,
+            w: 4,
+            h: 1,
+            ink: 0,
+        });
+        let sprite = |art: Arc<FxArt>| {
+            FxItem::Sprite(FxSprite {
+                x: 0,
+                y: 0,
+                dw: 2,
+                dh: 2,
+                flip_x: false,
+                art,
+                ink: 0,
+                clip: PxRect::EVERYWHERE,
+            })
+        };
+        let index = sprite(index_art(2, 1, &[1, 2]));
+        let premul = sprite(Arc::new(
+            FxArt::new(1, 1, FxTexels::Rgba8Premul, vec![9, 9, 9, 255]).unwrap(),
+        ));
+        let opaque = vec![FxInk::over(0x0010_2030, 255); 2];
+        assert!(FxContent::default().draws_opaque(), "an empty content");
+        for items in [vec![rect], vec![ramps], vec![index.clone()]] {
+            assert!(FxContent::new(items.clone(), opaque.clone()).draws_opaque());
+            for (k, ink) in [FxInk::over(0x0010_2030, 254), FxInk::add(0x0010_2030)]
+                .into_iter()
+                .enumerate()
+            {
+                let mut palette = opaque.clone();
+                palette[k] = ink;
+                assert!(
+                    !FxContent::new_unchecked(items.clone(), palette).draws_opaque(),
+                    "{items:?} over entry {k} = {ink:?}"
+                );
+            }
+        }
+        assert!(
+            !FxContent::new(vec![premul], opaque.clone()).draws_opaque(),
+            "an RGBA sprite's texels are not read"
+        );
+        let mut content = FxContent::new(vec![index], opaque);
+        content.edit(|_, palette| palette[1].alpha = 128);
+        assert!(!content.draws_opaque(), "the edit reseals");
+        content.edit(|_, palette| palette[1].alpha = 255);
+        assert!(content.draws_opaque());
     }
 
     #[test]

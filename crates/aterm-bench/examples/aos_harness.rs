@@ -17,16 +17,14 @@ use aterm_aos::replay::{chain_link, empty_chain, replay};
 use aterm_aos::task::{Code, PausedClass, Schema, state_digest};
 use aterm_aos::wire::{Dec, Enc, WireFault};
 use aterm_aos::{ArtifactId, ArtifactKind, TaskIdentity};
+use aterm_effects::aos_momentum::lane::{self, Fnv, Glow, LaneRun};
 use aterm_effects::aos_momentum::{
     ConfigRecord, EventCounts, GeomRecord, MOMENTUM_MAX_EVENTS, MomentumCode, MomentumEvent,
     MomentumHost, MomentumSchema, MomentumState, MomentumTrace, PrebuiltMomentum,
     momentum_identity,
 };
 use aterm_effects::cursor_glow::Geom;
-use aterm_effects::cursor_momentum::{
-    MOMENTUM_GLOW_RADIUS_CELLS, MOMENTUM_GLOW_TAU_S, MomentumGlow, MomentumGlowConfig,
-    MomentumGlowFrame,
-};
+use aterm_effects::cursor_momentum::{MomentumGlow, MomentumGlowConfig};
 use aterm_render::GlowQuad;
 
 /// `System`, counted: every allocation, deallocation and reallocation, the bytes asked for,
@@ -595,81 +593,16 @@ fn dist(v: &mut [u64]) -> Obj {
 }
 
 /// The frame interval the host's lane runs at (the momentum fixtures' `LANE`).
-const LANE_NS: u64 = 16_666_667;
+const LANE_NS: u64 = lane::S0_FRAME_INTERVAL_NS;
 const LANE: Duration = Duration::from_nanos(LANE_NS);
-const TAU: f32 = MOMENTUM_GLOW_TAU_S;
+const TAU: f32 = lane::S0_TAU;
 /// The build id the attached paths name.
 const BUILD: &str = "aos-harness";
-const ROWS: u16 = 24;
-const COLS: u16 = 100;
-const KEYS_PER_BURST: u16 = 24;
-/// A full cool-down runs until the lane parks, then the desk is idle this long.
-const IDLE_AFTER_PARK_NS: u64 = 500_000_000;
-/// A cut cool-down ends this long after the burst's last key, still hot.
-const CUT_AFTER_NS: u64 = 400_000_000;
-/// A hang detector, not a budget: no segment of the story runs a minute of story time.
-const HANG_NS: u64 = 60_000_000_000;
 /// The capacity the host's quad vectors start with (other effects' share included).
 const QUADS: usize = 512;
-const RESET_TAG: u64 = 0x5245_5345_5400_0000;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Page {
-    Dark,
-    Light,
-}
-
-#[derive(Clone, Copy)]
-enum Cool {
-    /// Until the lane parks, then idle.
-    Park,
-    /// Cut by the next burst 400 ms after the last key.
-    Cut,
-}
-
-/// (page, keys per second, cool-down) for each burst of 24 keys, in order.
-const SEGMENTS: [(Page, u64, Cool); 8] = [
-    (Page::Dark, 3, Cool::Park),
-    (Page::Dark, 6, Cool::Cut),
-    (Page::Dark, 10, Cool::Park),
-    (Page::Dark, 16, Cool::Cut),
-    (Page::Light, 3, Cool::Park),
-    (Page::Light, 6, Cool::Cut),
-    (Page::Light, 10, Cool::Park),
-    (Page::Light, 16, Cool::Park),
-];
 
 fn geom() -> Geom {
-    Geom {
-        cw: 15,
-        ch: 28,
-        rows: usize::from(ROWS),
-        cols: usize::from(COLS),
-        origin_x: 24,
-        origin_y: 84,
-        win_w: 24 + COLS * 15 + 24,
-        win_h: 84 + ROWS * 28 + 24,
-        head: 80,
-    }
-}
-
-/// The host's config for a block caret at column `col` on `page`: the letters left of it
-/// are the row's glyph span.
-fn config(page: Page, col: u16) -> MomentumGlowConfig {
-    let dark = page == Page::Dark;
-    MomentumGlowConfig {
-        enabled: true,
-        intensity: 1.0,
-        tau_s: TAU,
-        radius_cells: MOMENTUM_GLOW_RADIUS_CELLS,
-        base: 0x0050_FA7B,
-        dark_theme: dark,
-        hue: 0x0050_FA7B,
-        theme_fg: if dark { 0x00C8_C8D2 } else { 0x0024_292F },
-        theme_bg: if dark { 0x0010_1016 } else { 0x00FF_FFFF },
-        block: true,
-        glyph_span: Some((0, i32::from(col))),
-    }
+    lane::s0_geom()
 }
 
 /// One host call, at a story offset (ns from the origin).
@@ -695,146 +628,6 @@ const TICK: usize = 2;
 const QUERY: usize = 3;
 const CALL_NAMES: [&str; 4] = ["key", "reset", "tick", "query"];
 
-/// What the host calls, in the shape every path takes. No `Deref` hides the host's own.
-trait Glow {
-    fn key(&mut self, now: Instant, tau: f32);
-    fn rest(&mut self);
-    fn frame(
-        &mut self,
-        cur: Option<(u16, u16)>,
-        now: Instant,
-        geom: Geom,
-        cfg: &MomentumGlowConfig,
-        out: &mut Vec<GlowQuad>,
-        under: &mut Vec<GlowQuad>,
-    ) -> MomentumGlowFrame;
-    fn active(&self) -> bool;
-    fn settles(&self) -> bool;
-    fn wake(&mut self, now: Instant, lane: Duration) -> Option<Instant>;
-}
-
-impl Glow for MomentumGlow {
-    #[inline]
-    fn key(&mut self, now: Instant, tau: f32) {
-        self.on_key(now, tau);
-    }
-
-    #[inline]
-    fn rest(&mut self) {
-        self.reset();
-    }
-
-    #[inline]
-    fn frame(
-        &mut self,
-        cur: Option<(u16, u16)>,
-        now: Instant,
-        geom: Geom,
-        cfg: &MomentumGlowConfig,
-        out: &mut Vec<GlowQuad>,
-        under: &mut Vec<GlowQuad>,
-    ) -> MomentumGlowFrame {
-        self.tick(cur, now, geom, cfg, out, under)
-    }
-
-    #[inline]
-    fn active(&self) -> bool {
-        self.is_active()
-    }
-
-    #[inline]
-    fn settles(&self) -> bool {
-        self.settling()
-    }
-
-    #[inline]
-    fn wake(&mut self, now: Instant, lane: Duration) -> Option<Instant> {
-        self.next_change_deadline(now, lane)
-    }
-}
-
-impl Glow for MomentumHost {
-    #[inline]
-    fn key(&mut self, now: Instant, tau: f32) {
-        self.on_key(now, tau);
-    }
-
-    #[inline]
-    fn rest(&mut self) {
-        self.reset();
-    }
-
-    #[inline]
-    fn frame(
-        &mut self,
-        cur: Option<(u16, u16)>,
-        now: Instant,
-        geom: Geom,
-        cfg: &MomentumGlowConfig,
-        out: &mut Vec<GlowQuad>,
-        under: &mut Vec<GlowQuad>,
-    ) -> MomentumGlowFrame {
-        self.tick(cur, now, geom, cfg, out, under)
-    }
-
-    #[inline]
-    fn active(&self) -> bool {
-        self.is_active()
-    }
-
-    #[inline]
-    fn settles(&self) -> bool {
-        self.settling()
-    }
-
-    #[inline]
-    fn wake(&mut self, now: Instant, lane: Duration) -> Option<Instant> {
-        self.next_change_deadline(now, lane)
-    }
-}
-
-/// FNV-1a over everything a path shows the host: frames, quads, wakes, resets.
-struct Fnv(u64);
-
-impl Fnv {
-    fn new() -> Fnv {
-        Fnv(0xcbf2_9ce4_8422_2325)
-    }
-
-    fn u64(&mut self, v: u64) {
-        for b in v.to_le_bytes() {
-            self.0 ^= u64::from(b);
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-
-    fn quads(&mut self, qs: &[GlowQuad]) {
-        self.u64(qs.len() as u64);
-        for q in qs {
-            self.u64(
-                u64::from(q.row)
-                    | (u64::from(q.x) << 16)
-                    | (u64::from(q.y) << 32)
-                    | (u64::from(q.w) << 48),
-            );
-            self.u64(u64::from(q.h) | (u64::from(q.color) << 16) | (u64::from(q.alpha) << 48));
-            self.u64(u64::from(q.color2) | (u64::from(q.alpha2) << 32));
-        }
-    }
-
-    fn frame(&mut self, f: MomentumGlowFrame, out: &[GlowQuad], under: &[GlowQuad]) {
-        self.u64(f.fill.map_or(u64::MAX, u64::from));
-        self.u64(u64::from(f.hot));
-        self.u64(f.fp);
-        self.quads(out);
-        self.quads(under);
-    }
-
-    fn wake(&mut self, at: Option<u64>) {
-        self.u64(at.unwrap_or(u64::MAX));
-    }
-}
-
 /// The story offset of `t`.
 fn offset(t0: Instant, t: Instant) -> u64 {
     nanos(t.saturating_duration_since(t0))
@@ -842,11 +635,6 @@ fn offset(t0: Instant, t: Instant) -> u64 {
 
 fn at(t0: Instant, offset: u64) -> Instant {
     t0 + Duration::from_nanos(offset)
-}
-
-/// The first frame boundary after `t`.
-fn vsync_after(t: u64) -> u64 {
-    (t / LANE_NS + 1) * LANE_NS
 }
 
 /// What one drive of the story did.
@@ -867,113 +655,24 @@ struct Shape {
     span_ns: u64,
 }
 
-/// Runs the story against `g` closed loop with the host's frame lane, recording each call.
-fn drive(
-    g: &mut impl Glow,
-    t0: Instant,
-    calls: &mut Vec<Call>,
-    fnv: &mut Fnv,
-) -> Result<Shape, String> {
-    let mut shape = Shape::default();
-    let (mut out, mut under) = (Vec::with_capacity(QUADS), Vec::with_capacity(QUADS));
-    let mut now = 0u64;
-    let mut next_frame: Option<u64> = None;
-    let (mut row, mut col) = (2u16, 4u16);
-    let mut page = Page::Dark;
-    for (seg_page, rate, cool) in SEGMENTS {
-        if seg_page != page {
-            g.rest();
-            calls.push(Call::Reset);
-            fnv.u64(RESET_TAG);
-            shape.resets += 1;
-            page = seg_page;
-            row = (row + 2) % ROWS;
-            col = 4;
-        }
-        let gap = 1_000_000_000 / rate;
-        let start = now;
-        let mut next_key = now;
-        let mut typed = 0u16;
-        let mut cut_at = None;
-        loop {
-            let key = if typed < KEYS_PER_BURST {
-                Some(next_key)
-            } else {
-                None
-            };
-            let (t, is_key) = match (key, next_frame) {
-                (Some(k), Some(f)) if f < k => (f, false),
-                (Some(k), _) => (k, true),
-                (None, Some(f)) => (f, false),
-                (None, None) => break,
-            };
-            if let Some(cut) = cut_at
-                && t > cut
-            {
-                now = cut;
-                break;
-            }
-            if t - start > HANG_NS {
-                return Err("the story's lane never parked (a minute of story time)".into());
-            }
-            now = t;
-            if is_key {
-                g.key(at(t0, t), TAU);
-                calls.push(Call::Key { at: t });
-                shape.keys += 1;
-                typed += 1;
-                next_key = t + gap;
-                if typed == KEYS_PER_BURST && matches!(cool, Cool::Cut) {
-                    cut_at = Some(t + CUT_AFTER_NS);
-                }
-                col += 1;
-                if col >= COLS - 1 {
-                    col = 4;
-                    row = (row + 1) % ROWS;
-                }
-                let v = vsync_after(t);
-                next_frame = Some(next_frame.map_or(v, |f| f.min(v)));
-                continue;
-            }
-            let cfg = config(page, col);
-            let cur = (row, col);
-            out.clear();
-            under.clear();
-            let fr = g.frame(Some(cur), at(t0, t), geom(), &cfg, &mut out, &mut under);
-            calls.push(Call::Tick { at: t, cur, cfg });
-            fnv.frame(fr, &out, &under);
-            shape.ticks += 1;
-            let n = (out.len() + under.len()) as u64;
-            shape.quads += n;
-            shape.max_quads = shape.max_quads.max(n);
-            next_frame = if g.active() {
-                Some(vsync_after(t))
-            } else if g.settles() {
-                let w = g.wake(at(t0, t), LANE).map(|w| offset(t0, w));
-                calls.push(Call::Query { at: t });
-                fnv.wake(w);
-                shape.queries += 1;
-                match w {
-                    Some(w) if w > t => Some(w),
-                    Some(w) => {
-                        return Err(format!("a wake at {w} ns, not after the frame at {t} ns"));
-                    }
-                    None => {
-                        shape.stranded += 1;
-                        None
-                    }
-                }
-            } else {
-                shape.parks += 1;
-                None
-            };
-        }
-        if matches!(cool, Cool::Park) {
-            now += IDLE_AFTER_PARK_NS;
-        }
+/// A library lane run's shape and digest, or why it stopped.
+fn ran(r: &LaneRun) -> Result<(Shape, u64), String> {
+    if let Some(fault) = r.fault() {
+        return Err(fault.to_string());
     }
-    shape.span_ns = now;
-    Ok(shape)
+    let c = r.counts();
+    let shape = Shape {
+        keys: c.keys,
+        resets: c.resets,
+        ticks: c.ticks,
+        queries: c.queries,
+        parks: c.parks,
+        stranded: c.stranded,
+        quads: c.quads,
+        max_quads: c.max_quads,
+        span_ns: r.span_ns(),
+    };
+    Ok((shape, r.fnv()))
 }
 
 /// The story, as calls and as the events an attached host records for them.
@@ -986,17 +685,21 @@ struct Story {
 }
 
 impl Story {
+    /// The frozen scenario `S0` run closed loop against the shipped engine by the library lane, the one the candidate evaluator scores.
     fn generate(t0: Instant) -> Result<Story, String> {
-        let mut calls = Vec::new();
-        let mut fnv = Fnv::new();
-        let shape = drive(&mut MomentumGlow::default(), t0, &mut calls, &mut fnv)?;
-        let events = calls.iter().map(event).collect();
+        let r = lane::run(&mut MomentumGlow::default(), &lane::s0(), t0);
+        let (shape, digest) = ran(&r)?;
+        let events = r.calls().to_vec();
+        let calls = events.iter().map(call).collect::<Result<Vec<_>, _>>()?;
+        if !calls.iter().map(event).eq(events.iter().copied()) {
+            return Err("the story's calls do not record as the lane's events".into());
+        }
         Ok(Story {
             t0,
             calls,
             events,
             shape,
-            digest: fnv.0,
+            digest,
         })
     }
 
@@ -1023,6 +726,34 @@ impl Story {
                 "cells 15x28 px, grid 24x100, origin (24,84), window 1548x780, head 80",
             )
             .u("frame_interval_ns", LANE_NS)
+    }
+}
+
+/// The story call the lane recorded as `e`: at the story's τ, geometry and frame interval.
+fn call(e: &MomentumEvent) -> Result<Call, String> {
+    let at = |t: i128| u64::try_from(t).map_err(|_| format!("a call at {t} ns, before the origin"));
+    match *e {
+        MomentumEvent::Key { at: t, tau_bits } if tau_bits == TAU.to_bits() => {
+            Ok(Call::Key { at: at(t)? })
+        }
+        MomentumEvent::Reset => Ok(Call::Reset),
+        MomentumEvent::Tick {
+            cur: Some(cur),
+            at: t,
+            geom: g,
+            cfg,
+        } if g == GeomRecord::from(&geom()) => Ok(Call::Tick {
+            at: at(t)?,
+            cur,
+            cfg: cfg.config(),
+        }),
+        MomentumEvent::Query {
+            at: t,
+            frame_interval,
+        } if frame_interval == LANE => Ok(Call::Query { at: at(t)? }),
+        ref other => Err(format!(
+            "the lane recorded a call outside the story: {other:?}"
+        )),
     }
 }
 
@@ -1135,7 +866,7 @@ fn play<M: Meter>(
             Call::Reset => {
                 meter.time(RESET, || g.rest());
                 if let Some(f) = fnv.as_deref_mut() {
-                    f.u64(RESET_TAG);
+                    f.reset();
                 }
             }
             Call::Tick { at: t, cur, cfg } => {
@@ -1328,11 +1059,11 @@ fn measure_paths(story: &Story, cal: &Calibration) -> Result<(Obj, MomentumHost)
     for kind in PathKind::ALL {
         let mut fnv = Fnv::new();
         let p = pass(kind, story, &mut bufs, &mut Free, Some(&mut fnv));
-        if fnv.0 != story.digest {
+        if fnv.value() != story.digest {
             return Err(format!(
                 "the {} path showed the host something else than the story: digest {:016x}, the story's {:016x}",
                 kind.name(),
-                fnv.0,
+                fnv.value(),
                 story.digest
             ));
         }
@@ -1940,12 +1671,10 @@ fn measure_stranded_repair(story: &Story, cal: &Calibration) -> Result<Obj, Stri
     for _ in 0..REPAIR_REPEATS {
         let mut h = MomentumHost::default();
         h.aos_attach(story.t0, MomentumCode::DemoStrandedSettle, BUILD, 1);
-        let mut calls = Vec::new();
-        let mut fnv = Fnv::new();
-        let shape = drive(&mut h, story.t0, &mut calls, &mut fnv)?;
+        let (shape, digest) = ran(&lane::drive_m3_story(&mut h, story.t0))?;
         match first {
-            None => first = Some((fnv.0, shape)),
-            Some((digest, s)) if digest == fnv.0 && s == shape => {}
+            None => first = Some((digest, shape)),
+            Some((d, s)) if d == digest && s == shape => {}
             Some(_) => return Err("the stranded trace differed between two drives".into()),
         }
         let r = repair(&mut h, at(story.t0, shape.span_ns))?;

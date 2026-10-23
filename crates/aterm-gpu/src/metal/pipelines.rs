@@ -141,11 +141,32 @@ pub(crate) fn build(
     device.new_render_pipeline(&desc)
 }
 
-/// Compiles `library` with [`ffi::CompileOptions::aterm_default`].
+/// Compiles `library` for `device` ([`super::shaders::source_for`]) with [`ffi::CompileOptions::aterm_default`]: [`compile_library_with`] over the device's own compiler.
 pub(crate) fn compile_library(device: &Device, library: ShaderLibrary) -> Result<Library, String> {
-    let opts = ffi::CompileOptions::aterm_default()
-        .ok_or_else(|| "MTLCompileOptions allocation failed".to_owned())?;
-    device.new_library_with_options(super::shaders::source(library), &opts)
+    compile_library_with(device, library, |src| {
+        let opts = ffi::CompileOptions::aterm_default()
+            .ok_or_else(|| "MTLCompileOptions allocation failed".to_owned())?;
+        device.new_library_with_options(src, &opts)
+    })
+}
+
+/// Compiles `library`'s source for `device` by `compile`. Where the device has framebuffer fetch and `cell.metal` does not compile with its fetch twins, the twins alone are lost: it compiles again without them ([`super::shaders::source`]), so the device reads as [`crate::FetchProbe::Unsupported`] and its Unorm-law light keeps its own passes, rather than the Metal arm failing to mint.
+pub(crate) fn compile_library_with(
+    device: &Device,
+    library: ShaderLibrary,
+    compile: impl Fn(&str) -> Result<Library, String>,
+) -> Result<Library, String> {
+    let fetch = super::fetch::capable(device);
+    match compile(&super::shaders::source_for(library, fetch)) {
+        Err(why) if fetch && matches!(library, ShaderLibrary::Cell) => {
+            crate::stderr_line!(
+                "aterm-gpu: cell.metal did not compile with its framebuffer-fetch twins \
+                 ({why}); Unorm-law light keeps its own passes"
+            );
+            compile(super::shaders::source(library))
+        }
+        compiled => compiled,
+    }
 }
 
 /// Compiles the shader library named by `spec`.
@@ -183,6 +204,17 @@ mod tests {
                         spec.label
                     )
                 });
+            }
+        }
+        if super::super::fetch::capable(&dev) {
+            for twin in crate::pipeline_table::FetchTwin::ALL {
+                build(
+                    &dev,
+                    &libs[&ShaderLibrary::Cell],
+                    &twin.spec(),
+                    PixelFormat::Bgra8Unorm,
+                )
+                .unwrap_or_else(|e| panic!("{twin:?}'s fetch twin failed to build: {e}"));
             }
         }
     }

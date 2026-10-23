@@ -327,7 +327,8 @@ pub(crate) fn control_fence(
 /// The usage line every malformed `key` body answers (the plain, guarded and both cross-session arms).
 pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>] [if=<re>] \
                                     [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] \
-                                    [if-supervisor=<holder>] [unread=ok] [<mod>+]<name|char> \
+                                    [if-supervisor=<holder>] [unread=ok] \
+                                    [act=approve|deny|answer] [<mod>+]<name|char> \
                                     [mods=<list>] [type=press|repeat|release] [base=<c>] — \
                                     names include enter tab esc space backspace delete insert \
                                     up down left right home end pageup pagedown f1..f35 \

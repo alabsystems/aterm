@@ -85,9 +85,7 @@ fn observe_pty(app: &mut App, wid: WindowId) -> [i32; 2] {
     pipe
 }
 
-/// Silence is EAGAIN on the observer pipe. A positive read means bytes reached the PTY; a zero
-/// read (EOF, impossible while the test holds the write end) means another thread closed a
-/// descriptor it no longer owned.
+/// Asserts `pipe` is silent (`EAGAIN`) and closes both ends.
 #[cfg(unix)]
 fn assert_pty_silent_and_close(pipe: [i32; 2]) {
     let mut bytes = [0u8; 64];
@@ -283,17 +281,13 @@ fn accepting_a_live_composer_match_does_not_write_to_its_program() {
     );
 }
 
-/// The group a shell leads in front of the fixture's PTY, and the group an
-/// agent leads. Neither leads a process or is a real fd: the fixture's master
-/// carries the number and the injected probe answers it (`named_front`).
+/// Synthetic foreground process-group IDs returned by the injected `fg_probe` (`named_front`).
 #[cfg(unix)]
 const SHELL_GROUP: i32 = i32::MAX - 1;
 #[cfg(unix)]
 const AGENT_GROUP: i32 = i32::MAX - 2;
 
-/// Put `program` in front of `wid`'s session: `fresh` is the PTY's foreground
-/// group as a fresh read finds it, `named` the group the status sweep last
-/// named `program` for (`status program=`).
+/// Sets `fresh` as the live foreground group and publishes `program` under `named`.
 #[cfg(unix)]
 fn named_front(app: &mut App, wid: WindowId, fresh: i32, named: i32, program: &str) {
     let session = app.front_terminal(wid).expect("terminal").session;
@@ -362,9 +356,7 @@ fn release(app: &mut App, wid: WindowId, code: KeyCode, letter: &str) {
     );
 }
 
-/// An App whose one session writes to an observer pipe: the press path and the
-/// press-owner's repeat and release path share that session's sink. The read end
-/// is nonblocking; the sink owns the write end.
+/// Creates a headless `App` whose session sink writes to a nonblocking pipe.
 #[cfg(unix)]
 fn app_observing_pty() -> (App, std::os::fd::OwnedFd) {
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -409,11 +401,7 @@ fn drain(reader: &std::os::fd::OwnedFd) -> Vec<u8> {
     }
 }
 
-/// At a bash prompt a bare Ctrl-R and Ctrl-S are readline's reverse-i-search
-/// and forward-search-history: 0x12 and 0x13 reach the program, a held Ctrl-R
-/// steps the search with each repeat, the press, repeat and release follow the
-/// press to the program under Kitty event-type reporting, and aterm's find bar
-/// never opens.
+/// At a shell prompt, bare Ctrl-R/Ctrl-S reach the PTY without opening the find bar.
 #[cfg(unix)]
 #[test]
 fn bare_ctrl_r_and_ctrl_s_at_a_shell_prompt_reach_the_shell_and_open_no_find_bar() {
@@ -446,10 +434,7 @@ fn bare_ctrl_r_and_ctrl_s_at_a_shell_prompt_reach_the_shell_and_open_no_find_bar
     assert_eq!(drain(&pty), [], "nothing more reached the program");
 }
 
-/// In an agent's composer a bare Ctrl-R stays aterm's find, as 10d208372f made
-/// it: the bar opens searching backward, a held Ctrl-R repeats the search
-/// locally, and Claude sees no press, repeat or release byte even under Kitty
-/// event-type reporting.
+/// In an agent composer, bare Ctrl-R opens backward find and emits no PTY bytes.
 #[cfg(unix)]
 #[test]
 fn bare_ctrl_r_in_an_agent_composer_opens_find_and_writes_nothing() {
@@ -488,10 +473,7 @@ fn bare_ctrl_r_in_an_agent_composer_opens_find_and_writes_nothing() {
     assert_eq!(drain(&pty), [], "nothing more reached the program");
 }
 
-/// Negative control on the agent signal: the status sweep still names Claude
-/// for the group that has left the front (it exited to its shell, which a
-/// fresh read finds in front). The publication speaks for nobody, so the shell
-/// gets its C-r and no find bar opens.
+/// Stale agent publication for a departed foreground group leaves Ctrl-R to the shell.
 #[cfg(unix)]
 #[test]
 fn a_departed_agents_publication_leaves_ctrl_r_to_the_shell_in_front() {
@@ -510,11 +492,8 @@ fn a_departed_agents_publication_leaves_ctrl_r_to_the_shell_in_front() {
     assert_eq!(drain(&pty), [], "nothing more reached the program");
 }
 
-/// Claude Code runs `$EDITOR` with inherited stdio and no group of its own,
-/// so while vim reads the keys the group in front and its leader's name are
-/// still Claude's. The agent has handed the terminal off
-/// (`SessionFactory::handed_terminal`, asked of the agent's group), so vim
-/// gets its C-r (redo) and its repeat, and no find bar opens.
+/// When the agent hands off the terminal (`SessionFactory::handed_terminal`),
+/// `$EDITOR` receives Ctrl-R.
 #[cfg(unix)]
 #[test]
 fn an_editor_the_agent_handed_the_terminal_to_gets_ctrl_r() {
@@ -557,9 +536,7 @@ fn any_program_but_an_agent_or_its_runtime_takes_the_terminal_off_it() {
     }
 }
 
-/// Where no foreground group can be read (a Windows ConPTY's probe always
-/// answers `-1`, and its sweep names no group) the agent publication stands
-/// alone: an identified agent keeps Ctrl-R for aterm's find, a shell does not.
+/// When `fg_probe` returns `-1` (e.g. ConPTY), the published program name decides alone.
 #[cfg(unix)]
 #[test]
 fn with_no_foreground_group_to_read_the_agent_publication_stands_alone() {
@@ -579,10 +556,7 @@ fn with_no_foreground_group_to_read_the_agent_publication_stands_alone() {
     );
 }
 
-/// At a shell aterm's find stays one chord away: Cmd-R on macOS, the seeded
-/// `ctrl+shift+f` elsewhere (`HARDCODED_SUPER_CHORDS` is off on Linux). Once
-/// the bar is open a bare Ctrl-R is its isearch-repeat, and the shell behind
-/// it sees nothing.
+/// Once the platform find chord opens the find bar at a shell, bare Ctrl-R steps it locally.
 #[cfg(unix)]
 #[test]
 fn at_a_shell_the_platform_find_chord_opens_find_and_ctrl_r_then_steps_it() {

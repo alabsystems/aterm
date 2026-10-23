@@ -204,10 +204,7 @@ mod tests {
         ));
     }
 
-    /// Muse Code's and the Antigravity app's own data are on the list: Muse
-    /// Code 1.4.10 opened the account's `session-names.db` with HOME pointed
-    /// at the scratch. NEGATIVE CONTROLS: a sibling whose name only begins
-    /// like a subpath entry, and the rest of `.local/share`, are not.
+    /// Muse Code and Antigravity data paths are protected; sibling prefixes are not.
     #[test]
     fn muse_code_s_and_antigravity_s_own_data_are_on_the_list() {
         let h = "/Users//o";
@@ -240,11 +237,7 @@ mod tests {
         }
     }
 
-    /// aterm's own secrets are on the list: `~/.aterm` holds the machine key
-    /// (`machine.key`) and a release credential (`release-credentials.toml`),
-    /// and `~/.secrets` is a common home for tokens. NEGATIVE CONTROLS:
-    /// siblings whose names only begin like them, and aterm's install-time
-    /// scratch beside the home, are not.
+    /// `~/.aterm` and `~/.secrets` are protected; sibling prefixes are not.
     #[test]
     fn aterm_s_own_secrets_and_a_secrets_dir_are_on_the_list() {
         let h = "/Users//o";

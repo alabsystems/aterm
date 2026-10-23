@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Read-only upgrade watch ([`super::watch_at`], [`super::Opts::dry_run`], [`look_word`]).
-//! Applies hands-free [`St::for_target`], [`St::hold_clock`], and [`super::rearm`] updates.
 
 use std::path::PathBuf;
 
@@ -129,7 +128,6 @@ pub(super) fn watch_in(
     at_second(now, || look_at(opts, tab, how, now, read))
 }
 
-/// [`watch_in`]'s look, on a thread whose [`now_s`] reads `now`.
 fn look_at(
     opts: &Opts,
     tab: &str,
@@ -221,7 +219,6 @@ fn look_at(
         if ours {
             changed = sanctioned(opts, &r, &name, &mut st, limit_until, now);
             if st.tab.is_empty() {
-                // The read proved it here; a visit records it the same way.
                 tab.clone_into(&mut st.tab);
             }
         }
@@ -265,7 +262,6 @@ fn look_at(
     out
 }
 
-/// Whether the watch reads `agent`'s record as Claude Code's ([`look_word`], [`sanctioned`]).
 const fn reads_transcript(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
@@ -276,7 +272,7 @@ const fn reads_transcript(agent: upgrade::Agent) -> bool {
     }
 }
 
-/// Word for `step` ([`upgrade::wait_word`], [`rounds_step`], [`AT_POINT`], [`upgrade::NEXT_POINT`])
+/// Status word for `step` ([`upgrade::wait_word`], [`rounds_step`], or [`AT_POINT`]).
 pub(super) fn look_word(step: &str, claude: bool, status: impl FnOnce() -> String) -> String {
     if let Some(why) = step.strip_prefix("wait:") {
         return upgrade::wait_word(why, &status());
@@ -290,7 +286,6 @@ pub(super) fn look_word(step: &str, claude: bool, status: impl FnOnce() -> Strin
     )
 }
 
-/// The upgrade records of tab `tab` still owed a step ([`due_by`]), by file name.
 fn tab_records(opts: &Opts, tab: &str) -> Vec<(String, St)> {
     let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
         return Vec::new();
@@ -313,7 +308,6 @@ fn tab_records(opts: &Opts, tab: &str) -> Vec<(String, St)> {
     out
 }
 
-/// Claude's own status of `session` from its session file under `records`.
 fn status_of(records: &super::Records, session: Option<&str>) -> String {
     let Some(session) = session else {
         return String::new();
@@ -325,7 +319,6 @@ fn status_of(records: &super::Records, session: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-/// Parse a `<version>(<source>)` retarget candidate for [`St::for_target`].
 fn target_of(to: &str) -> Option<Candidate> {
     let (version, source) = to.strip_suffix(')')?.split_once('(')?;
     let source = match source {
@@ -340,7 +333,6 @@ fn target_of(to: &str) -> Option<Candidate> {
     })
 }
 
-/// The three sanctioned changes to `st` (the record the read `r` was about) ([`St::for_target`]).
 fn sanctioned(
     opts: &Opts,
     r: &Report,

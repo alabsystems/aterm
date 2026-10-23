@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pure logic for Gemini CLI (`@google/gemini-cli`) exit classification, session witnessing,
-//! pre-resume validation, and relaunch command construction.
+//! Gemini CLI (`@google/gemini-cli`) exit classification, session witnessing, and relaunch argv.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -87,7 +86,6 @@ enum Fate {
     OneShot,
 }
 
-/// Gemini CLI flag table mapping each flag name (without dashes) to its arity and relaunch fate.
 const FLAGS: &[(&str, Arity, Fate)] = &[
     ("acp", Arity::Switch, Fate::OneShot),
     ("accept-raw-output-risk", Arity::Switch, Fate::Keep),
@@ -336,8 +334,7 @@ pub fn is_session_uuid(s: &str) -> bool {
     s.len() == 36 && super::codex_rollout::is_thread_id(s)
 }
 
-/// Resolve the `.gemini` directory from `GEMINI_CLI_HOME`, `HOME`, or `fallback` (returning `None`
-/// if `GEMINI_CLI_HOME` is relative).
+/// Resolve the `.gemini` directory from `GEMINI_CLI_HOME`, `HOME`, or `fallback`.
 #[must_use]
 pub fn gemini_dir(cli_home: Option<&str>, home: Option<&str>, fallback: &Path) -> Option<PathBuf> {
     match cli_home.filter(|h| !h.is_empty()) {
@@ -653,8 +650,7 @@ impl Scan {
     }
 }
 
-/// Whether every `$set` session switch onto `session` across `files` is accounted for by a
-/// `--resume` header.
+/// Whether every `$set` switch onto `session` across `files` has a matching `--resume` header.
 #[must_use]
 pub fn resumes_account_for_switches(files: &[ChatsFile<'_>], session: &str) -> bool {
     let mine: Vec<&ChatsFile<'_>> = files
@@ -772,8 +768,7 @@ pub const START_READ_SLACK_MS: u64 = if cfg!(target_vendor = "apple") {
 /// Maximum delay after process start within which a process's own session header is expected.
 pub const LATE_HEADER_MS: u64 = START_WINDOW_MS + START_READ_SLACK_MS;
 
-/// Identify the session UUID owned by a Gemini CLI process started at `start_ms`, or return a
-/// [`NoWitness`] refusal if attribution is ambiguous.
+/// Identify the session UUID owned by a Gemini CLI process started at `start_ms`.
 pub fn witness(
     files: &[ChatsFile<'_>],
     start_ms: u64,
@@ -856,8 +851,7 @@ impl Precheck {
     }
 }
 
-/// Verify that the file Gemini CLI would select for `session` contains all turns recorded across
-/// every file for that session.
+/// Verify that the file Gemini CLI selects for `session` holds all turns across all its files.
 #[must_use]
 pub fn precheck(files: &[ChatsFile<'_>], session: &str) -> Precheck {
     let mut sorted: Vec<&ChatsFile<'_>> = files
@@ -924,8 +918,7 @@ pub enum ExitKind {
     Crashed,
     /// Any other exit status, not relaunched.
     Unwitnessed,
-    /// Exit `42` when an in-app restart re-ran `--session-id <uuid>` against the session file its
-    /// own first run created ([`restart_id`]).
+    /// Exit `42` when an in-app restart re-ran `--session-id <uuid>` against its own first file.
     Restarted,
 }
 
@@ -984,8 +977,7 @@ pub fn line_exit_kind(status: i64) -> ExitKind {
     }
 }
 
-/// Return the `--session-id <uuid>` from `argv` when `status` is [`FATAL_INPUT_ERROR`] (`42`) and
-/// no resume or session-file flag is present.
+/// Return `--session-id <uuid>` from `argv` when `status` is [`FATAL_INPUT_ERROR`] (`42`).
 #[must_use]
 pub fn restart_id(status: i64, argv: &[String]) -> Option<&str> {
     let names_another = argv
@@ -1000,8 +992,7 @@ pub fn restart_id(status: i64, argv: &[String]) -> Option<&str> {
     flag_value(argv, &[FLAG_SESSION_ID]).filter(|id| is_session_uuid(id))
 }
 
-/// Collect the environment variables (`GEMINI_CLI_HOME`, non-default `HOME`, and
-/// `GEMINI_CLI_TRUSTED_FOLDERS_PATH`) that a relaunch command must preserve.
+/// Collect `GEMINI_CLI_HOME`, non-default `HOME`, and `GEMINI_CLI_TRUSTED_FOLDERS_PATH`.
 #[must_use]
 pub fn relaunch_env<'a>(
     get: impl Fn(&str) -> Option<&'a str>,
@@ -1059,8 +1050,7 @@ pub fn trusted_folders_of_words(words: &[String]) -> Option<&str> {
         .filter(|value| Path::new(value).has_root())
 }
 
-/// Build the shell command shown to a user to manually resume `session` in `cwd`, or `None` if not
-/// safely quotable.
+/// Build the shell command shown to manually resume `session` in `root`, if safely quotable.
 #[must_use]
 pub fn told_line(session: &str, env: &[(String, String)], root: &str) -> Option<String> {
     if !is_session_uuid(session) {

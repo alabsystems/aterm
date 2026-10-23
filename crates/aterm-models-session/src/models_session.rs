@@ -5,8 +5,7 @@
 
 use aterm_spec::derive::*;
 
-/// Momentum wait model: accept a satisfied floor, time out an unmet reading past the backstop,
-/// or arm one crossing (`Buggy = 1` re-parks an expired reading).
+/// Momentum wait model (`Buggy = 1` re-parks an expired reading).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn momentum_wait_read_model() -> Model {
@@ -45,8 +44,7 @@ pub fn momentum_wait_read_model() -> Model {
     }
 }
 
-/// Spawn-time locale model: `resolve_spawn_locale` ensures the child runs under a UTF-8
-/// `LC_CTYPE` regardless of inherited locale (`Buggy = 1` fixes only when all vars are unset).
+/// Spawn-time UTF-8 `LC_CTYPE` locale model (`Buggy = 1` fixes only when all vars are unset).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn spawn_locale_model() -> Model {
@@ -128,8 +126,7 @@ pub fn spawn_locale_model() -> Model {
     }
 }
 
-/// Dynamic software update quiescence model: an update applies only when no request is in flight
-/// (`Buggy = 1` applies mid-flight and sets `torn`).
+/// Dynamic software update quiescence model (`Buggy = 1` applies mid-flight and sets `torn`).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn dsu_quiescence_model() -> Model {
@@ -218,8 +215,7 @@ pub fn dsu_quiescence_model() -> Model {
     }
 }
 
-/// Seamless re-exec fd-handoff model: every prepared PTY master is either re-adopted or closed
-/// (`Buggy = 1` drops a failed adoption unclosed and sets `leaked`).
+/// Seamless re-exec fd-handoff model (`Buggy = 1` drops a failed adoption unclosed).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn fd_handoff_no_leak_model() -> Model {
@@ -293,9 +289,7 @@ pub fn fd_handoff_no_leak_model() -> Model {
     }
 }
 
-/// Render snapshot sequence model: `ReadImage` captures `snap_seq := epoch` atomically so post-read
-/// writes do not tear the snapshot and `snap_seq <= epoch` (`Buggy = 1` stamps one ahead and leaks
-/// subsequent writes).
+/// Render snapshot sequence model (`Buggy = 1` stamps one ahead and leaks subsequent writes).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn read_image_seq_model() -> Model {
@@ -328,8 +322,7 @@ pub fn read_image_seq_model() -> Model {
     }
 }
 
-/// `SinkWriter` PTY master fd lifecycle model: the fd closes only when the last `Arc<SinkWriter>`
-/// clone drops, preventing use-after-close (`Buggy = 1` closes on every drop).
+/// `SinkWriter` PTY master fd lifecycle model (`Buggy = 1` closes on every drop).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
@@ -406,9 +399,7 @@ pub fn fd_lifecycle_model() -> Model {
     }
 }
 
-/// Tier residency model: `Push` spills an evicted event to the warm tier atomically and `Demote`
-/// moves warm to cold, so every recorded seq up to `seq` remains live or resident (`Buggy = 1`
-/// drops on eviction without spilling).
+/// Tier residency model (`Buggy = 1` drops on eviction without spilling).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn tier_residency_model() -> Model {
@@ -530,8 +521,7 @@ pub fn tier_residency_model() -> Model {
     }
 }
 
-/// Recording hydration faithfulness model: seeding `replay` from keyframe `KF` and folding forward
-/// step-by-step via XOR parity reproduces `live` (`Buggy = 1` drops the payload at `DROPAT`).
+/// Recording hydration faithfulness model (`Buggy = 1` drops the payload at `DROPAT`).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn recording_model() -> Model {
@@ -660,8 +650,7 @@ pub fn recording_model() -> Model {
     }
 }
 
-/// Streaming write coalescing model: bulk and single-byte `process_at` lanes agree after every
-/// element (`Buggy = 1` drops a per-element fixup at `SKIPAT`).
+/// Streaming write coalescing model (`Buggy = 1` drops a per-element fixup at `SKIPAT`).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn coalesce_model() -> Model {
     aterm_spec::ty_model! {
@@ -680,9 +669,7 @@ pub fn coalesce_model() -> Model {
     }
 }
 
-/// Multi-window routing model: tracks `win_count`, `frontmost`, monotonic `next_id`, and `exited`
-/// across window creation, close, and session raise (`Buggy = 1` skips exit on last close, skips
-/// frontmost re-point, and reads `next_id` after bumping).
+/// Multi-window routing model across window creation, close, and session raise.
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn window_routing_model() -> Model {
@@ -836,8 +823,7 @@ pub fn window_routing_model() -> Model {
     }
 }
 
-/// Control router dispatch completeness model: every forwardable verb class (`vc <= 3`) aimed at a
-/// remote child is forwarded rather than denied locally (`Buggy = 1` drops `vc = 2`).
+/// Control router dispatch completeness model (`Buggy = 1` drops `vc = 2`).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn dispatch_complete_model() -> Model {
@@ -857,8 +843,7 @@ pub fn dispatch_complete_model() -> Model {
     })
 }
 
-/// Cross-process relay teardown model: `Teardown` closes both read halves so blocked reader pumps
-/// observe EOF and join (`Buggy = 1` shuts only `Write`, leaving read halves open).
+/// Cross-process relay teardown model (`Buggy = 1` shuts only `Write`).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn relay_teardown_model() -> Model {
@@ -871,8 +856,7 @@ pub fn relay_teardown_model() -> Model {
     })
 }
 
-/// Child proxy registry lifecycle model: retained edge-token files are retired on session close so
-/// `registered <= live` (`Buggy = 1` drops a session without retiring its file).
+/// Child proxy registry lifecycle model (`Buggy = 1` drops a session without retiring its file).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn proxy_registry_model() -> Model {
@@ -888,9 +872,7 @@ pub fn proxy_registry_model() -> Model {
     })
 }
 
-/// Cross-process forward handshake liveness model: the server drains already-buffered bytes before
-/// reading more so the waiting client is always served (`Buggy = 1` demands a fresh read first and
-/// deadlocks).
+/// Cross-process forward handshake liveness model (`Buggy = 1` demands a fresh read first).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn forward_handshake_model() -> Model {
@@ -907,9 +889,7 @@ pub fn forward_handshake_model() -> Model {
     })
 }
 
-/// TLS relay startup liveness model: `DrainBuffered` forwards application bytes decrypted during
-/// the TLS handshake without waiting for another network read (`Buggy = 1` deadlocks waiting for a
-/// fresh record).
+/// TLS relay startup liveness model (`Buggy = 1` waits for a fresh record).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn tls_buffered_relay_model() -> Model {
@@ -926,8 +906,7 @@ pub fn tls_buffered_relay_model() -> Model {
     })
 }
 
-/// Edge authorization soundness model: a presented token is permitted only when table membership,
-/// destination, operation, and launch nonce all match (`Buggy = 1` omits the destination check).
+/// Edge authorization soundness model (`Buggy = 1` omits the destination check).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn authorize_soundness_model() -> Model {
@@ -942,8 +921,7 @@ pub fn authorize_soundness_model() -> Model {
     })
 }
 
-/// Cross-process forwarding authority model: forwarding is permitted only for owner-class scope,
-/// preventing transitive authority across session edges (`Buggy = 1` waives the owner guard).
+/// Cross-process forwarding authority model (`Buggy = 1` waives the owner guard).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn no_transitive_authority_model() -> Model {
@@ -958,9 +936,7 @@ pub fn no_transitive_authority_model() -> Model {
     })
 }
 
-/// Session id claim exclusivity model: at most one live instance holds `@<sid>` across normal
-/// launches, exits, and seamless handoffs via the claim lock, live graph entry, and successor
-/// marker.
+/// Session id claim exclusivity model across launches, exits, and seamless handoffs.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_id_claim_model() -> Model {
@@ -1019,9 +995,7 @@ pub fn session_id_claim_model() -> Model {
     }
 }
 
-/// Handoff address ownership model: a seamless-update candidate publishes carried session entries
-/// only after commit, and the predecessor exempts its own registered candidate while refusing live
-/// strangers.
+/// Handoff address ownership model for carried session entries.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn handoff_address_owner_model() -> Model {

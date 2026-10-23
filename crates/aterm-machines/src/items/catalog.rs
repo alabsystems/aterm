@@ -35,7 +35,6 @@ pub struct Table {
 }
 
 impl Table {
-    /// The table's setting for the preset `name`.
     fn preset(&self, name: &str) -> Option<bool> {
         match name {
             "siri" => self.siri,
@@ -60,15 +59,12 @@ pub enum Lit {
     Int(i64),
     /// `-string`.
     Str(&'static str),
-    /// Notification Center's widget list with no widget: the list as it is, less every
-    /// widget and their desktop placement, the fields it does not know kept
-    /// ([`widgets::cleared`]). Nothing turns it back on: a row with this `off` has no `on`.
+    /// Notification Center's widget list with no widget ([`widgets::cleared`]).
     NoWidgets,
 }
 
 impl Lit {
-    /// As a property-list value: for [`Lit::NoWidgets`], the list written where there was
-    /// none.
+    /// As a property-list value ([`Lit::NoWidgets`]).
     #[must_use]
     pub fn value(self) -> PValue {
         match self {
@@ -83,7 +79,7 @@ impl Lit {
     }
 }
 
-/// One compiled row: one key of one preset.
+/// One compiled row.
 #[derive(Debug, Clone, Copy)]
 pub struct CatalogRow {
     /// The `[consumer]` field that turns it on or off.
@@ -303,9 +299,7 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     expand_with(table, ctx, &Relaunches::default())
 }
 
-/// [`expand`], each process a row restarts relaunched once per account with every other
-/// row of the run in `relaunches` that restarts it ([`Pref::shared`]).
-///
+/// [`expand`] with shared relaunches across `relaunches` ([`Pref::shared`]).
 /// # Errors
 /// As [`expand`].
 pub fn expand_with(
@@ -368,9 +362,7 @@ pub fn expand_with(
     Ok(items)
 }
 
-/// The items of a [`Lit::NoWidgets`] row, one per user: each list cleared, or, for a run
-/// whose process holds no known Full Disk Access, a row that names the grant and touches
-/// nothing ([`super::defaults::withheld`]).
+/// The items of a [`Lit::NoWidgets`] row, one per user ([`super::defaults::withheld`]).
 fn no_widgets(row: &CatalogRow, ctx: &Ctx, relaunches: &Relaunches) -> Vec<Box<dyn Item>> {
     ctx.users
         .iter()
@@ -464,11 +456,6 @@ mod tests {
         assert_eq!(items[17].effect(), Effect::Restart);
     }
 
-    /// The row that clears Notification Center's widgets is the key's one owner, which
-    /// `aterm init` builds its row from too: with the grant it clears the list, keeping the
-    /// fields it does not know, and relaunches Notification Center once, after which the
-    /// row reads back clear; without it the row touches nothing and names the grant. `true`
-    /// leaves the list, which no write puts back, to the person.
     #[test]
     fn the_notification_center_row_clears_the_list_only_with_the_grant() {
         use crate::items::defaults::tests::{Session, session_of};

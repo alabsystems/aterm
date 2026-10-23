@@ -135,7 +135,7 @@ pub struct Scene<'a> {
     pub d_age: &'a HashMap<u32, u64>,
     /// How a process outside this job counts (its job's standing).
     pub elsewhere: &'a HashMap<u32, Standing>,
-    /// Whether a process macOS's program check holds names its wait ([`WaitName::ProgramCheck`]); off only under the conformance test's `Fault::IgnoreProgramCheck`.
+    /// Whether macOS program-check holds are reported as [`WaitName::ProgramCheck`].
     pub program_check: bool,
 }
 
@@ -195,7 +195,6 @@ pub fn name_job(
     best.unwrap_or_else(|| Wait::bare(WaitName::Unnamed, Standing::Capped, first.0, &first.1))
 }
 
-/// The Tier A wait of one process, `None` when nothing names it.
 fn leaf_wait(
     scene: &Scene<'_>,
     consumer: Option<u32>,
@@ -347,8 +346,6 @@ fn leaf_wait(
     None
 }
 
-/// The pid holding the other end of a pipe: `peer` is that end's handle,
-/// `this` this end's (Linux: both the inode, told apart by `write_end`).
 fn holder(scene: &Scene<'_>, peer: u64, this: u64, want_write: bool, not: u32) -> Option<u32> {
     let mut found: Option<u32> = None;
     for (pid, p) in scene.procs {
@@ -377,8 +374,6 @@ fn holder(scene: &Scene<'_>, peer: u64, this: u64, want_write: bool, not: u32) -
     found
 }
 
-/// Whether the read end paired with a write end (`peer` its handle) is full
-/// with a writer waiting: Darwin flags `PIPE_WANTW` on the reader's buffer.
 fn reader_end_full(scene: &Scene<'_>, peer: u64, this: u64, _not: u32) -> bool {
     scene.procs.values().any(|p| {
         p.fds.as_deref().unwrap_or(&[]).iter().any(|f| {
@@ -391,8 +386,6 @@ fn reader_end_full(scene: &Scene<'_>, peer: u64, this: u64, _not: u32) -> bool {
     })
 }
 
-/// How a pipe's peer counts: its own wait (followed up to [`PEER_DEPTH`]),
-/// or its job's standing when it is in another job; unknown is capped.
 fn peer_standing(
     scene: &Scene<'_>,
     consumer: Option<u32>,
@@ -432,8 +425,6 @@ fn listen_port(fds: &[Fd], ident: u64) -> Option<u16> {
     })
 }
 
-/// An open connection with nothing queued to read: its peer, state and the
-/// bytes queued (0).
 fn idle_connection(f: &Fd) -> Option<(Option<SocketAddr>, TcpState, u64)> {
     match &f.kind {
         FdKind::Tcp {
@@ -446,10 +437,6 @@ fn idle_connection(f: &Fd) -> Option<(Option<SocketAddr>, TcpState, u64)> {
     }
 }
 
-/// The connection an event queue waits on when every entry it holds is a
-/// read or a write on an idle connection (`connect` waits for writable):
-/// then the connection is the wait. `None` when the queue waits for
-/// anything else too.
 fn queue_on_connections(
     fds: &[Fd],
     knotes: &[Knote],

@@ -125,7 +125,16 @@ unsafe fn send_event_body(app: Id, cmd: Sel, event: Id) {
 /// Override the `-sendEvent:` method on the given application's class.
 ///
 /// # Panics
-/// TWICE, for two different reasons.
+/// TWICE, for two different reasons:
+/// - `SEND_EVENT.install` answers an [`aterm_objc::SwizzleError`]: the swizzle is refused (no
+///   class in `app`'s chain implements `-sendEvent:`; its row's encoding is missing or differs
+///   from `SendEvent`'s; this site is installed on another row, or another thread claimed it
+///   first; a third party swizzled the row since an earlier install; or the row holds
+///   `send_event` with no original to chain to), or, on `Raced`, it landed with a third party
+///   inside its window;
+/// - the row's owner is not `NSApplication` (the `assert_eq!`): `app`'s class, or a class
+///   between it and `NSApplication`, overrides `-sendEvent:`, so the swizzle replaced that
+///   class's method and not `NSApplication`'s.
 ///
 /// # Safety
 /// `app` must be a live `NSApplication` (or an instance of a subclass of one).

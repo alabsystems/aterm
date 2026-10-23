@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify wasm-smoke`: the two web modules' host boundary, in a page of the
-//! pinned chrome-headless-shell ([`crate::wasm_page`]). Both modules are
-//! built in the DEV profile, whose debug-only exports (each crate's
-//! `src/host.rs`) `perf/wasm/smoke.mjs` drives: the browser clocks, and what
-//! crosses the boundary in each direction. They are bound as the bench binds
-//! them (by `verify glue`'s generator) and not optimised. Then the CPU
-//! module's boundary replay ([`crate::perf::wasm::replay`]) holds its glue to
-//! the recorded answers (`verify glue --record-replay` rewrites them, after
-//! review).
+//! Web module host boundary checks ([`crate::wasm_page`], [`crate::perf::wasm::replay`]).
 //!
-//! STOCK EXCEPTION: Trust has no wasm32 std, so the build rides rustup's
-//! `stable` from a neutral cwd, in the cells lane's directory and under its job
-//! cap. A machine without the pinned browser or the stable wasm32 std is
-//! COULD NOT RUN naming the provider, found before anything builds: never a
-//! skip, never a pass.
+//! STOCK EXCEPTION: Trust has no wasm32 std, so the build rides rustup's `stable`.
 
 use std::path::{Path, PathBuf};
 
@@ -31,17 +19,12 @@ use crate::wasm_page::{self, Browser, Page, Refused};
 
 const LABEL: &str = "wasm-smoke (both web modules' host boundary and the CPU replay, in a browser)";
 
-/// The cells lane's `wasm-smoke` directory: the dev build's target dir
-/// ([`build_dev`]) and the bound modules.
+/// The cells lane's `wasm-smoke` directory ([`build_dev`]).
 pub(crate) fn build_dir(ctx: &Ctx) -> PathBuf {
     crate::plan::cells_dir(ctx).join("wasm-smoke")
 }
 
-/// Both web modules built in the DEV profile for wasm32 on rustup's stable
-/// (the STOCK EXCEPTION in the module doc), into [`build_dir`] under the
-/// cells lane's job cap: the directory the `.wasm` files land in. `check`
-/// (`wasm-smoke`, `browser`) names the build row; `None` once a row is
-/// recorded on `r` under `label`.
+/// Both web modules built in the DEV profile for wasm32 on rustup's stable ([`build_dir`]).
 pub(crate) fn build_dev(
     ctx: &Ctx,
     r: &mut Report,
@@ -100,7 +83,7 @@ pub(crate) fn build_dev(
     Some(target_dir.join("wasm32-unknown-unknown/debug"))
 }
 
-/// Build, bind and drive both modules; one row.
+/// Build, bind and drive both modules.
 pub fn run(ctx: &Ctx, r: &mut Report) {
     let browser = match wasm_page::browser() {
         Ok(browser) => browser,
@@ -160,8 +143,6 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
     }
 }
 
-/// The row for a browser that is not there or did not start: COULD NOT RUN,
-/// naming its provider once.
 fn could_not_run(r: &mut Report, why: &str) {
     r.cannot_run(format!(
         "{LABEL} — it runs in the pinned chrome-headless-shell, and none ran: {why} (fix: {})",
@@ -169,9 +150,6 @@ fn could_not_run(r: &mut Report, why: &str) {
     ));
 }
 
-/// In one `browser` serving `site`: the smoke in one tab, then the replay in
-/// fresh ones (a panic traps a module, and the replay pins the page's
-/// clocks). Progress goes to `log`.
 fn drive(
     browser: &Browser,
     root: &Path,

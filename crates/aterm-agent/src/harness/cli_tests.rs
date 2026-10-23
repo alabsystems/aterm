@@ -2830,6 +2830,48 @@ fn the_worst_give_up_row_fits_its_cut_whole() {
     }
 }
 
+#[test]
+fn an_incomplete_upgrade_status_never_reports_an_empty_all_clear() {
+    let tmp = tmp_dir("upgrade-status-incomplete");
+    let env = env_at(&tmp);
+    std::fs::write(
+        env.config.as_deref().expect("config path"),
+        "[harness]\nusage_tap = false\n",
+    )
+    .expect("private config");
+    for json in [false, true] {
+        let status = Cmd::UpgradeOwner {
+            sid: String::new(),
+            ask: OwnerAsk::Status,
+            json,
+        };
+        let (ok, out, err) = go(&status, &env);
+        assert!(ok, "missing records: {out}{err}");
+        assert_eq!(out.is_empty(), json, "missing records: {out}");
+        assert!(err.is_empty(), "missing records: {err}");
+
+        std::fs::create_dir_all(&env.state).expect("state");
+        let records = env.state.join("upgrade");
+        std::fs::write(&records, b"obstruction").expect("blocked records directory");
+        let (code, out, err) = go_code(&status, &env);
+        assert_eq!(code, format!("{:?}", ExitCode::from(1)), "{out}{err}");
+        assert!(
+            out.is_empty(),
+            "incomplete status has no empty all-clear: {out}"
+        );
+        assert!(err.contains("upgrade status is incomplete"), "{err}");
+
+        std::fs::remove_file(&records).expect("unblock records directory");
+        std::fs::create_dir(&records).expect("empty records directory");
+        let (ok, out, err) = go(&status, &env);
+        assert!(ok, "empty records: {out}{err}");
+        assert_eq!(out.is_empty(), json, "empty records: {out}");
+        assert!(err.is_empty(), "empty records: {err}");
+        assert!(!records.join("sweep.lock").exists(), "status takes no lock");
+        std::fs::remove_dir(&records).expect("remove empty records directory");
+    }
+}
+
 /// `upgrade --status` prints what the sweep recorded for each upgrade a live Claude Code still
 /// holds behind its target, taking no lock; the owner's word lands under the lock and shows in
 /// the next `--status` and in `ledger upgrade`.

@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unattended adoption consent for the ALab toolset, checked in priority order:
-//! recorded decline, ignored prefix, `auto_install = false` (or unreadable config),
-//! and disabled manager.
+//! Unattended adoption consent for the ALab toolset.
 
 use crate::config::PackagesConfig;
 use crate::store::Layout;
@@ -23,7 +21,7 @@ pub enum Adoption {
     ManagerDisabled,
 }
 
-/// Whether the unattended lanes may adopt the ALab toolset on `layout` under `cfg`, or the first refusal reason.
+/// Whether the unattended lanes may adopt the ALab toolset on `layout`, or the refusal reason.
 #[must_use]
 pub fn adoption(layout: &Layout, cfg: &PackagesConfig) -> Adoption {
     adoption_with(layout.declined().is_file(), cfg, crate::manager_enabled())
@@ -35,8 +33,7 @@ pub fn adoption_consented(layout: &Layout, cfg: &PackagesConfig) -> bool {
     adoption(layout, cfg) == Adoption::Consented
 }
 
-/// Whether `layout`'s first install of the ALab toolset is still ahead: no non-vendor ALab
-/// program is active and no pass has recorded a success.
+/// Whether `layout` has no active non-vendor ALab program and no recorded success yet.
 #[must_use]
 pub fn first_install_ahead(layout: &Layout) -> bool {
     holds_no_alab_program(layout)
@@ -51,10 +48,7 @@ pub fn holds_no_alab_program(layout: &Layout) -> bool {
         .any(|program| !crate::vendor_direct::is_vendor(program))
 }
 
-/// Returns the managed `bin/` directory to append to a session's PATH, or `None`.
-///
-/// Provided only when `home` already holds the shell hook or automatic lanes are
-/// enabled on a consenting machine.
+/// Returns the managed `bin/` directory for a session's PATH when consented or hooked.
 #[must_use]
 pub fn session_bin_dir(
     layout: &Layout,
@@ -88,9 +82,6 @@ fn adoption_with(declined: bool, cfg: &PackagesConfig, manager_enabled: bool) ->
 mod tests {
     use super::*;
 
-    /// Every input alone, and the order between them: a decline outranks an ignored
-    /// prefix, which outranks `auto_install = false`, which outranks a disabled manager —
-    /// the order the seed's lines are printed in.
     #[test]
     fn each_refusal_holds_alone_and_the_first_one_answers() {
         let consenting = PackagesConfig::default();
@@ -131,8 +122,6 @@ mod tests {
         }
     }
 
-    /// The store's decline marker is what [`adoption`] reads, and [`adoption_consented`]
-    /// is its yes.
     #[test]
     fn the_decline_marker_on_the_store_refuses() {
         let l = crate::testdir::layout("atpkg-adoption-");
@@ -148,9 +137,6 @@ mod tests {
         assert!(!adoption_consented(&l, &cfg));
     }
 
-    /// A session's PATH gets `bin/` on a consenting machine whose automatic lanes run, and
-    /// wherever the shell hook already stands (it appends the same entry); a decline,
-    /// `auto_install = false` or the lanes off, with no hook, hand nothing.
     #[test]
     fn a_session_gets_bin_where_consent_or_the_hook_already_puts_it() {
         let l = crate::testdir::layout("atpkg-session-bin-");

@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`PROGRAMS`]: each program's repo, coherence group, pack shape and targets — the one
-//! table the producer and every lane read.
-//!
-//! It holds no build numbers: the pins live in the signed index, and a publish is a typed
-//! change to the verified head (`api::Delta`). A changed row reaches the snapshot lanes
-//! only when a person re-runs `atpkg-publish lane install`.
+//! Program table ([`PROGRAMS`]) defining each program's repo, coherence group, and pack shape.
 
 use crate::triple::{AARCH64_APPLE_DARWIN, Triple, X86_64_APPLE_DARWIN};
 
@@ -32,8 +27,6 @@ pub const DUAL_DARWIN: &[Triple] = &[AARCH64_APPLE_DARWIN, X86_64_APPLE_DARWIN];
 /// move with the bundle or not at all.
 pub const ARM_DARWIN: &[Triple] = &[AARCH64_APPLE_DARWIN];
 
-// The tools the trust bundle shims, from the client: a seal is publishable only with every
-// one in its `bin/` (the five trust-wp drivers are staged into a copy of the seal).
 pub use atpkg::manifest::TRUST_EXPOSES;
 
 /// One program.
@@ -128,11 +121,7 @@ const fn plain(
     }
 }
 
-/// Every program the channel pins, in the order the index lists them. A vendor-direct
-/// program (`atpkg::vendor_direct::is_vendor`) has no row: its client follows its vendor,
-/// so neither `--pin`, `--target-pin` nor a lane ever pins it — except an ALab-built agent
-/// program (`atpkg::alab::agent`), whose [`Shape::Package`] row is what an explicit `--pin`
-/// of it publishes for the targets ALab builds it for.
+/// Every program the channel pins, in index order.
 pub static PROGRAMS: &[ProgramDef] = &[
     plain("ay", None, DUAL_DARWIN),
     plain("clean", None, DUAL_DARWIN),

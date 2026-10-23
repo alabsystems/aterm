@@ -27,22 +27,59 @@ use crate::cursor_momentum::{
 
 #[cfg(test)]
 mod admission_tests;
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+pub mod bundle;
+#[cfg(test)]
+mod bundle_tests;
 #[cfg(test)]
 mod clock_tests;
 #[cfg(test)]
 mod codec_tests;
 #[cfg(test)]
 mod contract_tests;
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+pub mod corpus;
+#[cfg(test)]
+mod corpus_tests;
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+pub mod fidelity;
+#[cfg(test)]
+mod fidelity_tests;
 #[cfg(test)]
 mod host_tests;
+pub mod lane;
+#[cfg(test)]
+mod lane_tests;
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+pub mod m4;
+#[cfg(test)]
+mod m4_tests;
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+pub mod plan;
+#[cfg(test)]
+mod plan_tests;
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+pub mod policy;
+#[cfg(test)]
+mod policy_tests;
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+pub mod publish;
+#[cfg(test)]
+mod publish_tests;
 #[cfg(test)]
 mod repair_tests;
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+pub mod search;
+#[cfg(test)]
+mod search_tests;
 #[cfg(test)]
 mod test_fixtures;
 mod trace;
 #[cfg(test)]
 mod trace_tests;
 
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+use plan::{PlanView, SchedulePlan};
 pub use trace::{
     EventCounts, MomentumTrace, ReadTrace, TRACE_FILE_DOMAIN, TRACE_FILE_MAGIC, TraceFault,
     TraceReplay,
@@ -57,6 +94,10 @@ pub const TASK_NAME: &str = "aterm.cursor.momentum-glow";
 pub const SCHEMA_NAME: &str = "momentum-glow.state+events";
 /// The contract artifact's name.
 pub const CONTRACT_NAME: &str = "momentum-glow.no-stranded-light";
+/// The shipped code artifact's name ([`MomentumCode::Shipped`]).
+pub const SHIPPED_CODE_NAME: &str = "momentum-glow.shipped";
+/// The demonstration fault's code artifact name, defined in every build so the acceptance policy binds the same bases even where the fault's code is compiled out.
+pub const DEMO_CODE_NAME: &str = "momentum-glow.demo-stranded-settle";
 /// The numerical half of the profile artifact's name, after the target.
 pub const NUMERIC_PROFILE: &str = "f32-ieee754/system-libm/single-thread";
 
@@ -820,9 +861,9 @@ impl MomentumCode {
     #[must_use]
     pub const fn artifact_name(self) -> &'static str {
         match self {
-            MomentumCode::Shipped => "momentum-glow.shipped",
+            MomentumCode::Shipped => SHIPPED_CODE_NAME,
             #[cfg(any(test, debug_assertions))]
-            MomentumCode::DemoStrandedSettle => "momentum-glow.demo-stranded-settle",
+            MomentumCode::DemoStrandedSettle => DEMO_CODE_NAME,
         }
     }
 
@@ -915,6 +956,100 @@ impl MomentumCode {
         }
     }
 
+    /// One input, admitted then applied under this code: [`Sched::apply`] of [`Sched::Prebuilt`].
+    #[inline]
+    pub fn apply(
+        self,
+        s: &mut MomentumState,
+        epoch: Instant,
+        ev: &MomentumEvent,
+        out: &mut Vec<GlowQuad>,
+        under: &mut Vec<GlowQuad>,
+    ) -> Applied {
+        Sched::Prebuilt(self).apply(s, epoch, ev, out, under)
+    }
+}
+
+/// What answers the scheduler question for a code: a prebuilt implementation or a schedule plan (design §10.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Sched {
+    /// A prebuilt implementation compiled into this build.
+    Prebuilt(MomentumCode),
+    /// A schedule plan, built only by the candidate evaluator (`m4`) and by publication of an admitted result.
+    #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+    Plan(SchedulePlan),
+}
+
+impl Sched {
+    /// The prebuilt implementation, or `None` for a plan.
+    #[inline]
+    #[must_use]
+    pub const fn prebuilt(self) -> Option<MomentumCode> {
+        match self {
+            Sched::Prebuilt(code) => Some(code),
+            #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+            Sched::Plan(_) => None,
+        }
+    }
+
+    /// The short name a status line shows.
+    #[inline]
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Sched::Prebuilt(code) => code.name(),
+            #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+            Sched::Plan(_) => plan::PLAN_NAME,
+        }
+    }
+
+    /// Frame cadence, as this code classifies the state.
+    #[inline]
+    #[must_use]
+    pub fn is_active(self, s: &MomentumState) -> bool {
+        match self {
+            Sched::Prebuilt(code) => code.is_active(s),
+            #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+            Sched::Plan(plan) => plan.is_active(&PlanView::of(&s.glow)),
+        }
+    }
+
+    /// Hot and not active, as this code classifies the state.
+    #[inline]
+    #[must_use]
+    pub fn settling(self, s: &MomentumState) -> bool {
+        match self {
+            Sched::Prebuilt(code) => code.settling(s),
+            #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+            Sched::Plan(plan) => plan.settling(&PlanView::of(&s.glow)),
+        }
+    }
+
+    /// The analytic instant the latched amplitude goes cold: the engine's, for every code.
+    #[inline]
+    #[must_use]
+    pub fn cold_at(self, s: &MomentumState) -> Option<Instant> {
+        s.glow.cold_at()
+    }
+
+    /// The wake this code names for the host's lane.
+    #[inline]
+    #[must_use]
+    pub fn next_change_deadline(
+        self,
+        s: &MomentumState,
+        now: Instant,
+        frame_interval: Duration,
+    ) -> Option<Instant> {
+        match self {
+            Sched::Prebuilt(code) => code.next_change_deadline(s, now, frame_interval),
+            #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+            Sched::Plan(plan) => {
+                plan.next_change_deadline(&PlanView::of(&s.glow), now, frame_interval)
+            }
+        }
+    }
+
     /// One input.
     pub fn apply(
         self,
@@ -981,7 +1116,7 @@ impl MomentumCode {
 /// A prebuilt implementation bound to its artifact (which names the build it was compiled into).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrebuiltMomentum {
-    code: MomentumCode,
+    sched: Sched,
     id: ArtifactId,
 }
 
@@ -991,16 +1126,45 @@ impl PrebuiltMomentum {
     #[must_use]
     pub fn new(code: MomentumCode, build: &str) -> Self {
         PrebuiltMomentum {
-            code,
+            sched: Sched::Prebuilt(code),
             id: code.artifact(build),
         }
     }
 
-    /// Which implementation.
+    /// The plan interpreter reading `plan` as compiled into `build` ([`SchedulePlan::artifact`]), which no verb or code name reaches.
+    #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
     #[inline]
     #[must_use]
-    pub const fn code(&self) -> MomentumCode {
-        self.code
+    pub(crate) fn planned(plan: SchedulePlan, build: &str) -> Self {
+        PrebuiltMomentum {
+            sched: Sched::Plan(plan),
+            id: plan.artifact(build),
+        }
+    }
+
+    /// The code `sched` names, as compiled into the build `build`.
+    #[inline]
+    #[must_use]
+    fn of(sched: Sched, build: &str) -> Self {
+        match sched {
+            Sched::Prebuilt(code) => Self::new(code, build),
+            #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+            Sched::Plan(plan) => Self::planned(plan, build),
+        }
+    }
+
+    /// Which prebuilt implementation, or `None` for a planned code.
+    #[inline]
+    #[must_use]
+    pub const fn code(&self) -> Option<MomentumCode> {
+        self.sched.prebuilt()
+    }
+
+    /// What answers the scheduler question.
+    #[inline]
+    #[must_use]
+    pub const fn sched(&self) -> Sched {
+        self.sched
     }
 }
 
@@ -1029,7 +1193,7 @@ impl Code<MomentumSchema> for PrebuiltMomentum {
     ) -> Result<MomentumObservation, StepRefusal> {
         let (mut out, mut under) = (Vec::new(), Vec::new());
         let applied = self
-            .code
+            .sched
             .apply(state, schema.epoch, input, &mut out, &mut under);
         Ok(observe(&applied, schema.epoch, &out, &under))
     }
@@ -1275,6 +1439,22 @@ fn at_rest(s: &MomentumState, epoch: Instant) -> bool {
     s.glow.snapshot(epoch) == MomentumGlow::default().snapshot(epoch)
 }
 
+/// What one tick presents: its cursor cell, geometry and config.
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+type Presentation = (Option<(u16, u16)>, GeomRecord, ConfigRecord);
+
+/// The plan-only presentation guard (design §10.1), which lets a plan read a frame as settling only while the presentation is unchanged since the last tick.
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Guard {
+    /// The last delivered tick's presentation.
+    last: Option<Presentation>,
+    /// That presentation differs from the one before it (a first tick moves).
+    moved: bool,
+    /// The ticks after which the guard held the frame cadence a live plan released, because the presentation moved.
+    firings: u64,
+}
+
 struct Hosted {
     boundary: Boundary<MomentumSchema, PrebuiltMomentum, NoStrandedLight>,
     build: String,
@@ -1288,6 +1468,9 @@ struct Hosted {
     queued_at: Option<i128>,
     /// The one encoder every live observation is encoded into before its chain link.
     scratch: Enc,
+    /// The plan-only presentation guard.
+    #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+    guard: Guard,
 }
 
 fn refill(v: &mut Vec<GlowQuad>, from: &[GlowQuad]) {
@@ -1364,8 +1547,47 @@ impl Hosted {
     }
 
     #[inline]
-    const fn code(&self) -> MomentumCode {
-        self.boundary.pair().code.code
+    const fn sched(&self) -> Sched {
+        self.boundary.pair().code.sched
+    }
+
+    /// Frame cadence as the running host reads it: `code.is_active ∨ (hot ∧ moved)` for a plan (design §10.1), the code's own answer otherwise.
+    #[inline]
+    fn is_active(&self) -> bool {
+        let (sched, s) = (self.sched(), self.state());
+        match sched {
+            Sched::Prebuilt(code) => code.is_active(s),
+            #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+            Sched::Plan(_) => sched.is_active(s) || (s.glow.hot() && self.guard.moved),
+        }
+    }
+
+    /// Settling as the running host reads it: `code.settling ∧ ¬moved` for a plan, the code's own answer otherwise (disjoint from [`Hosted::is_active`], their union hot).
+    #[inline]
+    fn settling(&self) -> bool {
+        let (sched, s) = (self.sched(), self.state());
+        match sched {
+            Sched::Prebuilt(code) => code.settling(s),
+            #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+            Sched::Plan(_) => sched.settling(s) && !self.guard.moved,
+        }
+    }
+
+    /// Keeps a delivered tick's presentation and whether it moved, counting a firing when that holds the cadence a live plan released.
+    #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+    #[inline]
+    fn guard_tick(&mut self, cur: Option<(u16, u16)>, geom: GeomRecord, cfg: ConfigRecord) {
+        let shown = Some((cur, geom, cfg));
+        self.guard.moved = self.guard.last != shown;
+        self.guard.last = shown;
+        let (sched, s) = (self.sched(), self.state());
+        if let Sched::Plan(_) = sched
+            && self.guard.moved
+            && s.glow.hot()
+            && !sched.is_active(s)
+        {
+            self.guard.firings = self.guard.firings.saturating_add(1);
+        }
     }
 
     #[inline]
@@ -1466,11 +1688,15 @@ impl Hosted {
                 return None;
             }
         }
-        let (epoch, code) = (self.epoch(), self.code());
+        let (epoch, sched) = (self.epoch(), self.sched());
         let (out_from, under_from) = (out.len(), under.len());
         let (_, state) = self.boundary.pair_mut();
-        let applied = code.apply(state, epoch, ev, out, under);
+        let applied = sched.apply(state, epoch, ev, out, under);
         self.boundary.advance();
+        #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+        if let MomentumEvent::Tick { cur, geom, cfg, .. } = *ev {
+            self.guard_tick(cur, geom, cfg);
+        }
         let drawn = out.get(out_from..).unwrap_or(&[]);
         let drawn_under = under.get(under_from..).unwrap_or(&[]);
         if let (MomentumEvent::Tick { cur, geom, cfg, .. }, Applied::Frame(frame)) = (ev, applied) {
@@ -1541,8 +1767,8 @@ impl Hosted {
         match self.deliver(&ev, moved, &mut Vec::new(), &mut Vec::new())? {
             Applied::Schedule { deadline, .. } => deadline,
             _ => {
-                let (code, s) = (self.code(), self.state());
-                (code.is_active(s) || code.settling(s))
+                let (sched, s) = (self.sched(), self.state());
+                (sched.is_active(s) || sched.settling(s))
                     .then(|| now.checked_add(frame_interval))
                     .flatten()
             }
@@ -1637,23 +1863,23 @@ impl MomentumHost {
         }
     }
 
-    /// Frame cadence (`MomentumGlow::is_active`); `false` while paused.
+    /// Frame cadence (`MomentumGlow::is_active`, or a plan's under its presentation guard); `false` while paused.
     #[inline]
     #[must_use]
-    pub const fn is_active(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         match &self.mode {
             HostMode::Direct(g) => g.is_active(),
-            HostMode::Hosted(h) => !h.boundary.is_paused() && h.code().is_active(h.state()),
+            HostMode::Hosted(h) => !h.boundary.is_paused() && h.is_active(),
         }
     }
 
     /// Hot with no frame-to-frame change (`MomentumGlow::settling`); `false` while paused.
     #[inline]
     #[must_use]
-    pub const fn settling(&self) -> bool {
+    pub fn settling(&self) -> bool {
         match &self.mode {
             HostMode::Direct(g) => g.settling(),
-            HostMode::Hosted(h) => !h.boundary.is_paused() && h.code().settling(h.state()),
+            HostMode::Hosted(h) => !h.boundary.is_paused() && h.settling(),
         }
     }
 
@@ -1663,7 +1889,7 @@ impl MomentumHost {
     pub fn cold_at(&self) -> Option<Instant> {
         match &self.mode {
             HostMode::Direct(g) => g.cold_at(),
-            HostMode::Hosted(h) => h.code().cold_at(h.state()),
+            HostMode::Hosted(h) => h.sched().cold_at(h.state()),
         }
     }
 
@@ -1712,9 +1938,48 @@ impl MomentumHost {
         queue_cap: usize,
         max_events: usize,
     ) {
+        self.attach_sched(
+            epoch,
+            Sched::Prebuilt(code),
+            build,
+            log_epoch,
+            queue_cap,
+            max_events,
+        );
+    }
+
+    /// Attaches as [`Self::aos_attach`] does with `plan` as the live code ([`PrebuiltMomentum::planned`]) and log epochs of `max_events` inputs, for the candidate evaluator.
+    #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+    pub(crate) fn attach_planned(
+        &mut self,
+        epoch: Instant,
+        plan: SchedulePlan,
+        build: &str,
+        log_epoch: u64,
+        max_events: usize,
+    ) {
+        self.attach_sched(
+            epoch,
+            Sched::Plan(plan),
+            build,
+            log_epoch,
+            MOMENTUM_QUEUE_CAP,
+            max_events,
+        );
+    }
+
+    fn attach_sched(
+        &mut self,
+        epoch: Instant,
+        sched: Sched,
+        build: &str,
+        log_epoch: u64,
+        queue_cap: usize,
+        max_events: usize,
+    ) {
         if let HostMode::Hosted(h) = &mut self.mode
             && h.epoch() == epoch
-            && h.code() == code
+            && h.sched() == sched
             && h.build == build
         {
             let first = h.cursor();
@@ -1725,7 +1990,7 @@ impl MomentumHost {
             return;
         }
         let glow = self.take_glow();
-        let prebuilt = PrebuiltMomentum::new(code, build);
+        let prebuilt = PrebuiltMomentum::of(sched, build);
         let identity = momentum_identity(&prebuilt);
         let mut boundary = Boundary::new(
             MomentumSchema::new(epoch),
@@ -1755,6 +2020,8 @@ impl MomentumHost {
             clamped: 0,
             queued_at: None,
             scratch: Enc::new(),
+            #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+            guard: Guard::default(),
         }));
     }
 
@@ -1839,13 +2106,20 @@ impl MomentumHost {
         matches!(&self.mode, HostMode::Hosted(h) if h.boundary.is_paused())
     }
 
-    /// The code running the glow (always [`MomentumCode::Shipped`] unattached).
+    /// The prebuilt code running the glow (always [`MomentumCode::Shipped`] unattached), or `None` while the live code is a schedule plan.
     #[inline]
     #[must_use]
-    pub const fn aos_code(&self) -> MomentumCode {
+    pub const fn aos_code(&self) -> Option<MomentumCode> {
+        self.aos_sched().prebuilt()
+    }
+
+    /// What answers the live code's scheduler question (always the shipped engine unattached).
+    #[inline]
+    #[must_use]
+    pub const fn aos_sched(&self) -> Sched {
         match &self.mode {
-            HostMode::Direct(_) => MomentumCode::Shipped,
-            HostMode::Hosted(h) => h.code(),
+            HostMode::Direct(_) => Sched::Prebuilt(MomentumCode::Shipped),
+            HostMode::Hosted(h) => h.sched(),
         }
     }
 
@@ -1865,10 +2139,18 @@ impl MomentumHost {
             HostMode::Hosted(h) => h,
         };
         let b = &h.boundary;
-        let (code, state, epoch) = (h.code(), h.state(), h.epoch());
+        let (code, state, epoch) = (h.sched(), h.state(), h.epoch());
         let snapshot = state.glow.snapshot(epoch).ok();
         let log = b.log();
-        let (is_active, settling) = (code.is_active(state), code.settling(state));
+        // The host's reading: a plan's answer under the presentation guard, as the lane runs it.
+        let (is_active, settling) = (h.is_active(), h.settling());
+        #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+        let (guard_moved, guard_firings) = match code {
+            Sched::Plan(_) => (Some(h.guard.moved), Some(h.guard.firings)),
+            Sched::Prebuilt(_) => (None, None),
+        };
+        #[cfg(not(any(test, debug_assertions, feature = "aos-candidates")))]
+        let (guard_moved, guard_firings) = (None, None);
         MomentumAosStatus {
             attached: true,
             code: code.name(),
@@ -1893,6 +2175,8 @@ impl MomentumHost {
             hot: is_active || settling,
             is_active,
             settling,
+            guard_moved,
+            guard_firings,
             cold_at: code.cold_at(state).map(|t| offset_of(epoch, t)),
             last_query_at: h.last_query.map(|(at, _)| at),
             next_deadline: h.last_query.and_then(|(_, d)| d),
@@ -1970,6 +2254,10 @@ pub struct MomentumAosStatus {
     pub hot: bool,
     pub is_active: bool,
     pub settling: bool,
+    /// Whether the last tick's presentation moved, while a plan is live (`None` otherwise).
+    pub guard_moved: Option<bool>,
+    /// The presentation guard's firings, while a plan is live (`None` otherwise).
+    pub guard_firings: Option<u64>,
     pub cold_at: Option<i128>,
     /// The latest recorded scheduler query's time…
     pub last_query_at: Option<i128>,
@@ -2030,6 +2318,9 @@ impl fmt::Display for MomentumAosStatus {
                 fr.out,
                 fr.under
             )?;
+        }
+        if let (Some(moved), Some(firings)) = (self.guard_moved, self.guard_firings) {
+            write!(f, " guard=moved:{moved},firings:{firings}")?;
         }
         let s = &self.stats;
         write!(

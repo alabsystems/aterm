@@ -503,15 +503,12 @@ mod tests {
         assert_eq!(busy(&fake, &layout()).as_deref(), Some("1-1"));
     }
 
-    /// A start reads as the word `ps -o lstart=` printed under `TZ=UTC0`, which a lock of an
-    /// earlier agent holds: the kernel's record, formatted here.
     #[test]
     fn a_start_is_the_word_ps_printed() {
         assert_eq!(lstart_word(0), "Thu_Jan_1_00:00:00_1970");
         assert_eq!(lstart_word(951_782_400), "Tue_Feb_29_00:00:00_2000");
         assert_eq!(lstart_word(1_792_190_170), "Fri_Oct_16_22:36:10_2026");
         assert_eq!(lstart_word(1_792_224_062), "Sat_Oct_17_08:01:02_2026");
-        // NEGATIVE CONTROL: a second later is another start.
         assert_ne!(lstart_word(1_792_190_171), lstart_word(1_792_190_170));
     }
 

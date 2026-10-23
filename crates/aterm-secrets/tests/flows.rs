@@ -340,6 +340,44 @@ fn a_lan_vault_from_create_to_revoke() {
 }
 
 #[test]
+fn a_fifo_at_the_store_files_lock_refuses_a_publish_without_a_wait() {
+    let lab = Lab::new("fifo");
+    let admin = lab.home("ma");
+    client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let lock = lab.root.path().join("store").join("fifo.vault.lock");
+    let lock = std::ffi::CString::new(std::os::unix::ffi::OsStringExt::into_vec(
+        lock.into_os_string(),
+    ))
+    .expect("a path");
+    // SAFETY: a NUL-terminated path; mkfifo reads it and keeps nothing.
+    assert_eq!(unsafe { libc::mkfifo(lock.as_ptr(), 0o600) }, 0, "mkfifo");
+    let open = client::admin_open(&admin).expect("admin opens");
+    let mut doc = open.doc.clone();
+    doc.set_entry(&Audience::Everyone, "k", synthetic("v").as_bytes())
+        .expect("set");
+    // A server that waited on the FIFO would hold its state lock, so a hang here would hang
+    // the lab's stop too: it is detected on a thread, and the lab then left running.
+    let (answered, answer) = std::sync::mpsc::channel();
+    let publisher = admin.clone();
+    std::thread::spawn(move || {
+        let _ = answered.send(client::admin_publish(&publisher, &open, &doc));
+    });
+    let Ok(published) = answer.recv_timeout(Duration::from_secs(60)) else {
+        std::mem::forget(lab);
+        panic!("the PUT waited on the FIFO at the lock");
+    };
+    let error = published.expect_err("not a lock it clears");
+    assert!(error.0.contains("409"), "{error}");
+    assert!(
+        matches!(
+            transport::fetch(&Source::Url(lab.url.clone()), None, Duration::from_secs(60)),
+            Ok(transport::Fetched::Body(_))
+        ),
+        "still serving"
+    );
+}
+
+#[test]
 fn the_server_and_every_reader_refuse_a_key_the_vault_never_endorsed() {
     let lab = Lab::new("pinned");
     let admin = lab.home("ma");
@@ -485,6 +523,20 @@ fn a_signed_vault_at_a_path_needs_no_server() {
     assert_eq!(
         read(&machine, "team_token").as_deref(),
         Some(token.as_str())
+    );
+
+    let vault = client::admin_open(&admin).expect("open");
+    let mut doc = vault.doc.clone();
+    doc.set_open(true).expect("open");
+    client::admin_publish(&admin, &vault, &doc).expect("publish");
+    let vault = client::admin_open(&admin).expect("open");
+    let mut doc = vault.doc.clone();
+    assert!(doc.remove_machine("mb", false).expect("remove"));
+    let gone = client::admin_publish(&admin, &vault, &doc).expect("publish");
+    assert!(gone.kept_out);
+    assert!(
+        !gone.queued,
+        "a path has no queue for a code to come back by"
     );
 }
 
@@ -697,6 +749,7 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
     assert!(doc.remove_machine("mb", false).expect("remove"));
     let gone = client::admin_publish(&admin, &open, &doc).expect("publish");
     assert!(gone.kept_out && !gone.password_renewed && gone.held.is_empty());
+    assert!(gone.queued, "a served vault's approver reads its queue");
     let kept = client::admin_open(&admin).expect("open").doc.clone();
     assert!(kept.open());
     assert_eq!(kept.code_only(), std::slice::from_ref(&mb));

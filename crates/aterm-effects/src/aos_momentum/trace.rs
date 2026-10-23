@@ -16,13 +16,12 @@ use aterm_time::Instant;
 
 use super::{MOMENTUM_MAX_EVENTS, MomentumCode, MomentumEvent, MomentumSchema, PrebuiltMomentum};
 
-/// The bytes that open a momentum trace file: `AOSMTR\0` then the format byte, 1.
+/// The bytes that open a momentum trace file.
 pub const TRACE_FILE_MAGIC: [u8; 8] = *b"AOSMTR\0\x01";
 
 /// The domain of the digest that closes a trace file.
 pub const TRACE_FILE_DOMAIN: &[u8] = b"aterm-aos-momentum-trace-file-v1\0";
 
-/// The closing digest's length.
 const SEAL_LEN: usize = 32;
 
 /// An exported trace.
@@ -83,7 +82,7 @@ pub struct ReadTrace {
     pub counts: EventCounts,
 }
 
-/// What [`MomentumTrace::replay`] reached: the recorded head, reproduced.
+/// What [`MomentumTrace::replay`] reached.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceReplay {
     /// The code the identity names.
@@ -104,7 +103,7 @@ pub enum TraceFault {
     Magic,
     /// They open with another format byte than [`TRACE_FILE_MAGIC`]'s.
     Format { found: u8 },
-    /// The closing digest does not name the bytes before it: the file was cut or altered.
+    /// The closing digest does not name the bytes before it.
     Seal { sealed: Digest, found: Digest },
     /// A field of the file does not decode, or bytes follow its end.
     Wire(WireFault),
@@ -112,7 +111,7 @@ pub enum TraceFault {
     Checkpoint(CheckpointFault),
     /// The log does not decode beside the identity and the checkpoint.
     Log(LogFault),
-    /// The log decoded only in part: torn, or not ended by its seal.
+    /// The log decoded only in part.
     Tail(Tail),
     /// The log says a delivered input is missing from it, so no replay of it is the live run.
     Broken { why: &'static str },
@@ -276,8 +275,7 @@ impl MomentumTrace {
         })
     }
 
-    /// Reads the trace on `epoch`, replays its log from its checkpoint through the code of `build`
-    /// the identity names, and checks the replay reached the recorded head.
+    /// Reads the trace on `epoch`.
     /// # Errors
     /// Any of [`Self::read`]'s, then [`TraceFault::Broken`], [`TraceFault::UnknownCode`],
     /// [`TraceFault::Restore`], [`TraceFault::Refused`], [`TraceFault::State`] or
@@ -287,10 +285,10 @@ impl MomentumTrace {
         if let Some(why) = read.log.broken() {
             return Err(TraceFault::Broken { why });
         }
-        let code = MomentumCode::ALL
+        let (named, code) = MomentumCode::ALL
             .iter()
-            .map(|&c| PrebuiltMomentum::new(c, build))
-            .find(|p| p.id == self.identity.code)
+            .map(|&c| (c, PrebuiltMomentum::new(c, build)))
+            .find(|(_, p)| p.id == self.identity.code)
             .ok_or_else(|| TraceFault::UnknownCode {
                 name: self.identity.code.name.clone(),
                 build: build.to_owned(),
@@ -324,7 +322,7 @@ impl MomentumTrace {
             });
         }
         Ok(TraceReplay {
-            code: code.code,
+            code: named,
             checkpoint: read.checkpoint.digest(),
             log_epoch: read.log.header().log_epoch,
             first_cursor,

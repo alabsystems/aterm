@@ -41,8 +41,7 @@ impl fmt::Display for DocError {
 
 impl std::error::Error for DocError {}
 
-/// Which document a request names: the `doc=` id a row or `OK edit` gave, or a `file://` URI in any
-/// spelling of the file.
+/// Which document a request names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocRef {
     Id(u64),
@@ -50,8 +49,7 @@ pub enum DocRef {
 }
 
 impl DocRef {
-    /// `<d>`, `doc=<d>`, `<file-uri>` or `uri=<file-uri>`: a field copied from a row reads as the
-    /// bare value.
+    /// `<d>`, `doc=<d>`, `<file-uri>` or `uri=<file-uri>`.
     pub fn parse(word: &str) -> Result<Self, DocError> {
         let value = word
             .strip_prefix("doc=")
@@ -98,7 +96,7 @@ impl LaterForm {
     }
 }
 
-/// One `doc` request: the arguments after the verb.
+/// One `doc` request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocRequest {
     /// `ls [uri=<file-uri>]`: every document, or the one that file is.
@@ -189,10 +187,7 @@ pub enum DiskState {
 }
 
 impl DiskState {
-    /// How a file read now stands against the version a buffer was read or last saved as, by
-    /// content: [`Self::Missing`] when no file is there, [`Self::Same`] when that version was a
-    /// file too and the length and the content agree (`disk_same`, contracted), and
-    /// [`Self::Changed`] otherwise.
+    /// Compare file contents ([`Self::Missing`], [`Self::Same`], [`Self::Changed`]).
     #[must_use]
     pub fn by_content(
         now_exists: bool,
@@ -231,10 +226,7 @@ impl DiskState {
 }
 
 trust_contract_fn! {
-    /// Whether a file read now holds the version a buffer was read or last
-    /// saved as: the file is there, the version was a file too, and both its
-    /// length and its content agree. `disk=same` is exactly this; a length
-    /// that agrees over other bytes is still a change.
+    /// Whether a file on disk matches the version a buffer was read or last saved as.
     fn disk_same(now_exists: bool, base_exists: bool, same_len: bool, same_content: bool) -> bool
     clauses [ensures result == (now_exists && base_exists && same_len && same_content)
         by disk_same_is_all_four]
@@ -253,8 +245,7 @@ verify_island! {
     }
 }
 
-/// A position in a text: a 1-based line by the anchor rules and a 1-based column in characters,
-/// written `<L>:<C>`.
+/// A position in a text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Point {
     pub line: usize,
@@ -310,8 +301,6 @@ impl fmt::Display for Point {
     }
 }
 
-/// The column of byte `end` on a line starting at byte `start`: one past the
-/// characters between them.
 fn column(text: &str, start: usize, end: usize) -> usize {
     let mut end = end.max(start);
     while end > start && !text.is_char_boundary(end) {
@@ -322,7 +311,7 @@ fn column(text: &str, start: usize, end: usize) -> usize {
         .saturating_add(1)
 }
 
-/// A caret in one view: `<view>:<L>:<C>`.
+/// A caret in one view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewPoint {
     /// The view (`inspect app/v1 view <view>`).
@@ -346,7 +335,7 @@ impl fmt::Display for ViewPoint {
     }
 }
 
-/// A selection in one view, start to end: `<view>:<L>:<C>-<L>:<C>`.
+/// A selection in one view, start to end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewSpan {
     pub view: u64,
@@ -372,8 +361,7 @@ impl fmt::Display for ViewSpan {
     }
 }
 
-/// One `doc ls` row: `doc=<d> uri=<canonical-uri> seq=<s> dirty=0|1 disk=<state> views=<v,…>
-/// ticket=<t,…|-> cursor=<view>:<L>:<C>|- sel=<view>:<L>:<C>-<L>:<C>|-`.
+/// One `doc ls` row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocRow {
     /// The document (`doc read <d>`).
@@ -463,7 +451,6 @@ impl DocRow {
     }
 }
 
-/// `a,b,c`, or `-` for none.
 fn list<T: fmt::Display>(items: &[T]) -> String {
     if items.is_empty() {
         return "-".to_string();
@@ -475,9 +462,6 @@ fn list<T: fmt::Display>(items: &[T]) -> String {
         .join(",")
 }
 
-/// `a,b,c` of decimal ids, or `-` for none. Not generic over the item's
-/// parser: a call through an `impl Fn` is an instance the Trust lane cannot
-/// discharge (SPECS.md §4).
 fn parse_list(text: &str, field: &'static str) -> Result<Vec<u64>, DocError> {
     if text == "-" {
         return Ok(Vec::new());
@@ -487,12 +471,10 @@ fn parse_list(text: &str, field: &'static str) -> Result<Vec<u64>, DocError> {
         .collect()
 }
 
-/// `field=<text>` is not what the field takes.
 fn bad(field: &'static str, text: &str) -> DocError {
     DocError::BadField(field, text.to_string())
 }
 
-/// A decimal `u64`, digits only.
 fn digits(text: &str) -> Option<u64> {
     if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -500,12 +482,10 @@ fn digits(text: &str) -> Option<u64> {
     text.parse().ok()
 }
 
-/// A decimal `u64` field, digits only.
 fn number(text: &str, field: &'static str) -> Result<u64, DocError> {
     digits(text).ok_or_else(|| DocError::BadField(field, text.to_string()))
 }
 
-/// `uri` is one `file://` wire token.
 fn file_uri_token(uri: &str) -> Result<(), DocError> {
     if uri.is_empty() || uri.chars().any(char::is_whitespace) {
         return Err(DocError::Whitespace("uri"));
@@ -675,10 +655,6 @@ mod tests {
         assert_eq!(spaced.format(), Err(DocError::Whitespace("uri")));
     }
 
-    /// `disk=`'s table over every input: a file that is gone is missing
-    /// whatever else holds, and a file is the same only when its version
-    /// was a file and both length and content agree. `disk_same`'s contract
-    /// proves the second; this checks the arm order `by_content` reads them in.
     #[test]
     fn disk_state_by_content_is_its_table() {
         for bits in 0..16_u8 {

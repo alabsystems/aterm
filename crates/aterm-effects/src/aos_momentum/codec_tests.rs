@@ -560,7 +560,7 @@ fn code_names_round_trip_and_other_names_name_nothing() {
     for &code in MomentumCode::ALL {
         assert_eq!(MomentumCode::from_name(code.name()), Some(code));
         assert_eq!(MomentumCode::from_name(code.artifact_name()), Some(code));
-        assert_eq!(PrebuiltMomentum::new(code, BUILD).code(), code);
+        assert_eq!(PrebuiltMomentum::new(code, BUILD).code(), Some(code));
     }
     for name in ["", "Shipped", "momentum-glow", "demo", "shipped "] {
         assert_eq!(MomentumCode::from_name(name), None, "{name:?}");

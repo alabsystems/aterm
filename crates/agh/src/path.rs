@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 
 //! RFC 3986 encoders and dot-segment guards for URL path segments and query values.
 
 use crate::error::{Error, Result};
 
-/// The uppercase hex digits, by nibble.
 const UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
-/// `text`'s bytes, each outside the unreserved set as `%XX`.
 fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for b in text.bytes() {
@@ -76,7 +73,6 @@ pub(crate) fn dot_segment_error(what: &str, text: &str) -> Error {
 /// Rejects `text` if it contains a `.` or `..` segment.
 ///
 /// # Errors
-///
 /// Returns a usage error if [`has_dot_segment`] is true.
 pub(crate) fn refuse_dot_segment(what: &str, text: &str) -> Result<()> {
     if has_dot_segment(text) {
@@ -88,7 +84,6 @@ pub(crate) fn refuse_dot_segment(what: &str, text: &str) -> Result<()> {
 /// Rejects a pre-encoded `text` if percent-decoding reveals a `.` or `..` segment.
 ///
 /// # Errors
-///
 /// Returns a usage error if [`has_encoded_dot_segment`] is true.
 pub(crate) fn refuse_encoded_dot_segment(what: &str, text: &str) -> Result<()> {
     if has_encoded_dot_segment(text) {
@@ -107,7 +102,6 @@ pub(crate) fn bad_tag(tag: &str) -> bool {
 /// Rejects `tag` if [`bad_tag`] is true.
 ///
 /// # Errors
-///
 /// Returns a usage error when `tag` cannot be used in a release path.
 pub(crate) fn refuse_bad_tag(tag: &str) -> Result<()> {
     if bad_tag(tag) {

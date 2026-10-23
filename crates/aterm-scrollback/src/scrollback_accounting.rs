@@ -23,28 +23,16 @@ impl Scrollback {
         self.update_watermark_level();
     }
 
-    /// Monotonic count of lines dropped by memory-pressure eviction (the byte
-    /// budget's cold-tier FIFO) or lost with a quarantined warm block: real
-    /// retention loss, reported out of band (no sentinel content is injected).
-    /// Each line counts once: the blank rows a quarantined block leaves in cold
-    /// are not counted again when the budget evicts them. `set_line_limit`
-    /// truncation is intentional and not counted.
+    /// Monotonic count of lines dropped by memory-pressure eviction or lost with
+    /// a quarantined warm block.
     #[must_use]
     #[inline]
     pub const fn pressure_evicted_lines(&self) -> u64 {
         self.pressure_evicted_lines
     }
 
-    /// Monotonic count of history lines whose inline image was discarded because
-    /// the line was compressed: the out-of-band signal for the image retention
-    /// horizon, the sibling of [`pressure_evicted_lines`](Self::pressure_evicted_lines).
-    ///
-    /// An image lives only while its line is uncompressed in the hot tier; the
-    /// warm and cold wire format has no image section (see `Line::serialize`).
-    /// The line keeps its text, attributes, hyperlinks and underline colours, so
-    /// a footprint ages out one row at a time from its top. The count is in
-    /// footprint rows (one per history line); it never decreases and
-    /// [`clear`](Self::clear) does not reset it.
+    /// Monotonic count of history lines whose inline image was discarded when
+    /// the line left the hot tier.
     #[must_use]
     #[inline]
     pub const fn image_rows_dropped_by_compression(&self) -> u64 {
@@ -52,10 +40,6 @@ impl Scrollback {
     }
 
     /// Update both diagnostic and budget aggregates from per-tier counters.
-    ///
-    /// Saturating: each operand is bytes this process holds, so the true sum
-    /// fits; saturation only discharges the strict L0 gate's unconstrained-input
-    /// overflow counterexamples.
     #[inline]
     pub(crate) const fn sync_accounting(&mut self) {
         self.bytes_used = self
@@ -84,7 +68,6 @@ impl Scrollback {
     }
 
     /// Saturating for the Trust lane, as in [`sync_accounting`](Self::sync_accounting).
-    /// Test-only: only the invariant assert and the memory-tracking tests call it.
     #[cfg(test)]
     pub(crate) fn recompute_total_memory_used(&self) -> usize {
         self.hot
@@ -102,12 +85,8 @@ impl Scrollback {
             .saturating_add(self.cold.recompute_compressed_size())
     }
 
-    /// Consistency check: the aggregate counters equal a from-scratch
-    /// recomputation over the tiers.
-    ///
-    /// The asserts run only under `cfg(test)`: they can fire when a counter
-    /// drifts, and the strict L0 gate, which refutes every reachable panic,
-    /// would reject a library build that carried them.
+    /// Asserts that aggregate counters match a from-scratch recomputation over
+    /// the tiers (`cfg(test)` only so the L0 gate sees no reachable panic).
     pub(crate) fn assert_bytes_used_invariant(&self) {
         #[cfg(test)]
         {

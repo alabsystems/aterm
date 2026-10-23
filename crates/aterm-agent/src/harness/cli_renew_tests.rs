@@ -36,11 +36,31 @@ fn renew_env(tag: &str) -> (Tmp, Env) {
     (tmp, env)
 }
 
+fn cached_profile_only(env: &Env) {
+    let browser =
+        env.home.as_deref().unwrap().join(
+            ".cache/aterm/browser.noindex/chrome-headless-shell-fixture/chrome-headless-shell",
+        );
+    std::fs::create_dir_all(browser.parent().unwrap()).unwrap();
+    std::fs::write(browser, b"inert browser marker; RenewHost runs no program").unwrap();
+    let profile = crate::harness::headless_oauth::browser_profile_dir(
+        &env.accounts_store().dir,
+        Some("main"),
+    );
+    std::fs::create_dir_all(profile).unwrap();
+    std::fs::write(
+        env.config.as_deref().unwrap(),
+        "[harness]\nusage_tap = false\n",
+    )
+    .unwrap();
+}
+
 struct RenewHost {
     tty: bool,
     ssh_session: bool,
     exe: Option<PathBuf>,
     flow: i32,
+    flow_after_first: Option<i32>,
     signs_in_as: Option<&'static str>,
     obstruct_checkpoint: bool,
     ssh_exit: i32,
@@ -56,6 +76,7 @@ impl RenewHost {
             ssh_session: false,
             exe: Some(PathBuf::from("/opt/aterm/bin/aterm")),
             flow: 0,
+            flow_after_first: None,
             signs_in_as: None,
             obstruct_checkpoint: false,
             ssh_exit: 0,
@@ -120,7 +141,11 @@ impl AccountsHost for RenewHost {
             )
             .unwrap();
         }
-        Ok(self.flow)
+        Ok(if self.flows.borrow().len() > 1 {
+            self.flow_after_first.unwrap_or(self.flow)
+        } else {
+            self.flow
+        })
     }
 
     fn status_in_home(&self, home: &str) -> Result<Captured, String> {
@@ -464,12 +489,29 @@ fn a_renewal_that_answers_another_account_changes_nothing_live() {
 
 #[test]
 fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
-    for flow in [130, 1] {
-        let (_tmp, env) = renew_env(&format!("renew-cancel-{flow}"));
+    for (flow, cached) in [
+        (130, false),
+        (1, false),
+        (130, true),
+        (137, true),
+        (143, true),
+    ] {
+        let (_tmp, env) = renew_env(&format!("renew-cancel-{flow}-{cached}"));
+        if cached {
+            cached_profile_only(&env);
+        }
         let mut host = RenewHost::new();
         host.flow = flow;
+        host.flow_after_first = Some(0);
         let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
         assert_eq!(code, exit(1), "{out}{err}");
+        assert_eq!(host.flows.borrow().len(), 1);
+        if cached {
+            assert!(matches!(
+                &host.flows.borrow()[0].2,
+                RenewBrowser::Remote { .. }
+            ));
+        }
         assert!(
             host.checked.borrow().is_empty(),
             "no `auth status` after a failed flow"
@@ -486,13 +528,57 @@ fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
 }
 
 #[test]
+fn a_cached_profile_authentication_failure_falls_back_once_to_the_interactive_browser() {
+    let (_tmp, env) = renew_env("renew-headless-auth-fallback");
+    cached_profile_only(&env);
+    let mut host = RenewHost::new();
+    host.flow = 1;
+    host.flow_after_first = Some(0);
+    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    let flows = host.flows.borrow();
+    assert_eq!(flows.len(), 2);
+    assert!(matches!(&flows[0].2, RenewBrowser::Remote { .. }));
+    assert!(!matches!(&flows[1].2, RenewBrowser::Remote { .. }));
+    assert_eq!(*host.checked.borrow(), [flows[1].0.clone()]);
+    let store = env.accounts_store();
+    assert_eq!(
+        logins_of(&env).get("main").unwrap().dir.as_deref(),
+        Some(flows[1].0.as_str()),
+    );
+    assert!(
+        accounts::read_renewal_checkpoint(
+            Path::new(&flows[1].0),
+            &std::fs::canonicalize(&flows[1].0).unwrap(),
+            env.now,
+        )
+        .is_some()
+    );
+    assert_eq!(
+        store
+            .tail(10)
+            .unwrap()
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        [accounts::Kind::Auth, accounts::Kind::Renewed],
+    );
+    no_address(&env, &[&out, &err]);
+}
+
+#[test]
 fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstructed() {
     let (_tmp, env) = renew_env("renew-checkpoint-obstructed");
+    cached_profile_only(&env);
     let mut host = RenewHost::new();
     host.obstruct_checkpoint = true;
     let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
     assert_eq!(code, exit(1), "{out}{err}");
     assert_eq!(host.flows.borrow().len(), 1);
+    assert!(matches!(
+        &host.flows.borrow()[0].2,
+        RenewBrowser::Remote { .. }
+    ));
     assert_eq!(host.checked.borrow().len(), 1);
     let store = env.accounts_store();
     let staging = store.logins_dir().join("main+1");
@@ -508,12 +594,14 @@ fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstr
         "{err}"
     );
     assert!(err.contains("its home is kept"), "{err}");
+    assert!(!store.logins_dir().join("main+2").exists());
     no_address(&env, &[&out, &err]);
 }
 
 #[test]
 fn a_renewal_keeps_its_published_home_when_the_ledger_cannot_be_appended() {
     let (_tmp, env) = renew_env("renew-published-ledger-failure");
+    cached_profile_only(&env);
     let store = env.accounts_store();
     store.ensure().expect("store");
     std::fs::create_dir(store.ledger_path()).expect("block ledger append");
@@ -521,6 +609,10 @@ fn a_renewal_keeps_its_published_home_when_the_ledger_cannot_be_appended() {
     let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
     assert_eq!(code, exit(1), "{out}{err}");
     assert_eq!(host.flows.borrow().len(), 1);
+    assert!(matches!(
+        &host.flows.borrow()[0].2,
+        RenewBrowser::Remote { .. }
+    ));
     assert_eq!(host.checked.borrow().len(), 1);
 
     let logins = logins_of(&env);
@@ -537,6 +629,11 @@ fn a_renewal_keeps_its_published_home_when_the_ledger_cannot_be_appended() {
         home.join(".claude.json").is_file(),
         "keep the checked login"
     );
+    assert!(
+        accounts::read_renewal_checkpoint(home, &std::fs::canonicalize(home).unwrap(), env.now,)
+            .is_some()
+    );
+    assert!(!store.logins_dir().join("main+2").exists());
     no_address(&env, &[&out, &err]);
 }
 
@@ -634,6 +731,12 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
             Ok(ev)
         })
         .expect("walls recorded");
+    env.accounts_store()
+        .transact_logins(env.now, &mut note, |_, logins| {
+            accounts::note_login_notice(logins, "main", 2, env.now);
+            Ok(Vec::new())
+        })
+        .expect("walled row login notice recorded");
     let wall_host = RenewHost::new();
     let (code, out, err) = acc(renew(&[], true, None), &env, &wall_host);
     assert_eq!(code, exit(0), "{out}{err}");

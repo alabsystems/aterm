@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `ship tap deploy <tap checkout> [--dry-run]`: the public Homebrew tap's structure, from this
-//! repo's source of truth ([`SOURCE`]), mirrored into a checkout of `alabsystems/homebrew-tap` and
-//! committed there.
+//! `ship tap deploy <tap checkout> [--dry-run]`.
 
 use std::path::{Path, PathBuf};
 
@@ -23,8 +21,7 @@ pub const SOURCE: &str = "distribution/homebrew-tap";
 /// The documents mirrored as they are.
 pub const DOCS: [&str; 2] = ["README.md", "MAINTENANCE.md"];
 
-/// Wording only an internal document carries (lowercase): a source holding any of it is refused, so
-/// an internal doc never leaks into the public tap.
+/// Wording only an internal document carries (lowercase).
 pub const INTERNAL_WORDING: [&str; 3] = [
     "private dev repo",
     "private aterm dev repo",
@@ -87,9 +84,7 @@ pub struct Planned {
     pub change: Change,
 }
 
-/// `source`, a cask stanza, with `live`'s `version` and `sha256` lines kept: the first `  version
-/// "<digits and dots>"` and `  sha256 "<lowercase hex>"` lines of the live cask replace the
-/// source's own.
+/// `source`, a cask stanza, with `live`'s `version` and `sha256` lines kept.
 /// # Errors
 /// The live cask has no such line to keep.
 pub fn keep_live(source: &str, live: &str) -> Result<String, String> {
@@ -124,7 +119,6 @@ pub fn keep_live(source: &str, live: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// Every file under `dir`, recursively.
 fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = entry.path();
@@ -353,7 +347,6 @@ mod tests {
         out.stdout_utf8().trim().to_string()
     }
 
-    /// A source of truth: the two docs and two casks, `alab` one the tap lacks.
     fn source(root: &Path) -> PathBuf {
         let src = root.join("homebrew-tap");
         std::fs::create_dir_all(src.join("Casks")).unwrap();
@@ -372,8 +365,6 @@ mod tests {
         src
     }
 
-    /// A tap checkout holding the live aterm cask, an old README and a file the source
-    /// does not have.
     fn tap(root: &Path) -> PathBuf {
         let tap = root.join("tap");
         std::fs::create_dir_all(tap.join("Casks")).unwrap();
@@ -407,10 +398,6 @@ mod tests {
         assert!(keep_live(src, "  version \"0.63.0\"\n  sha256 \"NOTHEX\"\n").is_err());
     }
 
-    /// THE DEPLOY, against a scratch tap: a dry run prints the plan and writes nothing;
-    /// a deploy mirrors the docs, keeps the live cask's version and sha256, seeds the
-    /// new cask, leaves the tap's own files, commits once and pushes nothing; a second
-    /// is already current.
     #[test]
     fn a_deploy_mirrors_the_source_keeps_the_live_lines_and_commits_once() {
         let d = scratch("deploy");
@@ -504,9 +491,6 @@ mod tests {
         assert_eq!(git(&tap, &["status", "--porcelain"]), "");
     }
 
-    /// The deploy's commit holds only what it writes: an index that already holds a
-    /// staged change is refused (a dry run too) before anything is written, and a
-    /// change of the tap's own it did not stage stays out of the commit.
     #[test]
     fn a_staged_index_is_refused_and_nothing_else_rides_in_the_commit() {
         let d = scratch("staged");

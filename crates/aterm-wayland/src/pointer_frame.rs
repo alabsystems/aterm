@@ -119,7 +119,6 @@ pub enum Raw<S> {
 
 const VERTICAL: u32 = 0;
 const HORIZONTAL: u32 = 1;
-/// `wl_pointer.axis_source`'s values run to `wheel_tilt` (3).
 const LAST_SOURCE: u32 = 3;
 const RELEASED: u32 = 0;
 const PRESSED: u32 = 1;
@@ -137,7 +136,6 @@ pub struct Frames<S> {
     latest_button: Option<u32>,
 }
 
-/// One axis scroll's two axes, `value` on `axis` (`None` for an axis the protocol does not name).
 fn on_axis(axis: u32, set: impl FnOnce(&mut AxisScroll)) -> Option<(AxisScroll, AxisScroll)> {
     let (mut horizontal, mut vertical) = (AxisScroll::default(), AxisScroll::default());
     match axis {

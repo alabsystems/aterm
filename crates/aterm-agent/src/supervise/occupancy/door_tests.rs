@@ -178,6 +178,41 @@ fn a_successor_seeds_the_no_progress_rows_by_their_kind() {
     );
 }
 
+/// A SUCCESSOR PACES BY THE LINES THAT WENT AT A BREAK ([`break_lines_in`]), oldest first: this
+/// session's stuck lines typed at `door=break` and the door's typed `fact-hold@v1` lines; a
+/// rider's typed row (`door=turn-end`), a line left unsent, a hold's `waiting` row, a would-be
+/// line and another session's line count for nothing.
+#[test]
+fn a_successor_paces_by_the_lines_typed_at_a_break_alone() {
+    let hung = EpisodeKey::no_progress(27098, 7);
+    let stuck = FactKind::NoProgress.rule();
+    let hold = FactKind::Hold.rule();
+    let went = fact_outcome_reason(hung, FactDoor::Break, Told::Typed);
+    let rode = fact_outcome_reason(hung, FactDoor::TurnEnd, Told::Typed);
+    let left = fact_outcome_reason(hung, FactDoor::Break, Told::Skipped("not-submitted"));
+    let nudged = outcome_reason(RuleId::WaitNudge, 0xab, 1_800_000, false, Told::Typed);
+    let would = rules::would_reason(RuleId::WaitNudge, 0xab, 1_800_000, false);
+    let body = [
+        row(SID, 1, stuck, Outcome::Typed, &went),
+        row(SID, 2, stuck, Outcome::Typed, &rode),
+        row(SID, 3, stuck, Outcome::Skipped, &left),
+        row(SID, 4, hold, Outcome::Waiting, "open"),
+        row(SID, 5, rules::WOULD_RULE, Outcome::Waiting, &would),
+        row("@s-2", 6, stuck, Outcome::Typed, &went),
+        row(SID, 7, hold, Outcome::Typed, &nudged),
+        row(SID, 8, stuck, Outcome::Typed, &went),
+    ]
+    .join("\n");
+    assert_eq!(
+        break_lines_in(&body, Some(SID)),
+        [
+            (1, FactKind::NoProgress),
+            (7, FactKind::Hold),
+            (8, FactKind::NoProgress)
+        ]
+    );
+}
+
 #[test]
 fn every_pace_answer_reads_back_by_its_word() {
     let answers = [

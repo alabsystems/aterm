@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tape item codec ([`super::frame`], [`EffectRecord`], [`Item::Note`], [`Mark`], [`End`],
-//! [`Stamp`], [`Encoder`], [`Decoder`], [`super::delta`], [`KINDS`], [`super::recover`],
-//! [`ctl_request`], [`ctl_reply`]).
+//! Tape item codec ([`super::frame`], [`EffectRecord`], [`Item::Note`], [`Mark`], [`End`]).
+//! Stateful [`Stamp`], [`Encoder`], [`Decoder`], [`super::delta`], [`KINDS`], [`super::recover`].
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -128,7 +127,7 @@ const END_RETURNED: u8 = 0;
 const END_SUSPENDED: u8 = 1;
 const END_UNWOUND: u8 = 2;
 
-/// THE ERROR KINDS' TABLE: a failed file read's kind as one byte.
+/// One-byte codes for failed file-read error kinds.
 pub(crate) const KINDS: [(u8, ErrorKind); 39] = [
     (0, ErrorKind::Other),
     (1, ErrorKind::NotFound),
@@ -212,12 +211,10 @@ pub(crate) fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-/// The step from `prev` to `next`, wrapping: what a clock is stored as.
 const fn step(prev: u64, next: u64) -> i64 {
     next.wrapping_sub(prev) as i64
 }
 
-/// [`step`]'s inverse.
 const fn stepped(prev: u64, step: i64) -> u64 {
     prev.wrapping_add(step as u64)
 }
@@ -310,7 +307,6 @@ impl<'a> Input<'a> {
     }
 }
 
-/// A path's root and what is under it.
 fn rooted(path: &str) -> Option<(&str, Option<&str>)> {
     let rest = path.strip_prefix('@')?;
     if rest.starts_with('@') {
@@ -430,7 +426,6 @@ impl Encoder {
         }
     }
 
-    /// A name: its number once the file has spelled it.
     fn name(&mut self, name: &str, out: &mut Vec<u8>) {
         if let Some(id) = self.names.get(name) {
             put_varint(out, id.saturating_add(1));
@@ -549,7 +544,6 @@ impl Decoder {
         Ok(Item::Effect { record, stamp })
     }
 
-    /// One of aterm's own items (a note, a mark, the end).
     fn aterm_item(
         &mut self,
         tag: u8,
@@ -617,7 +611,7 @@ impl Decoder {
     }
 }
 
-/// THE CONTROL LANE'S REQUEST, as an `Exchange`'s request bytes.
+/// Control lane `Exchange` request bytes.
 #[must_use]
 pub fn ctl_request(args: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();

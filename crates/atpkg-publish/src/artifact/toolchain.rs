@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Trust toolchain a pack builds with: resolved once to a physical, build-numbered directory,
-//! held by an `atpkg` lease for the whole run, and admitted by content and lineage before anything
-//! is built.
+//! Resolving, leasing, and admitting the Trust toolchain a pack builds with.
 
 use std::path::{Path, PathBuf};
 
@@ -98,9 +96,7 @@ pub enum Held {
     Nothing,
 }
 
-/// Lease the build `dir` belongs to (a toolchain's `bin/`, or a sysroot under the store) while the
-/// returned [`Held`] lives: gc never reclaims a leased build and an unattended trust update waits
-/// for it.
+/// Leases the store build containing `dir` while the returned [`Held`] lives.
 /// # Errors
 /// A refusal when the directory is gone once the lease is laid.
 pub fn lease(ctx: &Ctx, dir: &Path, who: &str) -> Result<Held> {
@@ -143,8 +139,7 @@ pub fn lease_required(ctx: &Ctx, dir: &Path, who: &str) -> Result<Held> {
     }
 }
 
-/// Admit the compiler in `bin` by content and lineage under `switch`'s policy, through the client's
-/// own checker; its record is the pack's provenance.
+/// Admits the compiler in `bin` by content and lineage under `switch`.
 /// # Errors
 /// A refusal carrying every reason the checker gave.
 pub fn admit(tools: &dyn Tools, bin: &Path, switch: &Switch) -> Result<atpkg::lineage::Compiler> {

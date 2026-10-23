@@ -6,18 +6,6 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 
 //! Shell integration injection for aterm.
-//!
-//! # Usage
-//!
-//! ```rust,no_run
-//! use aterm_shell_integration::{ShellType, prepare};
-//!
-//! let shell = ShellType::detect("/bin/zsh");
-//! if let Ok(Some(injection)) = prepare(shell) {
-//!     // Add injection.env_add to the child's environment before fork
-//!     // Use injection.argv_override if Some (bash --rcfile)
-//! }
-//! ```
 #![cfg_attr(
     test,
     allow(
@@ -69,7 +57,6 @@ pub mod scripts {
     }
 }
 
-/// Header prepended to every standalone body file (`aterm_shell_integration_body.<ext>`).
 const BODY_FILE_HEADER: &str = "\
 # aterm shell integration — the BODY alone (the LOADER / BODY split, 2026-09-26).
 #
@@ -449,8 +436,6 @@ pub fn typed_rekey_with_loader(shell: ShellType, quoted_path: &str) -> Option<St
     })
 }
 
-/// Memoized path of this build's installed script directory (keyed by path in
-/// case [`cache_dir`] changes with XDG env).
 static SCRIPTS_WRITTEN: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Prepare shell integration for `shell`.
@@ -459,13 +444,13 @@ pub fn prepare(shell: ShellType) -> Result<Option<InjectionEnv>, std::io::Error>
     prepare_cached(shell, cache_dir(), &SCRIPTS_WRITTEN)
 }
 
-/// Ensure this build's content-addressed script directory (`<cache>/<address>/`) is installed and return its path.
+/// Install this build's content-addressed script directory and return its path.
 #[inline]
 pub fn ensure_script_set() -> Result<PathBuf, std::io::Error> {
     ensure_cached(cache_dir(), &SCRIPTS_WRITTEN)
 }
 
-/// Compile the zsh loader and body in `dir` to `.zwc` wordcode (`zcompile -U` under `zsh -f`, staged via a `.zwc` temp file and renamed into place).
+/// Compile the zsh loader and body in `dir` to `.zwc` wordcode via `zsh -f`.
 /// # Errors
 /// When `zsh` cannot be run, `zcompile` fails, or the rename fails.
 #[cfg(any(unix, windows))]
@@ -542,8 +527,6 @@ fn ensure_cached(
     Ok(base)
 }
 
-/// Canonical list of relative paths and contents for a script folder, shared by
-/// [`ensure_scripts`], [`script_set_address`], and [`script_set_matches`].
 fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 14] {
     [
         (
@@ -593,27 +576,21 @@ fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 14] {
     ]
 }
 
-/// Build a standalone body file ([`BODY_FILE_HEADER`] + [`scripts::body`]).
 fn body_file(loader: &str) -> std::borrow::Cow<'static, str> {
     let body = scripts::body(loader).expect("a zsh/bash/fish script carries its body markers");
     std::borrow::Cow::Owned(format!("{BODY_FILE_HEADER}{body}"))
 }
 
-/// LF-normalized [`scripts::ZSH`] with comment lines stripped ([`strip_comment_lines`]).
 fn installed_zsh() -> &'static str {
     static INSTALLED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     INSTALLED.get_or_init(|| strip_comment_lines(&lf_only(scripts::ZSH)))
 }
 
-/// LF-normalized [`scripts::BASH`] with comment lines stripped ([`strip_comment_lines`]).
 fn installed_bash() -> &'static str {
     static INSTALLED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     INSTALLED.get_or_init(|| strip_comment_lines(&lf_only(scripts::BASH)))
 }
 
-/// Strip standalone `#` comment lines from `script` (preserving a leading `#!`
-/// and [`scripts::BODY_BEGIN`] / [`scripts::BODY_END`] markers) to reduce shell
-/// parse time at startup.
 fn strip_comment_lines(script: &str) -> String {
     let mut out = String::with_capacity(script.len());
     for (index, line) in script.split_inclusive('\n').enumerate() {
@@ -652,15 +629,12 @@ pub fn script_set_address() -> &'static str {
     })
 }
 
-/// Whether `dir` contains every file of [`script_set`] byte-for-byte.
 fn script_set_matches(dir: &Path) -> bool {
     script_set()
         .iter()
         .all(|(path, bytes)| std::fs::read(dir.join(path)).is_ok_and(|b| b == bytes.as_bytes()))
 }
 
-/// Unique scratch suffix (`<pid>-<nanos>-<seq>`) so concurrent threads within one
-/// process never collide on a microsecond clock tick.
 fn scratch_suffix() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     #[cfg_attr(
@@ -678,8 +652,6 @@ fn scratch_suffix() -> String {
     format!("{}-{nanos}-{n}", std::process::id())
 }
 
-/// Install this build's script set at `<root>/<address>/` via a `.tmp-…` staging
-/// directory and atomic rename, moving aside any corrupted existing directory.
 fn install_script_set(root: &Path) -> Result<PathBuf, std::io::Error> {
     let address = script_set_address();
     let dir = root.join(address);
@@ -720,7 +692,6 @@ pub const GC_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 
 /// Number of newest foreign script folders always retained regardless of age.
 pub const GC_KEEP_NEWEST: usize = 5;
 
-/// Age after which leftover `.tmp-…`/`.stale-…` scratch directories are removed.
 const GC_SCRATCH_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Whether `name` is a 16-character lowercase hex content address.
@@ -740,9 +711,6 @@ const fn is_address(name: &str) -> bool {
     true
 }
 
-/// Remove other builds' script folders under `root` older than [`GC_MIN_AGE`]
-/// (retaining the [`GC_KEEP_NEWEST`] newest and this build's own) along with
-/// stale scratch directories.
 fn collect_old_script_sets(root: &Path, now: std::time::SystemTime) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -774,7 +742,7 @@ fn collect_old_script_sets(root: &Path, now: std::time::SystemTime) {
     }
 }
 
-/// Prepare shell integration into an explicit `base` directory (unconditional write, no memoization).
+/// Prepare shell integration into an explicit `base` directory without memoization.
 pub fn prepare_into(shell: ShellType, base: &Path) -> Result<Option<InjectionEnv>, std::io::Error> {
     if shell == ShellType::Unknown {
         return Ok(None);
@@ -783,7 +751,6 @@ pub fn prepare_into(shell: ShellType, base: &Path) -> Result<Option<InjectionEnv
     Ok(injection_for(shell, base))
 }
 
-/// Build the per-shell injection env for scripts already present at `base`.
 fn injection_for(shell: ShellType, base: &Path) -> Option<InjectionEnv> {
     match shell {
         ShellType::Zsh => Some(prepare_zsh(base)),
@@ -796,9 +763,6 @@ fn injection_for(shell: ShellType, base: &Path) -> Option<InjectionEnv> {
     }
 }
 
-/// Cache directory for shell integration files (`$XDG_CACHE_HOME/aterm/shell-integration`
-/// or `~/.cache/aterm/shell-integration` on Unix; `%LOCALAPPDATA%\aterm\shell-integration`
-/// on Windows).
 fn cache_dir() -> PathBuf {
     #[cfg(any(unix, windows))]
     if let Some(root) = aterm_uds::test_binary::scratch_root()
@@ -809,7 +773,6 @@ fn cache_dir() -> PathBuf {
     per_user_cache_dir()
 }
 
-/// Per-user cache directory used outside Cargo test binaries.
 fn per_user_cache_dir() -> PathBuf {
     #[cfg(windows)]
     {
@@ -853,7 +816,6 @@ fn lf_only(contents: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Write all files in [`script_set`] into `base`.
 fn ensure_scripts(base: &Path) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(base)?;
     for (path, bytes) in script_set() {
@@ -866,7 +828,6 @@ fn ensure_scripts(base: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-/// Parked-hold prelude shared by zsh (`.zshenv`) and bash (`--rcfile`) wrappers: if the session's spare FIFO exists, emit `633;P;AtermSpare=parked` and wait for `run` (proceed to warm hold at first prompt), `go`, or `go <folder>` (retarget working directory and preserve `OLDPWD` per shell convention).
 macro_rules! spare_parked_hold {
     () => {
         "\
@@ -907,7 +868,6 @@ unset __aterm_spare_n __aterm_spare_go __aterm_spare_cd __aterm_spare_o
     };
 }
 
-/// Capture any DEBUG trap set by user startup files into `<re-key path>.trap` (or `$__aterm_rc_debug_trap`) and clear it before sourcing the bash integration, since `.` hides the caller's DEBUG trap unless `functrace` is set (and bash 3.2 restores the caller's trap on return from `.`).
 macro_rules! bash_debug_trap_handover {
     () => {
         "\
@@ -931,8 +891,6 @@ esac
     };
 }
 
-/// zsh wrapper `.zshenv` that restores `ZDOTDIR` from `ATERM_ORIGINAL_ZDOTDIR`
-/// before sourcing the user's `.zshenv` and our integration.
 const ZSH_WRAPPER: &str = concat!(
     spare_parked_hold!(),
     "\
@@ -952,8 +910,6 @@ source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.zsh\"
 "
 );
 
-/// Login-style bash `--rcfile` wrapper used on macOS and inside WSL
-/// ([`WSL_LAUNCH_SH`]).
 const BASH_WRAPPER: &str = concat!(
     spare_parked_hold!(),
     "\
@@ -977,8 +933,6 @@ fi
 "
 );
 
-/// Bash loader used on non-macOS Unix (`bash --rcfile`) and Git Bash
-/// (`bash --login --posix` via `$ENV`, [`BASH_LOGIN_START`]).
 const BASH_LOADER: &str = concat!(
     spare_parked_hold!(),
     "\
@@ -1156,10 +1110,6 @@ fn prepare_fish(base: &Path) -> InjectionEnv {
     }
 }
 
-/// PowerShell/pwsh injection: `-ExecutionPolicy Bypass -NoExit -Command`
-/// dot-sources `aterm_shell_integration.ps1` after the user's profiles load,
-/// wrapping any profile-installed `prompt` and layering readline chords over
-/// PSReadLine's Windows edit mode.
 fn prepare_powershell(base: &Path) -> InjectionEnv {
     InjectionEnv {
         env_add: vec![(
@@ -1181,17 +1131,12 @@ fn prepare_powershell(base: &Path) -> InjectionEnv {
 /// Environment variable carrying a POSIX cwd across the WSL boundary ([`wsl_cwd_env`]).
 pub const WSL_CWD_VAR: &str = "ATERM_WSL_CWD";
 
-/// `WSLENV` entries contributed by [`prepare_wsl`] (`/p` translates the Windows
-/// cache directory path into the distro's mount namespace).
 const WSLENV_ENTRIES: [&str; 3] = [
     "ATERM_SHELL_INTEGRATION_DIR/p",
     "ATERM_SHELL_NONCE",
     WSL_CWD_VAR,
 ];
 
-/// Inline `/bin/sh -c` launcher passed to `wsl.exe --exec`: `cd`s into
-/// [`WSL_CWD_VAR`] if set, then execs the user's `$SHELL` with `--rcfile` when
-/// `$SHELL` is bash, or as a plain `-l` login shell otherwise.
 const WSL_LAUNCH_SH: &str = concat!(
     r#"if [ -n "$ATERM_WSL_CWD" ] && [ -d "$ATERM_WSL_CWD" ]; then cd "$ATERM_WSL_CWD"; fi; "#,
     "unset ATERM_WSL_CWD; ",
@@ -1235,7 +1180,6 @@ pub fn wsl_cwd_env(shell: ShellType, cwd: Option<&str>) -> Option<(String, Strin
     Some((WSL_CWD_VAR.to_string(), cwd.to_string()))
 }
 
-/// WSL injection via `WSLENV` and `wsl.exe --exec /bin/sh -c` ([`WSL_LAUNCH_SH`]).
 fn prepare_wsl(base: &Path) -> InjectionEnv {
     let existing = std::env::var("WSLENV").unwrap_or_default();
     InjectionEnv {
@@ -1256,19 +1200,12 @@ fn prepare_wsl(base: &Path) -> InjectionEnv {
     }
 }
 
-/// Default `cmd.exe` prompt when `PROMPT` is unset (`C:\dir>`).
 const CMD_DEFAULT_PROMPT: &str = "$P$G";
 
-/// `OSC 0` title sequence setting the console title to the current directory (`$P`).
 const CMD_PROMPT_TITLE: &str = "$e]0;$P$e\\";
 
-/// Disable bracketed paste (2004) and in-band size reports (2048) at each `cmd` prompt.
 const CMD_PROMPT_MODES: &str = "$e[?2004l$e[?2048l";
 
-/// `cmd.exe` partial integration via `%PROMPT%`: wraps any inherited `PROMPT`
-/// with [`CMD_PROMPT_TITLE`] (`OSC 0`), [`CMD_PROMPT_MODES`], `OSC 133;A`,
-/// `OSC 633;P;Cwd=$P` (after `133;A` so the CWD is recorded on the new block),
-/// and `OSC 133;B`.
 fn prepare_cmd() -> InjectionEnv {
     let inherited = std::env::var("PROMPT").ok();
     InjectionEnv {
@@ -1277,13 +1214,11 @@ fn prepare_cmd() -> InjectionEnv {
     }
 }
 
-/// Pure helper constructing the instrumented `cmd.exe` `%PROMPT%` string.
 fn cmd_prompt(inherited: Option<&str>) -> String {
     let user = inherited
         .filter(|p| !p.is_empty())
         .unwrap_or(CMD_DEFAULT_PROMPT);
     if user.contains("]133;A") {
-        // Already instrumented (nested aterm): leave it exactly as inherited.
         return user.to_string();
     }
     let title = CMD_PROMPT_TITLE;

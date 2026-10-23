@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The shared input reducer, `EditorInput` (design §4.4; slice S4).
+//! The shared input reducer (`EditorInput`).
 
 use aterm_types::keyboard::{Key, Modifiers, NamedKey};
 
@@ -100,7 +100,7 @@ impl Shortcut {
 }
 
 impl EditorWorkspace {
-    /// Reduce one input from a face: the one place a key becomes a command.
+    /// Reduce one input from a face.
     pub fn handle_input(
         &mut self,
         store: &mut DocumentStore,
@@ -186,8 +186,7 @@ impl EditorWorkspace {
         self.reduce_key(store, view, key, mods, text)
     }
 
-    /// [`Self::reduce_editor_key`] once the keypad is folded and a pending
-    /// ESC has had its say.
+    /// [`Self::reduce_editor_key`] once the keypad is folded and a pending ESC has had its say.
     fn reduce_key(
         &mut self,
         store: &mut DocumentStore,
@@ -327,9 +326,6 @@ impl EditorWorkspace {
         Ok(Reduction::reveal(effects))
     }
 
-    /// Run `command` on the document, unless a minibuffer is open: it owns
-    /// the keys then, and a document gesture (Delete, an arrow, ⌘Z) is
-    /// refused with a status line rather than leaking into the text.
     fn document_gesture(
         &mut self,
         store: &mut DocumentStore,
@@ -356,7 +352,6 @@ mod tests {
         Profile::Terminal,
     ];
 
-    /// An editor on `text` whose workspace uses `profile`'s keymap.
     fn editor(
         profile: Profile,
         text: &str,
@@ -391,8 +386,6 @@ mod tests {
         Keymap::emacs(profile).resolve(&[KeyChord::parse(chord).expect("test chord parses")])
     }
 
-    /// The profiles differ only where a face's platform has a reflex of its
-    /// own.
     #[test]
     fn profile_tables() {
         let command = KeyResolution::Command;
@@ -443,11 +436,6 @@ mod tests {
         }
     }
 
-    /// ESC is Meta in the terminal face alone (`Profile::escape_is_meta`):
-    /// there `ESC x` is `M-x`, ESC keeps a region and a C-u argument while it
-    /// waits, and ESC ESC quits. A GUI's Escape is what it always was: it
-    /// quits at once (the region and a C-u argument go, the status says
-    /// Quit), and the key after it is typed as itself.
     #[test]
     fn escape_is_meta_only_in_the_terminal_face() {
         let escape = || key(Key::Named(NamedKey::Escape), Modifiers::empty());
@@ -527,12 +515,6 @@ mod tests {
         }
     }
 
-    /// In the terminal face ESC is Meta only for a key the keymap can
-    /// spell. A key it cannot (Down, a function key) or a Super key ends the
-    /// ESC and does what it does without it, and so do committed text and a
-    /// paste; a pending C-u survives the ESC it outlived. Any other pending
-    /// sequence waits on. In a GUI, Escape leaves nothing pending, so every
-    /// one of these keys does what it does after a plain Escape.
     #[test]
     fn escape_ends_for_a_key_it_cannot_spell() {
         let text = "alpha beta\ngamma delta\nthird\nfourth\nfifth\nsixth\n";
@@ -660,9 +642,6 @@ mod tests {
         assert_eq!(view.prefix_hud, None);
     }
 
-    /// A minibuffer a face opens outside the keys (the Find, Go to Line and
-    /// Commands buttons) ends a pending sequence, which could never complete
-    /// inside it; a pending C-u still reaches the command M-x runs.
     #[test]
     fn a_minibuffer_opened_outside_the_keys_ends_a_pending_sequence() {
         let escape = key(Key::Named(NamedKey::Escape), Modifiers::empty());
@@ -730,8 +709,6 @@ mod tests {
         assert_eq!(view.primary_selection().head, 4);
     }
 
-    /// ESC is Meta for exactly one key: ESC b moves back a word, ESC C-g
-    /// cancels, and a C-u before it reaches the M- command.
     #[test]
     fn escape_is_meta_for_one_key() {
         let text = "alpha beta gamma";
@@ -805,8 +782,6 @@ mod tests {
         assert!(!view.chord_pending());
     }
 
-    /// TAB indents to the next tab stop at every caret, never over a region,
-    /// and completes an M-x query instead while one is open.
     #[test]
     fn tab_indents_to_the_next_tab_stop() {
         let tab = || key(Key::Named(NamedKey::Tab), Modifiers::empty());
@@ -903,8 +878,6 @@ mod tests {
         assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "one  two");
     }
 
-    /// The ⌘ shortcuts belong to the GUI profiles; the terminal face drops a
-    /// Super key, and ⌘S saves even with a sequence half typed.
     #[test]
     fn super_shortcuts_are_the_gui_profiles() {
         let save = |profile: Profile, before: &[EditorInput]| {
@@ -955,9 +928,6 @@ mod tests {
         assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "abc");
     }
 
-    /// Keys that type insert their layout's text, a paste is one transaction
-    /// whose newline is text, PageDown pages the caret with the view, and a
-    /// key the editor has no use for is ignored.
     #[test]
     fn plain_keys_type_paste_scroll_and_ignore() {
         let (mut store, mut workspace, mut view, document) = editor(Profile::Terminal, "");

@@ -32,6 +32,7 @@ mod mint;
 mod mktemp;
 mod rules;
 mod slog_inert;
+mod stock_label;
 mod term_write;
 
 /// One violation: where, which rule, and what the rule saw there.
@@ -97,6 +98,7 @@ pub const GUARDS: &[Rule] = &[
     slog_inert::SLOG_INERT,
     eager_drop::EAGER_DROP,
     doc_sentence::DOC_SENTENCE,
+    stock_label::STOCK_LABEL,
     github::GITHUB_AUTH_DOOR,
     github::GH_SPAWN,
     github::AGH_FX,

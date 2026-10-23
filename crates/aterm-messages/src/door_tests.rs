@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the gaps in the type-level rule
-//! (`need.rs`) and how the door closes them — a decline is not an action, a
-//! standing row is born late, a Live row that shows no indicator is not work,
-//! a decision row keeps its ten minutes, and a recorded ask is named.
+//! Tests for `MessageCenter` admission rules (`need.rs`).
 
 use crate::center::{MessageCenter, Outcome};
 use crate::log::MessageLog;
@@ -32,7 +29,6 @@ fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
 
-/// A standing ask that says its sentence and offers no button.
 fn sentence() -> Ask {
     Ask::standing(
         StandingWhy::OnlyYou(Reason::new("its own work holds the move")),
@@ -65,10 +61,7 @@ fn upgrade_row() -> Message {
     .key("harness.upgrade.s-3e79")
 }
 
-/// A Warn row held until read whose only capsules are `Not today` and `Skip version`
-/// (two ways to be quiet, none to fix anything) is recorded, never shown. The same row
-/// with no capsule (the sentence is the action), or with a real button beside the
-/// snoozes, stands.
+/// A standing `Warn` row whose only actions are snoozes is recorded rather than shown.
 #[test]
 fn a_standing_row_whose_only_capsules_decline_is_recorded_never_shown() {
     let now = t0();
@@ -87,7 +80,6 @@ fn a_standing_row_whose_only_capsules_decline_is_recorded_never_shown() {
     assert_eq!(rec.severity, Severity::Warn, "Problems still lists it");
     assert_eq!(c.wanted_rows(), 0);
 
-    // Controls: the sentence alone stands; a real button beside the snoozes stands.
     let mut c = fresh(now);
     let bare = c.post(upgrade_row().now(sentence()), stamp(), now).id;
     assert!(c.live(bare).is_some(), "words alone are an action");
@@ -117,7 +109,6 @@ fn a_standing_row_whose_only_capsules_decline_is_recorded_never_shown() {
     assert_eq!(c.demotions(), 0);
 }
 
-/// `is_snooze` is the one list of what only silences a row.
 #[test]
 fn is_snooze_names_exactly_the_snoozes() {
     let declines = [
@@ -160,9 +151,7 @@ fn is_snooze_names_exactly_the_snoozes() {
     }
 }
 
-/// A Live row shows work: a fill or `busy`. One that shows neither at Warn or above is
-/// blocked on a person without saying why, so it is recorded; `.working()` demands the
-/// same indicator. At Info a still Live row stays.
+/// A `Hold::Live` row at `Warn`+ or via `.working()` requires a progress indicator.
 #[test]
 fn a_blocked_live_row_at_warn_is_a_record_and_work_needs_its_indicator() {
     let now = t0();
@@ -218,8 +207,7 @@ fn a_blocked_live_row_at_warn_is_a_record_and_work_needs_its_indicator() {
     assert_eq!(c.demotions(), 0);
 }
 
-/// A standing row is born late (Row Law, clause 2): posted and withdrawn inside the
-/// progress grace, it never asks the band for a row.
+/// A standing ask resolved within `PROGRESS_GRACE` is never revealed.
 #[test]
 fn a_standing_ask_waits_out_the_progress_grace() {
     let now = t0();
@@ -231,13 +219,11 @@ fn a_standing_ask_waits_out_the_progress_grace() {
     let id = c.post(msg, stamp(), now).id;
     assert_eq!(c.wanted_rows(), 0, "not yet");
     assert_eq!(c.commit_rows(now, 3), None);
-    // It ends inside the grace: no row was ever wanted.
     assert!(c.resolve(id, Outcome::Ok, now + ms(800)));
     let _ = c.settle(now + PROGRESS_GRACE + ms(1), true);
     assert_eq!(c.wanted_rows(), 0);
     assert_eq!(c.commit_rows(now + PROGRESS_GRACE + ms(1), 3), None);
 
-    // A row that lasts is revealed at the grace, and then it is a band row.
     let msg = Message::new(tags::HARNESS, Severity::Warn, "Claude stopped in tab 4")
         .key("harness.upgrade.s-4")
         .now(sentence());
@@ -247,10 +233,7 @@ fn a_standing_ask_waits_out_the_progress_grace() {
     assert!(c.live(id).is_some_and(|l| l.revealed));
 }
 
-/// A decision row keeps its ten minutes when it is a class: the posture row
-/// (`Ask::flash(.., Span::Ten)`) and a question (`Ask::question`, a `Hold::Ask` that ranks
-/// first). The same hold written by hand on an unclassified row is cut to
-/// `MAX_TRANSIENT` and counted.
+/// Classified decision rows keep a 10-minute hold; unclassified rows are capped at `MAX_TRANSIENT`.
 #[test]
 fn a_decision_row_keeps_its_ten_minutes_and_an_unclassified_one_is_cut() {
     let now = t0();
@@ -303,9 +286,7 @@ fn a_decision_row_keeps_its_ten_minutes_and_an_unclassified_one_is_cut() {
     assert_eq!(c.last_demoted(), Some("packages.posture2"));
 }
 
-/// The door names what it recorded, so the host's one warning points at the builder: a
-/// standing ask whose action is two actions (` or `) is recorded with its words and
-/// severity, and `last_demoted` is its key.
+/// Demoted standing asks record their key in `last_demoted`.
 #[test]
 fn a_recorded_ask_is_named_for_the_hosts_one_warning() {
     let now = t0();

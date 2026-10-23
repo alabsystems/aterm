@@ -722,11 +722,14 @@ pub(crate) fn cmd_await(
 
     use aterm_core::terminal::{RowRange, WatcherSpec};
 
-    const USAGE: &str = "ERR usage: await <idle <ms>|seq [<n>]|match <re> [rows <a> <b>]|\
-                         gone <re> [rows <a> <b>]|block|frame|inbox since=<id> [kinds=<k,...>] [topic=<t>]|\
-                         agent <word>[,<word>...] [since=<rev>]|task [@<sel>[:<rev>][,...]] [any|all] [since=<rev>]|\
-                         log need|open=<lvl>|close=<lvl>|kind=<k> [since=<seq> ep=<e>]> \
-                         [timeout <ms>] | await consent [kind=debugger] [timeout=<ms>] | await momentum <floor 0..=1> [timeout <ms>]\n";
+    const USAGE: &str = "ERR usage: await idle <ms> | seq [<n>] | match <re> [rows <a> <b>] | \
+                         gone <re> [rows <a> <b>] | block | frame | inbox since=<id>|re=<off> \
+                         [kinds=<k,...>] [topic=<t>] | agent <word>[,<word>...] [since=<rev>] | \
+                         task [@<sel>[:<rev>][,...]] [any|all] [since=<rev>] | \
+                         log <need|open=<lvl>|close=<lvl>|kind=<k>>[,...] [since=<seq> ep=<e>] | \
+                         sys <predicate> | \
+                         edit ticket=<t>|uri=<file-uri> | consent [kind=debugger] | \
+                         momentum <floor 0..=1>; each takes [timeout=<ms>]\n";
 
     let mut toks = rest.split_whitespace();
     let mut timeout_ms = aterm_control::wire::WAIT_DEFAULT_MS;
@@ -1922,7 +1925,7 @@ fn guarded_submit(
 }
 
 /// `turn`'s usage line.
-pub(crate) const TURN_USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>] <text>\n";
+pub(crate) const TURN_USAGE: &str = "ERR usage: turn [id=<epoch>:<producer>:<seq>] [if-supervisor=<holder>] [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] [if-rows=<first>-<last>:<hex16>] [cause=@<off>|<seq>] <text>\n";
 
 /// `turn`'s options as parsed ([`turn_options`]): every leading `k=v`, and the message after them, verbatim.
 pub(crate) struct TurnOptions<'a> {

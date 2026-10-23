@@ -97,9 +97,7 @@ impl Probe {
     }
 
     /// Current thermal throttle level, or [`Why`] it is unavailable.
-    ///
     /// # Errors
-    ///
     /// Returns [`Why`] when the platform or machine provides no reading.
     pub fn throttle(&mut self) -> Result<Throttle, Why> {
         #[cfg(target_os = "linux")]
@@ -594,7 +592,7 @@ pub struct GpuReading {
     pub cores: Option<u16>,
     /// Accelerator model/class name (macOS) or DRM driver name (Linux).
     pub name: Option<String>,
-    /// Reason [`Self::device_pct`] is `None` (e.g. [`Why::Asleep`] or [`Why::Unsupported`]).
+    /// Reason [`Self::device_pct`] is `None` (such as [`Why::Asleep`] or [`Why::Unsupported`]).
     pub unread: Option<Why>,
 }
 
@@ -835,7 +833,7 @@ pub struct LinkReading {
     pub up: bool,
     /// A loopback interface (`IFF_LOOPBACK`).
     pub loopback: bool,
-    /// Whether backed by a physical device (`/sys/class/net/<if>/device` on Linux; `None` on macOS).
+    /// Whether backed by a physical device.
     pub physical: Option<bool>,
     /// Driver-reported link rate in bits per second, if known.
     pub rate_bps: Option<u64>,
@@ -913,9 +911,9 @@ pub fn net_links_into(scratch: &mut Vec<u8>) -> Option<Vec<LinkReading>> {
 /// System-wide and per-user process/task table ceilings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessLimits {
-    /// Maximum processes/tasks system-wide (`kern.maxproc` on macOS; `min(pid_max, threads-max)` on Linux).
+    /// Maximum processes/tasks system-wide.
     pub system: Option<u64>,
-    /// Maximum processes/tasks for one user (`min(kern.maxprocperuid, RLIMIT_NPROC)` on macOS; `RLIMIT_NPROC` on Linux).
+    /// Maximum processes/tasks for one user.
     pub per_user: Option<u64>,
 }
 
@@ -983,7 +981,7 @@ pub fn process_limits() -> ProcessLimits {
 /// Kernel workqueue thread-pool ceilings per process (`workqueue_limits`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WorkqueueLimits {
-    /// Maximum constrained (non-overcommit) workqueue threads per process (`kern.wq_max_constrained_threads`).
+    /// Maximum constrained (non-overcommit) workqueue threads per process.
     pub constrained: Option<u64>,
     /// Maximum total workqueue threads per process (`kern.wq_max_threads`).
     pub total: Option<u64>,

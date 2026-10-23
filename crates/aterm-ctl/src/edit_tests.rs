@@ -10,16 +10,10 @@ use super::*;
 const SID: &str = "s-ab";
 const URI: &str = "file:///tmp/x%20y/COMMIT_EDITMSG";
 
-/// How long the mock window may take to accept and answer the connect phase:
-/// a hang detector, never a latency budget (a loaded machine may not run the
-/// mock thread for seconds).
+/// How long the mock window may take to accept and answer the connect phase.
 #[cfg(unix)]
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-/// A scripted [`Wire`]: each `resolve` and `send` takes the next scripted
-/// answer (a resolve with none left answers `/run/a.sock`, a send with none
-/// left is refused as a dead socket is), and the clock moves only by the
-/// pauses asked of it.
 struct Script {
     resolves: VecDeque<io::Result<String>>,
     answers: VecDeque<io::Result<String>>,
@@ -45,7 +39,6 @@ impl Script {
         self
     }
 
-    /// The requests sent, without their sockets and waits.
     fn requests(&self) -> Vec<&str> {
         self.sent.iter().map(|(_, line, _)| line.as_str()).collect()
     }
@@ -92,11 +85,6 @@ fn uri_leg() -> String {
     format!("@{SID} await edit uri={URI} timeout=600000\n")
 }
 
-/// RE-ARMED UNTIL THE OUTCOME, with no total limit: two legs time out at the
-/// server's bound and the third answers. Every leg asks the same socket for
-/// the same ticket and the server's whole bound, and waits past it by the
-/// leg slack; nothing pauses between legs (the server's orphan grace starts
-/// at each leg's end).
 #[test]
 fn rearm_on_timeout() {
     let mut wire = Script::new(vec![
@@ -121,14 +109,6 @@ fn rearm_on_timeout() {
     assert_eq!(wire.paused, Duration::ZERO);
 }
 
-/// A LEG CUT BY ITS SERVER is re-dialled: the session's socket is resolved
-/// again and the wait re-armed by the file, because a successor knows no
-/// ticket the old process minted. A successor that does not host the session
-/// yet (`ERR no such session`) is looked at again, and once a leg is taken
-/// the wait is back to normal. `ERR unknown ticket` (a server that lost the
-/// ticket) re-arms by the file on the same socket. NEGATIVE CONTROL: nothing
-/// taking the wait within the successor bound ends it `Replaced`, with what
-/// was last heard, never an outcome.
 #[test]
 fn redial_by_uri_after_replaced() {
     for sid in [
@@ -248,10 +228,6 @@ fn redial_by_uri_after_replaced() {
     );
 }
 
-/// What each `edit` answer means for the client (design §6.1): an `ERR` the
-/// window answered, or no window to ask, sends it to its own terminal; the
-/// server's deadline, or a request taken and never answered, does not (the
-/// view may still open), and neither does an answer it cannot read.
 #[test]
 fn err_reply_selects_terminal_face() {
     for sid in [
@@ -365,20 +341,13 @@ fn err_reply_selects_terminal_face() {
     }
 }
 
-/// The exchanges over a real socket, through the connect phase every client
-/// here runs (`AUTH`, the `version` probe) to a mock window: `edit` sends its
-/// one line and reads the view's ticket; `await edit` re-arms on a new
-/// connection after `OK timeout`, and reads the outcome.
+/// The exchanges over a real socket.
 #[cfg(unix)]
 #[test]
 fn edit_and_await_edit_over_a_real_socket() {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
 
-    /// A wire pinned to one socket, sending as [`SocketWire`] does, but never
-    /// waiting less than the hang detector for the mock: its connect phase in
-    /// place of `CONNECT_WAIT`, and its answer even when the exchange's own
-    /// reply wait is shorter.
     struct Pinned(String);
     impl Wire for Pinned {
         fn resolve(&mut self) -> io::Result<String> {

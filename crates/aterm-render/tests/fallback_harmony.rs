@@ -10,9 +10,7 @@ use aterm_render::{
     fallback_xheight_scale, wide_center_offset,
 };
 
-/// On a dense lattice of finite positive (target, actual) pairs the scale stays inside the
-/// clamp interval, and when the ideal ratio is inside it the scaled advance equals the
-/// target (1e-3 relative).
+/// On a lattice of positive `(target, actual)` pairs, the scale stays clamped and exact in range.
 #[test]
 fn scale_clamp_bounds_and_exactness_lattice() {
     let vals: Vec<f32> = (1..=400).map(|i| i as f32 * 0.25).collect(); // 0.25..=100
@@ -81,10 +79,7 @@ fn scale_clamp_total_on_degenerate_inputs() {
     assert_eq!(fallback_cjk_scale(f32::MAX, f32::MIN_POSITIVE), 1.0);
 }
 
-/// Exhaustive over every (box_w, adv) in a lattice that includes `adv >
-/// box_w` (a clamped face whose scaled advance overflows the box): the
-/// offset satisfies the floor characterization `2*off <= gap <= 2*off + 1`,
-/// hence `|left - right| <= 1`.
+/// `wide_center_offset` satisfies `2*off <= gap <= 2*off + 1` across `(box_w, adv)` pairs.
 #[test]
 fn wide_center_offset_balances_margins_exhaustively() {
     let mut nonzero_offsets = 0u32;
@@ -109,9 +104,7 @@ fn wide_center_offset_balances_margins_exhaustively() {
     assert!(nonzero_offsets > 0);
 }
 
-/// The fit contains the whole bitmap and its advance after centring and never enlarges a
-/// glyph that fits; an oversized warning sign (30px mask, 27.5px advance, 10px cell) gets a
-/// roughly one-third uniform scale, not a crop.
+/// `fallback_fit_scale` contains the bitmap and its advance without enlarging.
 #[test]
 fn fallback_fit_scale_contains_ink_and_preserves_aspect() {
     let warning = fallback_fit_scale(10, 20, 30, 27, -1, 27.501_354);
@@ -151,9 +144,7 @@ fn fallback_fit_scale_contains_ink_and_preserves_aspect() {
     assert!(shrunk > 0, "the oversize arm must be exercised");
 }
 
-/// The symbol fit contains the centred ink (not the advance), is never smaller than the
-/// text fit and never enlarges; for a wide-advance symbol (Noto Sans Symbols 2's `⏺`: 0.9 em
-/// advance, 0.7 em disc) it is materially larger than the text fit.
+/// `fallback_ink_fit_scale` contains the centred ink without shrinking to fit the advance.
 #[test]
 fn fallback_ink_fit_scale_contains_the_ink_only() {
     use aterm_render::fallback_ink_fit_scale;
@@ -197,9 +188,7 @@ fn fallback_ink_fit_scale_contains_the_ink_only() {
     );
 }
 
-/// The fit class is the code point's Unicode class: letters (every script,
-/// the Mathematical Alphanumeric block included) and digits are TEXT;
-/// pictographs, media controls, shapes, dingbats and operators are SYMBOLS.
+/// `fallback_fit_class` classifies letters and digits as `Text` and symbols as `Symbol`.
 #[test]
 fn the_fallback_fit_class_follows_the_unicode_class() {
     use aterm_render::{FallbackFit, fallback_fit_class};
@@ -215,8 +204,7 @@ fn the_fallback_fit_class_follows_the_unicode_class() {
     }
 }
 
-/// Cell allocation follows Unicode width and config, never a fallback font's proportional
-/// advance.
+/// Cell allocation follows Unicode width and `ambiguous_width` config.
 #[test]
 fn fallback_cell_count_matches_terminal_cjk_policy() {
     use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
@@ -255,10 +243,7 @@ fn fallback_cell_count_matches_terminal_cjk_policy() {
     );
 }
 
-/// Engine → `RenderInput` → CPU raster cache for the config-sensitive edge classes: one
-/// EAW-A scalar received wide, then again after the policy reloads narrow (no reflow), so
-/// both spans coexist in one row and must reach distinct fitted raster keys; a zero-width
-/// combining overlay stays span 0.
+/// Wide and narrow spans of the same EAW-A scalar coexist with distinct raster cache keys.
 #[cfg(feature = "embedded-font")]
 #[test]
 fn materialized_ambiguous_spans_coexist_and_combining_stays_zero_width() {
@@ -388,10 +373,7 @@ fn materialized_ambiguous_spans_coexist_and_combining_stays_zero_width() {
     assert_ne!(combining_img.bytes().iter().copied().max(), Some(0));
 }
 
-/// Exhaustive over every (top, height, band) in a lattice spanning negative
-/// tops (ascender overshoot), zero-size bitmaps/bands and far-past-the-band
-/// placements: the trim only ever drops rows, every kept row lies inside
-/// `[0, band)`, and an already-in-band glyph is untouched.
+/// `clamp_to_row_band` keeps retained rows inside `0..band` and leaves in-band glyphs untouched.
 #[test]
 fn clamp_to_row_band_keeps_rows_in_band_exhaustively() {
     let mut trimmed = 0u32;
@@ -424,8 +406,7 @@ fn clamp_to_row_band_keeps_rows_in_band_exhaustively() {
     assert!(trimmed > 0 && untouched > 0);
 }
 
-/// A style (italic) mismatch outranks any weight distance (OS/2 weights are 1..=1000 and
-/// the italic penalty is 1000); among style-matched candidates the closest weight wins.
+/// `fallback_weight_rank` ranks style matches ahead of weight distance.
 #[test]
 fn weight_rank_orders_candidates() {
     assert!(
@@ -441,11 +422,7 @@ fn weight_rank_orders_candidates() {
     );
 }
 
-/// The CoreText drawability probe is total (garbage bytes, truncated fonts, an
-/// out-of-range collection index and the empty blob return `false` without panicking) and
-/// sound on a real face (accepting means a non-empty raster was obtained). Non-vacuity:
-/// Menlo is accepted for 'M'; the colour-emoji face is rejected for an emoji, which belongs
-/// to the colour pipeline.
+/// `ct_face_can_render` rejects invalid or colour-emoji faces and accepts monochrome glyphs.
 #[test]
 #[cfg(target_os = "macos")]
 fn ct_probe_is_total_and_sound() {
@@ -484,15 +461,13 @@ fn ct_probe_is_total_and_sound() {
     );
 }
 
-/// A checked-in face's bytes, for tests of the fallback lane's law rather than this host's
-/// faces.
+/// Read a checked-in font asset.
 fn asset(rel: &str) -> Vec<u8> {
     let path = format!("{}/assets/{rel}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
 }
 
-/// A renderer on the checked-in Cascadia Mono (no long arrows, no `⚠`) with
-/// `fallback` injected as its broad tier.
+/// Build a renderer on checked-in Cascadia Mono with `fallback` as its fallback face.
 fn cascadia_with_fallback(px: f32, fallback: &str) -> aterm_render::Renderer {
     let mut r = aterm_render::Renderer::from_bytes(
         &asset("bundled/CascadiaMonoPL-Regular.ttf"),
@@ -505,8 +480,7 @@ fn cascadia_with_fallback(px: f32, fallback: &str) -> aterm_render::Renderer {
     r
 }
 
-/// Whether some face of a candidate file in `paths` maps `ch`: a host fact read from the
-/// files, never from the renderer.
+/// Whether any face in `paths` maps `ch`.
 fn a_candidate_file_maps(paths: &[String], ch: char) -> bool {
     paths.iter().any(|p| {
         std::fs::read(p).is_ok_and(|bytes| {
@@ -521,9 +495,7 @@ fn a_candidate_file_maps(paths: &[String], ch: char) -> bool {
     })
 }
 
-/// A wide CJK glyph from the fallback chain sits inside the row band and owns the full
-/// 2-cell box, under both backends. It cannot run on a host whose candidate files map no
-/// ideograph.
+/// A wide CJK fallback glyph stays within the row band and spans its 2-cell box.
 #[test]
 fn cjk_fallback_glyph_is_banded_and_wide() {
     use aterm_render::{FaceId, GlyphClass, Renderer, Theme};
@@ -585,9 +557,7 @@ fn cjk_fallback_glyph_is_banded_and_wide() {
     }
 }
 
-/// A bare warning sign is text-presentation and one cell wide; a proportional fallback
-/// face must not let its ink spill into the next cell (`⚠ MCP`). Runs over the checked-in
-/// Noto Sans Symbols 2, whose `⚠` is wider than a cell.
+/// A narrow fallback symbol (`U+26A0`) stays bounded to one cell across styles.
 #[test]
 fn narrow_fallback_symbol_is_bounded_to_one_cell() {
     use aterm_render::{FaceId, GlyphClass, StyleBits};
@@ -679,8 +649,7 @@ fn narrow_fallback_symbol_is_bounded_to_one_cell() {
     );
 }
 
-/// With the stock macOS candidate list, 中 comes from the native CJK face (Hiragino Sans
-/// GB), not Arial Unicode, and a char Hiragino lacks still reaches the broad face.
+/// On macOS, Hiragino Sans GB leads the CJK chain while Arial Unicode backs non-CJK glyphs.
 #[test]
 #[cfg(target_os = "macos")]
 fn native_cjk_face_leads_the_macos_chain() {
@@ -701,12 +670,7 @@ fn native_cjk_face_leads_the_macos_chain() {
     );
 }
 
-/// U+27F5..U+27FC are East_Asian_Width Neutral (one cell) but fallback faces draw them
-/// wider (STIX Two Math: 1.612 em advance, 1.499 em ink); their coverage must stay inside
-/// the cell box, extending the `tests/display_faces.rs` law to the fallback lane, also under
-/// `debug_force_fontdue`. Runs over this host's chain and over the checked-in Noto Sans
-/// Math, which maps all eight, so every host checks the law. Non-vacuity: at least one
-/// arrow is condensed to exactly `cell_w`.
+/// Long arrows (`U+27F5..=U+27FC`) stay inside their single-cell box.
 #[test]
 fn long_arrows_never_leave_their_cell() {
     use aterm_render::{FaceId, GlyphClass, Renderer, Theme};
@@ -765,8 +729,7 @@ fn long_arrows_never_leave_their_cell() {
     );
 }
 
-/// A long arrow does not shear a box-drawing row: rendering `│⟹│` and `│ │` leaves both
-/// `│` cells and columns 3–4 pixel-identical; the middle cell must differ.
+/// Rendering a long arrow between box-drawing bars does not shear adjacent columns.
 #[test]
 fn a_long_arrow_does_not_shear_a_box_drawing_row() {
     use aterm_core::terminal::Terminal;
@@ -814,9 +777,7 @@ fn a_long_arrow_does_not_shear_a_box_drawing_row() {
     }
 }
 
-/// Exhaustive over a small geometry lattice: a shrink keeps the ink's vertical centre to
-/// within half a pixel, and when the smaller ink fits the row band it is placed inside it
-/// rather than left for `clamp_to_row_band` to crop.
+/// `shrink_ymin_about_ink_centre` preserves vertical centre and keeps fitting ink in the band.
 #[test]
 fn a_shrink_keeps_the_ink_centre_and_lands_in_the_band() {
     use aterm_render::shrink_ymin_about_ink_centre as shrink;

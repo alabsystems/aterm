@@ -1,9 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unattended publication lanes (`atpkg-publish lane run|install|disarm <alab|linux>`,
-//! [`alab`], [`linux`], [`resolve`], [`gap`], [`state`], [`hold`], [`rows`], [`report`],
-//! [`install`], [`units`], [`self_check`]).
+//! Unattended publication lanes ([`alab`], [`linux`], [`resolve`], [`gap`], [`state`], [`hold`],
+//! [`rows`], [`report`], [`install`], [`units`], [`self_check`]).
 
 pub mod alab;
 pub mod gap;
@@ -34,7 +33,6 @@ pub enum LaneKind {
 impl LaneKind {
     /// `alab` | `linux`.
     /// # Errors
-    ///
     /// A usage error for anything else.
     pub fn parse(s: &str) -> Result<Self> {
         match s {
@@ -72,7 +70,6 @@ pub struct RunFlags {
 impl RunFlags {
     /// Parse `lane run <lane>`'s flags.
     /// # Errors
-    ///
     /// A usage error naming the flag.
     pub fn parse(kind: LaneKind, args: &[String]) -> Result<Self> {
         let mut flags = Self::default();
@@ -118,9 +115,7 @@ impl RunFlags {
 
 /// `atpkg-publish lane <run|install|disarm> <alab|linux> …`.
 /// # Errors
-///
-/// A usage error for an unknown subcommand or lane; otherwise what the subcommand
-/// answers.
+/// A usage error for an unknown subcommand or lane; otherwise what the subcommand answers.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let (Some(sub), Some(kind)) = (args.first(), args.get(1)) else {
         return Err(Error::usage(
@@ -144,7 +139,6 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     }
 }
 
-/// The production `lane run`.
 fn run_lane(ctx: &Ctx, kind: LaneKind, flags: &RunFlags) -> Result<()> {
     let exe = std::env::current_exe().map_err(|e| Error::io("find this binary's own path", &e))?;
     let pinned = self_check(&exe, flags.sha256.as_deref(), flags.dry_run, &ctx.state_dir)?;
@@ -218,10 +212,9 @@ fn run_with_production_deps(
 
 /// The snapshot self-check.
 /// # Errors
-///
-/// A refusal when the executable does not hash to what the unit names, is not in a
-/// snapshot directory, or its `INSTALLED-FROM` names another hash; or when a signing run
-/// names no hash at all.
+/// A refusal when the executable does not hash to what the unit names, is not in a snapshot
+/// directory, or its `INSTALLED-FROM` names another hash; or when a signing run names no hash at
+/// all.
 pub fn self_check(
     exe: &Path,
     expected: Option<&str>,

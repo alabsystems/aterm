@@ -15,11 +15,8 @@ use crate::linux_proof::{self as proof, Gui};
 /// The Deck's height in points: aterm-gui's `stats_deck::DECK_PT`.
 pub const DECK_PT: f64 = 62.0;
 
-/// The column a press selects the first of two tabs at: well inside its
-/// card on an 80-column strip, clear of its close mark.
 const FIRST_TAB_COL: u16 = 5;
 
-/// What one check found.
 struct Check {
     name: String,
     ok: bool,
@@ -100,10 +97,6 @@ pub(crate) fn row(up: &Up, arch: Arch, screen: Screen, bin: &str, results: &Path
     }
 }
 
-/// Start the screen, then aterm-gui with the Deck on twice, on the GPU (the
-/// renderer a Linux window draws with, whose `image` is its own render) and
-/// on the CPU (`--cpu`, whose remainder bands are aterm's own): each check's
-/// finding, or why the row could not run.
 fn drive(
     up: &Up,
     arch: Arch,
@@ -174,7 +167,6 @@ fn drive(
     Ok(checks)
 }
 
-/// A `dims` reply's numbers.
 struct Dims {
     scale: f64,
     cell_w: usize,
@@ -211,24 +203,19 @@ impl Dims {
         })
     }
 
-    /// The Deck's 62 pt at this scale, in device px.
     fn deck_want(&self) -> usize {
         (DECK_PT * self.scale).round() as usize
     }
 
-    /// The Deck's rows in the frame.
     const fn deck_rows(&self) -> Range<usize> {
         self.deck_y..self.deck_y + self.deck_h
     }
 
-    /// The strip band's foot: the top pad, the head and the strip's rows.
     const fn band_foot(&self) -> usize {
         self.pad_top + self.head + self.tab_rows * self.cell_h
     }
 }
 
-/// One session's checks: the layout on both presenters, and the bands where
-/// the CPU presenter makes them.
 fn session_checks(s: &Session<'_>, presenter: &'static str, on: &str) -> Vec<Check> {
     let named = |check: &str| format!("{presenter} {check}");
     let mut out = Vec::new();
@@ -278,7 +265,6 @@ fn session_checks(s: &Session<'_>, presenter: &'static str, on: &str) -> Vec<Che
     out
 }
 
-/// The Deck's height and place in the head.
 fn head(d: &Dims) -> Result<String, String> {
     let want = d.deck_want();
     if d.deck_h != want || d.deck_y != 0 || d.head < d.deck_h {
@@ -294,7 +280,6 @@ fn head(d: &Dims) -> Result<String, String> {
     ))
 }
 
-/// Each header button's slot drawn in the band under the Deck.
 fn buttons(caption: &Caption, f: &Frame, d: &Dims) -> Result<String, String> {
     if !caption.client {
         return Ok("the window system frames the window: no buttons of aterm's".into());
@@ -323,8 +308,6 @@ fn buttons(caption: &Caption, f: &Frame, d: &Dims) -> Result<String, String> {
     }
 }
 
-/// The Deck turned off: the head less it, and the band under it the band
-/// without it, pixel for pixel; then the Deck turned back on.
 fn off(
     s: &Session<'_>,
     presenter: &str,
@@ -365,8 +348,6 @@ fn off(
     ))
 }
 
-/// Whether frame `on`'s `rows` band rows from `top` are frame `off`'s from
-/// its top, by RGB: what it says of them.
 fn band_held(on: &Frame, top: usize, off: &Frame, rows: usize) -> Result<String, String> {
     if on.w != off.w || on.h < top + rows || off.h < rows {
         return Err(format!(
@@ -402,7 +383,6 @@ fn band_held(on: &Frame, top: usize, off: &Frame, rows: usize) -> Result<String,
     }
 }
 
-/// A press on the strip under the Deck selects the first of two tabs.
 fn click(s: &Session<'_>) -> Result<String, String> {
     let made = s.ctl(&["tab", "new"])?;
     let active = |r: &str| r.split_whitespace().nth(1).map(str::to_string);
@@ -425,8 +405,6 @@ fn click(s: &Session<'_>) -> Result<String, String> {
     r
 }
 
-/// A window not whole cells, its frame held to the server's pixels but for
-/// the Deck's rows, and its remainder bands each the frame's nearest pixel.
 fn bands(s: &Session<'_>, caption: &Caption) -> Result<String, String> {
     let display = s.screen.display;
     let (how, d) = if caption.client {

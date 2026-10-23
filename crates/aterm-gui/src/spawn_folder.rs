@@ -108,11 +108,7 @@ fn folder_fault_in(
     within(in_flight, budget, dir, check).flatten()
 }
 
-/// Why a fresh shell cannot start in `dir`: [`folder_fault`], except that a
-/// check that did not answer in time — or was not started, the cap being
-/// reached, or not needed, another folder's check on the same volume having
-/// run past the budget ([`beside_silent`]) — is [`Fault::Unresponsive`] for a
-/// folder on a volume that is not local ([`remote_volume`]).
+/// Why a fresh shell cannot start in `dir`.
 pub(crate) fn start_fault(dir: &str) -> Option<Fault> {
     #[cfg(unix)]
     {
@@ -260,10 +256,6 @@ fn canonical_in(
     within(in_flight, budget, dir, check).flatten()
 }
 
-/// [`canonical_folder`] without the time limit. On Windows it is spelled
-/// without the verbatim prefix `canonicalize` answers with
-/// (`without_verbatim`): the harness compares it with the folder Claude
-/// Code's folder-trust dialog shows, `C:\…`, never `\\?\C:\…`.
 fn canonical_now(dir: &str) -> Option<String> {
     let canonical = std::fs::canonicalize(dir).ok()?;
     let canonical = canonical.to_string_lossy().into_owned();
@@ -408,7 +400,7 @@ fn remote_mount_of<'a>(
         .and_then(|(on, local)| (!local).then_some(on))
 }
 
-/// THE PATH ALIASES MACOS FIXES AT BOOT, so a folder and the mount that holds it are compared spelled one way, without asking any volume.
+/// The path aliases macOS fixes at boot, so a folder and the mount that holds it are compared spelled one way, without asking any volume.
 #[cfg(unix)]
 #[derive(Debug, Default)]
 pub(crate) struct Aliases {
@@ -429,10 +421,6 @@ const LINK_HOPS: usize = 4;
 
 #[cfg(unix)]
 impl Aliases {
-    /// PURE: the aliases named by the root's symlinks (`links`: a name at `/`
-    /// and its target as read, relative ones relative to `/`) and the text of
-    /// `/usr/share/firmlinks` (`firmlinks`: a path, a tab, the same folder
-    /// relative to the data volume, per line).
     fn of(links: impl IntoIterator<Item = (PathBuf, PathBuf)>, firmlinks: &str) -> Self {
         Self {
             links: links
@@ -448,8 +436,6 @@ impl Aliases {
         }
     }
 
-    /// PURE: `path` spelled one way: root links followed (up to [`LINK_HOPS`]),
-    /// then a firmlink's path spelled on the data volume.
     fn spelled(&self, path: &Path) -> PathBuf {
         let mut path = path.to_path_buf();
         for _ in 0..LINK_HOPS {
@@ -461,9 +447,6 @@ impl Aliases {
         Self::through(&self.firmlinks, &path).unwrap_or(path)
     }
 
-    /// `path` with the longest of `aliases` it starts with (by whole
-    /// components) replaced by that alias's target; `None` when it starts with
-    /// none.
     fn through(aliases: &[(PathBuf, PathBuf)], path: &Path) -> Option<PathBuf> {
         aliases
             .iter()
@@ -478,8 +461,6 @@ impl Aliases {
             })
     }
 
-    /// This machine's aliases, read once (the launch reads them ahead,
-    /// [`warm`]).
     fn here() -> &'static Self {
         static HERE: std::sync::OnceLock<Aliases> = std::sync::OnceLock::new();
         HERE.get_or_init(|| {
@@ -529,7 +510,6 @@ unsafe extern "C" {
 #[cfg(target_os = "macos")]
 fn mount_table() -> Vec<(std::path::PathBuf, bool)> {
     use std::os::unix::ffi::OsStringExt as _;
-    /// `<sys/mount.h>`.
     const MNT_NOWAIT: libc::c_int = 2;
     const MNT_LOCAL: u32 = 0x0000_1000;
     // SAFETY: a null buffer asks only for the count; nothing is written.
@@ -738,10 +718,7 @@ pub(crate) fn inherited_in(
     }
 }
 
-/// THE PARKED SPARE'S RETARGET: the kernel path of `dir` for a parked spare
-/// shell to move to, or `None` where it cannot: a folder judged not local, a
-/// read that ran past `CHECK_BUDGET`, or a folder the inherited `$HOME` or
-/// `$PWD` spells otherwise (`retarget_in`). `None` on other platforms.
+/// The parked spare's retarget.
 pub(crate) fn retarget_folder(dir: &str) -> Option<String> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -791,7 +768,7 @@ fn retarget_now(dir: &str) -> Option<String> {
     retarget_in(&kernel, names, [home.as_deref(), pwd.as_deref()])
 }
 
-/// PURE: [`retarget_folder`]'s rule over the folder's kernel path, `names` (whether a path names the folder) and the inherited `$HOME` and `$PWD`.
+/// [`retarget_folder`]'s rule over the folder's kernel path, `names` (whether a path names the folder) and the inherited `$HOME` and `$PWD`.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn retarget_in(
     kernel: &str,
@@ -901,13 +878,8 @@ fn kernel_path(dir: &str) -> Option<String> {
 }
 
 static NOTED_PENDING: AtomicBool = AtomicBool::new(false);
-/// The folders noted since the last park, oldest first, each once. Every
-/// entry is a shell that was spawned, so the list is as long as the person's
-/// own new tabs, and the park empties it.
 static NOTED: Mutex<Vec<(String, Fault)>> = Mutex::new(Vec::new());
 
-/// Note a folder a shell was asked to start in and could not, for the next
-/// park's row.
 fn note(dir: String, fault: Fault) {
     let Ok(mut noted) = NOTED.lock() else {
         return;
@@ -983,10 +955,6 @@ mod tests {
     #[cfg(unix)]
     use std::time::{Duration, Instant};
 
-    /// A WORKER'S TRUSTED FOLDER is spelled as Claude Code's folder-trust
-    /// dialog spells it: Windows' verbatim `\\?\` prefix comes off a drive's
-    /// path and a share's; a path with no other spelling keeps it, and any
-    /// other path is not one this rewrites.
     #[test]
     fn a_canonical_folder_is_spelled_without_the_verbatim_prefix() {
         for (verbatim, plain) in [
@@ -1020,8 +988,6 @@ mod tests {
         use super::fault_now;
         use std::os::unix::fs::PermissionsExt as _;
         use std::sync::atomic::AtomicUsize;
-        /// This test's own in-flight count: the process-wide one is shared
-        /// with every test that spawns a shell in a folder.
         static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
         let folder_fault =
             |dir: &str| within(&IN_FLIGHT, Duration::from_secs(60), dir, fault_now).flatten();
@@ -1064,12 +1030,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Condvar, Mutex, PoisonError};
 
-        /// This test's own in-flight count: the process-wide one is shared with
-        /// every test that spawns a shell in a folder, and four checks those
-        /// leave waiting would fill the cap and turn this `None` into the cap's.
         static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-        /// The hung check has started (so a `None` is the budget's, not the
-        /// in-flight cap's), and the gate it waits behind until the verdict.
         static ENTERED: AtomicBool = AtomicBool::new(false);
         static GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
         fn hangs(_: &str) -> Option<Fault> {
@@ -1404,12 +1365,8 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Condvar, Mutex, PoisonError};
 
-        /// This test's own in-flight counts (the process-wide one is shared
-        /// with every test that spawns a shell in a folder).
         static FULL: AtomicUsize = AtomicUsize::new(super::CHECKS_IN_FLIGHT_MAX);
         static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-        /// The hung check has started (so its `None` is the budget's, not the
-        /// cap's), and the gate it waits behind until the verdict.
         static ENTERED: AtomicBool = AtomicBool::new(false);
         static GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
         fn answers(_: &str) -> Option<String> {
@@ -1648,9 +1605,6 @@ mod tests {
         }
     }
 
-    /// The home folder stands in for a folder a shell cannot start in, naming it
-    /// and why; a present folder and an empty ask change nothing, and with no
-    /// home folder the request stands.
     #[test]
     fn a_folder_a_shell_cannot_start_in_starts_it_in_home_and_a_present_one_is_unchanged() {
         let fault = |dir: &str| match dir {
@@ -1703,11 +1657,6 @@ mod tests {
         }
     }
 
-    /// A SHELL HANDED NO FOLDER NEVER CHDIRS INTO A HOME THAT STOPPED
-    /// ANSWERING (session 0 of an aterm started from Finder): the folder the
-    /// PTY goes to unasked, on a volume that is not local by the mount table,
-    /// is checked, and silent it starts the shell in `/`, named as the home
-    /// that did not answer.
     #[test]
     fn a_home_that_stopped_answering_starts_an_unasked_shell_in_the_root() {
         let fault = |dir: &str| match dir {
@@ -1816,9 +1765,6 @@ mod tests {
         );
     }
 
-    /// A fall-back said once its shell is up reaches the queue in order, each
-    /// folder once, and the queue empties when taken; a start that used its
-    /// folder notes nothing.
     #[test]
     fn a_start_that_fell_back_reaches_the_queue_and_one_that_did_not_says_nothing() {
         let _lane = crate::message_inbox::lane_test_guard();
@@ -1847,8 +1793,6 @@ mod tests {
         assert!(take_noted().is_empty(), "drained");
     }
 
-    /// A held pane's folder (ssh: maybe another machine's) is taken only when it
-    /// is here; the same folder from a pane at its own prompt is taken.
     #[test]
     fn a_held_panes_folder_is_taken_only_when_it_is_here() {
         let gone = |dir: &str| (dir == "/home/me/proj").then_some(Fault::Missing);
@@ -1863,10 +1807,6 @@ mod tests {
         assert_eq!(inherited_in(local.clone(), || true, gone), Some(local));
     }
 
-    /// A PARKED SPARE'S RETARGET names the one `$PWD` every shell's start
-    /// would: the folder's kernel path, unless the inherited `$HOME` or `$PWD`
-    /// names the folder spelled otherwise (zsh would take it, bash would not)
-    /// or one FIFO line cannot carry it.
     #[test]
     fn a_retarget_names_the_folder_only_as_every_shell_would() {
         use std::ffi::OsStr;
@@ -1900,9 +1840,6 @@ mod tests {
         assert_eq!(retarget_in("tmp/x", |_| false, [None, None]), None);
     }
 
-    /// A retarget never moves a spare onto a volume that is not local: not to a
-    /// folder judged so (nothing is read there), and not through a person's
-    /// own symlink from a local folder into one (the bounded read lands there).
     #[test]
     fn a_retarget_never_lands_on_a_volume_that_is_not_local() {
         let remote = |dir: &str| dir.starts_with("/Volumes/share");

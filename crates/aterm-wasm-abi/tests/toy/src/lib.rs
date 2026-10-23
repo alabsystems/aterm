@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Toy WebAssembly module exporting every `aterm-wasm-abi` boundary type and shape.
+//!
+//! STOCK EXCEPTION: wasm32 only, and Trust has no wasm32 std, so `verify wasm-glue` builds it on
+//! rustup's stable (`crates/aterm-verify/src/wasm_glue/toy.rs`).
 
 #![cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! EPISODES AND THE DECK'S CLAUSE (RD §5.5): what the causes of successive split ticks add up to,
-//! on the host's monotonic clock (`Sample::mono_ms`, which stops while the Mac sleeps).
+//! EPISODES AND THE DECK'S CLAUSE (RD §5.5).
 
 use std::collections::HashMap;
 
@@ -12,8 +11,7 @@ use crate::model::Snapshot;
 
 /// An open episode closes once its cause has failed this long, ms.
 pub const CLOSE_MS: u64 = 30_000;
-/// Split ticks further apart than this are not consecutive, ms (a split window's own limit,
-/// [`super::WINDOW_MAX_NS`]).
+/// Split ticks further apart than this are not consecutive, ms.
 pub const GAP_MS: u64 = super::WINDOW_MAX_NS / 1_000_000;
 /// The clause needs its activity to cover this much, millicores.
 pub const CLAUSE_MC: i64 = 1000;
@@ -64,9 +62,7 @@ pub struct Episodes {
 }
 
 impl Episodes {
-    /// One split tick at `mono_ms` (wall `unix_ms`) on which `held` hold (`cut`: its sweep stopped
-    /// at its cap, so each tab's work episode stays as it was): every episode open after it, ranked
-    /// as [`super::detect()`] ranks causes.
+    /// One split tick at `mono_ms` (wall `unix_ms`) on which `held` hold.
     pub fn step(
         &mut self,
         mono_ms: u64,
@@ -155,8 +151,7 @@ pub struct ClauseHold {
 }
 
 impl ClauseHold {
-    /// One split tick at `mono_ms`, with the episodes `open` after it over the window `split`: the
-    /// clause to show.
+    /// One split tick at `mono_ms`, with the episodes `open` after it over the window `split`.
     pub fn step(
         &mut self,
         mono_ms: u64,
@@ -207,9 +202,6 @@ impl ClauseHold {
     }
 }
 
-/// The clause's candidate: the largest open covering cause that holds, when
-/// it is a named activity covering at least [`CLAUSE_MC`] and [`CLAUSE_PM`]
-/// of the busy CPU outside aterm (others, services and a positive residual).
 fn candidate(open: &[OpenCause], split: &CoalSplit) -> Option<DeckCause> {
     let o = open.iter().filter(|o| o.holds && o.id.covering()).fold(
         None,

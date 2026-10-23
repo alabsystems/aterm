@@ -18,10 +18,8 @@ pub fn ask_no_one(cmd: &mut aterm_uds::spawnfd::Command) -> &mut aterm_uds::spaw
 /// How long a git credential helper may run before it is taken for one waiting on a person.
 pub const PERSON_WAIT: Duration = Duration::from_secs(60);
 
-/// How often a [`Watch`] lists its child's process tree.
 const LOOK: Duration = Duration::from_secs(5);
 
-/// One row of a `ps -A -o pid=,ppid=,args=` listing.
 struct Row<'a> {
     pid: i32,
     ppid: i32,
@@ -49,7 +47,6 @@ fn rows(listing: &str) -> Vec<Row<'_>> {
         .collect()
 }
 
-/// `top` and every process below it, by parent pid.
 fn below(rows: &[Row<'_>], top: i32) -> BTreeSet<i32> {
     let mut tree = BTreeSet::from([top]);
     loop {
@@ -65,9 +62,7 @@ fn below(rows: &[Row<'_>], top: i32) -> BTreeSet<i32> {
     }
 }
 
-/// The git credential helpers running under `root` in a `ps -A -o pid=,ppid=,args=` listing, each
-/// with its name, the topmost of each chain only (git's `git credential-<name>` stands for the
-/// program it runs).
+/// The git credential helpers running under `root` in a `ps -A -o pid=,ppid=,args=` listing.
 #[must_use]
 pub fn helpers(listing: &str, root: i32) -> Vec<(i32, String)> {
     let rows = rows(listing);
@@ -99,8 +94,7 @@ pub fn helpers(listing: &str, root: i32) -> Vec<(i32, String)> {
         .collect()
 }
 
-/// `top` and every process below it in a `ps -A -o pid=,ppid=,args=` listing, each with its command
-/// line, in listing order.
+/// `top` and every process below it in a `ps -A -o pid=,ppid=,args=` listing.
 #[must_use]
 pub fn subtree(listing: &str, top: i32) -> Vec<(i32, String)> {
     let rows = rows(listing);
@@ -111,7 +105,6 @@ pub fn subtree(listing: &str, top: i32) -> Vec<(i32, String)> {
         .collect()
 }
 
-/// The helper a command line runs, if it is one ([`helpers`]).
 fn helper_name(args: &str) -> Option<&str> {
     let mut words = args.split_whitespace();
     let mut program = basename(words.next()?);
@@ -143,7 +136,6 @@ fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
-/// A program that runs a script named as its operand.
 fn interpreter(program: &str) -> bool {
     matches!(
         program,
@@ -157,8 +149,6 @@ fn interpreter(program: &str) -> bool {
 struct Seen(Vec<(Identity, String, Instant)>);
 
 /// A pid names a process only while its kernel start record still agrees.
-/// An unavailable record never authorizes a signal. This closes reuse between
-/// looks; the final start read and `kill` remain separate kernel operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Identity {
     pid: i32,
@@ -183,8 +173,6 @@ impl Identity {
 }
 
 impl Seen {
-    /// Note the helpers `running` at `now`: one no longer running is forgotten, a new
-    /// one is seen from `now`. The ones seen for `wait` or longer.
     fn overdue(
         &mut self,
         running: Vec<(Identity, String)>,
@@ -306,8 +294,6 @@ fn watch(root: Identity, wait: Duration, look: Duration, stopped: &mpsc::Receive
     }
 }
 
-/// Escalate only the original TERM targets that are still present. This
-/// deliberately needs no live root: an orphan can still hold its output pipe.
 fn escalate(
     ended: &mut Vec<(Identity, String)>,
     listing: &str,
@@ -328,7 +314,6 @@ fn escalate(
     }
 }
 
-/// `ps -A -o pid=,ppid=,args=`, or `None` when it cannot be read.
 fn listing() -> Option<String> {
     aterm_uds::spawnfd::command("/bin/ps")
         .args(["-A", "-o", "pid=,ppid=,args="])
@@ -340,8 +325,6 @@ fn listing() -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
-/// `SIGTERM` to `pid`, or `SIGKILL` when it is `hard` (a negative `pid` is a
-/// process group). Its own `kill`: the module needs nothing of the release's.
 fn end(pid: i32, hard: bool) {
     #[cfg(unix)]
     {
@@ -469,9 +452,6 @@ mod tests {
         assert_eq!(ended, [(process(509, 10), "sleep 120".to_string())]);
     }
 
-    /// The release's own git asks no person: once a waiting helper is ended, git
-    /// with no answer fails in its own words instead of prompting on the terminal or
-    /// running an askpass it inherited (an editor's terminal exports one).
     #[test]
     fn the_releases_git_never_prompts_on_a_terminal() {
         use crate::ledger::GitRunner as _;
@@ -488,18 +468,12 @@ mod tests {
         }
     }
 
-    /// Ends git's process group, then fails the test with `why`.
     fn give_up(group: i32, why: &str) -> ! {
         end(-group, true);
         panic!("{why}")
     }
 
-    /// A REAL GIT, ASKING A HELPER THAT NEVER ANSWERS: a script that marks it ran,
-    /// then waits in a child of its own past the hang detector below, as a script
-    /// that does not `exec` its last command does. The watch ends the helper and
-    /// that child, and git, asking no one ([`ask_no_one`]: neither a terminal nor the
-    /// askpass it was handed), fails on its own. Only this test's helper is
-    /// configured (no system or global git config), so no keychain is asked.
+    /// A REAL GIT.
     #[cfg(unix)]
     #[test]
     fn a_helper_waiting_for_a_person_is_ended_with_what_it_started() {

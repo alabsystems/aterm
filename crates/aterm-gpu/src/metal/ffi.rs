@@ -525,6 +525,24 @@ impl Device {
         }
     }
 
+    /// `-[MTLDevice supportsFamily:]` for the raw `MTLGPUFamily` value `family`.
+    pub(crate) fn supports_family(&self, family: isize) -> bool {
+        // SAFETY: `-supportsFamily:` takes an `NSInteger` and returns a `BOOL`, read through [`ObjcBool`], on a live `MTLDevice`.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel, isize) -> ObjcBool = checked_msg();
+            f(self.id(), sel(c"supportsFamily:"), family).as_bool()
+        }
+    }
+
+    /// `-[MTLDevice registryID]`, the GPU's identity for the life of the system.
+    pub(crate) fn registry_id(&self) -> u64 {
+        // SAFETY: `-registryID` is a `uint64_t` getter on a live `MTLDevice`.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> u64 = checked_msg();
+            f(self.id(), sel(c"registryID"))
+        }
+    }
+
     /// Compile MSL source into an `MTLLibrary` with Metal's runtime compiler (no build-time Xcode dependency).
     #[cfg(test)]
     pub(crate) fn new_library(&self, source: &str) -> Result<Library, String> {

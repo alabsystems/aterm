@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! DECLARED WAKES AS THE LOOP SEES THEM (`docs/DESIGN-harness-occupancy-2026-10-20.md` §4.1, §8
-//! row 2): the view of the book the window's host keeps of the conditions a session asked to be
-//! told of (`wake when=…`, [`super::wakes::WakeBook`]), read by the loop through
-//! `IdleHost::wakes`, and the closed words of the book, the doors that tell a wake
-//! ([`WakeDoor`]) and the host's answer to a claim on one ([`WakeClaim`]).
-//!
-//! Closed words and plain numbers only: an agent's label, path or pattern never crosses here, and
-//! a wake's need crosses as the grammar's own canonical spelling. The empty view is the default
-//! host's, and what a replay of a build without the door reads.
+//! DECLARED WAKES AS THE LOOP SEES THEM.
 
 use serde::{Deserialize, Serialize};
 
@@ -48,9 +40,7 @@ impl WakeDoor {
     }
 }
 
-/// THE HOST'S ANSWER TO A CLAIM ON A WAKE (`IdleHost::wake_claim`, an act): the wake is the
-/// claiming door's to tell, or why it is not. Asked under `occupancy = "prompt"` alone, just
-/// before the write; the default host keeps no book, so every wake is [`Self::Gone`].
+/// THE HOST'S ANSWER TO A CLAIM ON A WAKE (`IdleHost::wake_claim`, an act).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeClaim {
     /// Claimed for the asking door: its line may go.
@@ -113,8 +103,7 @@ impl WakeClaim {
     }
 }
 
-/// WHO DECLARED A WAKE, as its class word: the agent's tree (`yours`), or the owner through
-/// Settings ▸ Harness (`owner's`; in the type, with no surface yet).
+/// WHO DECLARED A WAKE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Declarer {
@@ -144,8 +133,7 @@ impl Declarer {
     }
 }
 
-/// A WAKE'S PRIORITY (`prio=`): a critical wake is told before the others, and passes no pace
-/// and no guard.
+/// A WAKE'S PRIORITY (`prio=`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Prio {
@@ -277,11 +265,7 @@ impl ExpireWhy {
     }
 }
 
-/// A WAKE'S STATE in the book (§3 D4 of the slice-2 plan). `Pending` until its condition holds,
-/// then `Ready`, then told by one door: the agent's `await wake` (`Answering` while the reply is
-/// written, then `Answered` in a hosted session until the loop sees a turn run after it, or
-/// `Told` at once in an unhosted one), or the loop's break or point (`Claimed` for the write,
-/// then `Told`). The rest end it.
+/// A WAKE'S STATE in the book (§3 D4 of the slice-2 plan).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum WakeState {
@@ -323,8 +307,7 @@ pub enum WakeState {
 }
 
 impl WakeState {
-    /// Its word: `pending`, `ready`, `answering`, `answered`, `claimed`, `told`, `taken` or
-    /// `expired`.
+    /// Its word.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -358,8 +341,7 @@ impl WakeState {
 /// The rule a wake's lines are told under.
 pub const WAKE_RULE: &str = "wake@v1";
 
-/// A WAKE'S EPISODE: `fnv1a("wake@v1 builtin <declared_ms> <ord>")`, the form `rules::episode`
-/// gives a built-in rule's, so a successor loop and the book name one wake alike.
+/// A WAKE'S EPISODE.
 #[must_use]
 pub fn wake_episode(declared_ms: i64, ord: u16) -> u64 {
     aterm_hash::fnv1a_64(format!("{WAKE_RULE} builtin {declared_ms} {ord}").as_bytes())
@@ -382,8 +364,7 @@ pub struct WakeSeen {
     pub ready_since_ms: Option<i64>,
     /// What its condition's atoms read, in order.
     pub kinds: Vec<AtomKind>,
-    /// Its need (`need=`), in the grammar's canonical spelling
-    /// (`aterm_vitals::sys::predicate::AwaitSys::canonical`).
+    /// Its need (`need=`).
     pub need: Option<String>,
     /// Whether its need names build slots (the line reserves one).
     pub need_slots: bool,
@@ -399,9 +380,7 @@ impl WakeSeen {
     }
 }
 
-/// THE SESSION'S BOOK OF WAKES AS THE LOOP SEES IT (`IdleHost::wakes`, a query): each wake still
-/// to be told, by ordinal. The empty book is the default host's, and what a replay of a build
-/// without the door reads (`TapeValue::absent`).
+/// THE SESSION'S BOOK OF WAKES AS THE LOOP SEES IT (`IdleHost::wakes`, a query).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WakesSeen {
     /// The live wakes, lowest ordinal first.
@@ -421,8 +400,7 @@ impl WakesSeen {
         self.wakes.iter().filter(|w| w.state.met()).count()
     }
 
-    /// THE WAKE A LOOP'S DOOR WOULD TELL FIRST: of those `Ready` or `Answered` and not
-    /// `await_only`, a critical one first, then the lowest ordinal.
+    /// THE WAKE A LOOP'S DOOR WOULD TELL FIRST.
     #[must_use]
     pub fn head_due(&self) -> Option<&WakeSeen> {
         self.wakes

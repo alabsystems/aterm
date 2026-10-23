@@ -1,19 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The gap to main, for a bundle whose pin is held to its repo's origin/main
-//! ([`crate::programs::BundleDef::main_gap`]: trust). Trust is cut at an origin/main
-//! commit, not from a signed release, so a pin ahead of the newest signed release can
-//! still be far behind main. A report only: it holds no group and packs nothing. The cut
-//! is a run of its own ([`trust_cut_commands`]), which the agent running it performs on a
-//! release-credential machine, the release and the uploads included (Trust's
-//! DECISION_QUEUE D27).
-//!
-//! A build number counts a commit's whole ancestry, so `main's build - the pin's` is what
-//! the pin lacks only when the pin is on main. When the clone has the pin's commit (its
-//! trustc's `commit-hash`), the gap is counted on the graph (`<pin>..main` behind,
-//! `main..<pin>` its own) and a pin off main is said to be off it; otherwise it falls back
-//! to the build numbers, and says so.
+//! The gap to main.
 
 use std::path::Path;
 
@@ -92,8 +80,7 @@ pub struct Owed {
     pub off: bool,
 }
 
-/// Read the gap of `program` (pinned at `pin`) from `clone`, the program's scratch clone,
-/// or `Err(why)` when there is none to read.
+/// Read the gap of `program` (pinned at `pin`) from `clone`.
 #[must_use]
 pub fn read(
     program: &str,
@@ -205,7 +192,7 @@ impl MainGap {
         matches!(self.reading, Reading::Unknown(_))
     }
 
-    /// What is owed, if a cut is.
+    /// What is owed.
     #[must_use]
     pub fn owed(&self) -> Option<Owed> {
         let Reading::Known {
@@ -264,8 +251,7 @@ impl MainGap {
         }
     }
 
-    /// The decision row's note: `; <words> <program> main <sha10> (<LABEL> below)`, or
-    /// nothing when no cut is owed.
+    /// The decision row's note.
     #[must_use]
     pub fn row_note(&self) -> String {
         match (self.owed(), self.main_sha()) {
@@ -378,12 +364,7 @@ impl MainGap {
     }
 }
 
-/// Trust main's cut, as trust's docs/CUTTING-A-TOOLCHAIN.md §3.9 runs it: mint, seal,
-/// stage the trust-wp drivers into a copy of the seal (the directory that is packed), run
-/// the staged pack's gates (`promote-toolchain.sh --gate-only`) and §3.9's first-step
-/// conditions on that copy (the consumer check, and for P5a the seal-line audit), and only
-/// then the archives' release, the re-pin push and the group publish. Placeholders: `<v>`
-/// (the version the mint prints), `<rev>` (the seal `promote-toolchain.sh` names).
+/// Trust main's cut.
 #[must_use]
 pub fn trust_cut_commands(main_sha: &str) -> Vec<String> {
     let c12 = short(main_sha, 12);

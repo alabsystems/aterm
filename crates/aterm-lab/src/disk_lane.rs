@@ -12,19 +12,14 @@ use crate::{Fail, LAB, Res, stop};
 /// The lane runs only with this much free on this host.
 pub const HOST_FREE_MIN: u64 = 24 << 30;
 
-/// How far back the fixtures are dated.
 const IDLE_DAYS: u64 = 8;
 
-/// The image's size.
 const IMAGE: &str = "8g";
 
-/// What one fixture's build directory holds in each of its caches.
 const CACHE_BYTES: u64 = 150 << 20;
 
-/// A one-minute hang detector for what must happen.
 const MUST: Duration = Duration::from_secs(60);
 
-/// The lines of the instance's aterm.toml after its own tables.
 const DISK: &[&str] = &[
     "[disk]",
     "warn_free_gib = 6",
@@ -32,10 +27,8 @@ const DISK: &[&str] = &[
     "idle_build_dirs = true",
 ];
 
-/// The checkouts laid on the volume, by name.
 const CHECKOUTS: &[&str] = &["idle", "recent-index", "edited", "locked", "linked"];
 
-/// A mounted image, detached and removed when it drops.
 struct Image {
     file: PathBuf,
     mnt: PathBuf,
@@ -89,7 +82,6 @@ impl Drop for Image {
     }
 }
 
-/// Run `program args… [last]` to completion.
 fn run(program: &str, args: &[&str], last: Option<&Path>) -> Result<(), String> {
     let mut cmd = aterm_uds::spawnfd::command(program);
     cmd.args(args);
@@ -111,7 +103,6 @@ fn run(program: &str, args: &[&str], last: Option<&Path>) -> Result<(), String> 
     }
 }
 
-/// Write `bytes` of a pattern to `path` (its folders made).
 fn fill(path: &Path, bytes: u64) -> Result<(), String> {
     use std::io::Write as _;
     if let Some(dir) = path.parent() {
@@ -129,9 +120,6 @@ fn fill(path: &Path, bytes: u64) -> Result<(), String> {
     aterm_durable::ordered(&f).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// A cargo build directory at `dir`: a signed tag, `.rustc_info.json`, one
-/// profile `debug/` with its three locks, `.fingerprint/`, `deps/`, `build/`
-/// and `incremental/` of [`CACHE_BYTES`] each (deps and incremental).
 fn lay_target(dir: &Path) -> Result<(), String> {
     let debug = dir.join("debug");
     for d in [
@@ -163,8 +151,6 @@ fn lay_target(dir: &Path) -> Result<(), String> {
     )
 }
 
-/// A checkout at `dir`: its git files, a manifest, a source file and its
-/// `target/`.
 fn lay_checkout(dir: &Path) -> Result<(), String> {
     let write =
         |p: PathBuf, b: &[u8]| std::fs::write(&p, b).map_err(|e| format!("{}: {e}", p.display()));
@@ -178,8 +164,6 @@ fn lay_checkout(dir: &Path) -> Result<(), String> {
     lay_target(&dir.join("target"))
 }
 
-/// Date every file and folder under `root` (and `root`) `days` back, folders
-/// after what they hold.
 fn backdate(root: &Path, days: u64) -> Result<(), String> {
     let when = SystemTime::now() - Duration::from_secs(days * 86_400);
     let mut stack = vec![(root.to_path_buf(), false)];
@@ -203,14 +187,12 @@ fn backdate(root: &Path, days: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Touch `path` now.
 fn touch_now(path: &Path) -> Result<(), String> {
     std::fs::File::open(path)
         .and_then(|f| f.set_modified(SystemTime::now()))
         .map_err(|e| format!("cannot touch {}: {e}", path.display()))
 }
 
-/// Free bytes on the volume holding `path`.
 fn free_on(path: &Path) -> Option<u64> {
     aterm_agent::harness::disk::free_bytes(path)
 }
@@ -239,7 +221,6 @@ impl Verdict {
     }
 }
 
-/// The value of `key=` in a status line.
 fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     line.split_whitespace()
         .find_map(|w| w.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
@@ -372,9 +353,6 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
     }
 }
 
-/// The lane's checks against the running `inst`: `status disk=` reads `short`, `await sys
-/// free>=5GiB` answers, the journal's removals run in tier order and keep what they must; then,
-/// filled past the emergency, the reserve is released before anything else of that pass.
 fn lane(inst: &Instance, home: &Path, mirror: &Path, v: &mut Verdict) -> Result<(), String> {
     let ls = inst.ctl(&["ls"]);
     let sid = ls
@@ -529,7 +507,6 @@ fn lane(inst: &Instance, home: &Path, mirror: &Path, v: &mut Verdict) -> Result<
     Ok(())
 }
 
-/// A path as one wire token (`%XX` for a space or a `%`).
 fn aterm_control_pct(s: &str) -> String {
     s.replace('%', "%25").replace(' ', "%20")
 }

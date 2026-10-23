@@ -27346,7 +27346,7 @@ mod tests {
             (b, ink)
         };
         for &face in faces {
-            let mut stem_parted = Vec::new();
+            let (mut compared, mut stem_parted) = (0usize, Vec::new());
             for px in 10..=36 {
                 let mut r = Renderer::from_system_with_family(face, px as f32, Theme::default())
                     .expect(NO_FONT);
@@ -27385,8 +27385,14 @@ mod tests {
                         bold_ink >= regular_ink,
                         "{at}: bold ink {bold_ink} under the regular {regular_ink}"
                     );
+                    compared += 1;
                 }
             }
+            assert!(
+                compared > 0,
+                "{face:?}: no size from 10 to 36 px measures its weights alike, so no bold mark \
+                 was compared"
+            );
             if cfg!(target_os = "macos") {
                 assert!(
                     !stem_parted.is_empty(),
@@ -27409,15 +27415,16 @@ mod tests {
         } else {
             &[None]
         };
-        let (mut measured, mut flush) = (0usize, 0usize);
+        let (mut measured, mut flush, mut absent) = (0usize, 0usize, Vec::new());
         for &face in faces {
             for px in 8..=16 {
                 let mut r = Renderer::from_system_with_family(face, px as f32, Theme::default())
                     .expect(NO_FONT);
-                if face
-                    .is_some_and(|name| !r.primary_source_path().is_some_and(|p| p.contains(name)))
+                if let Some(name) = face
+                    && !r.primary_source_path().is_some_and(|p| p.contains(name))
                 {
-                    continue;
+                    absent.push(name);
+                    break;
                 }
                 r.debug_block_on_lazy_fallbacks();
                 let (cw, ch) = r.cell_size();
@@ -27445,11 +27452,15 @@ mod tests {
                 }
             }
         }
-        assert!(
-            measured >= 9 * 2 * BandIcon::ALL.len() * 2,
-            "{measured} rasters"
+        assert_eq!(
+            measured,
+            (faces.len() - absent.len()) * 9 * 2 * BandIcon::ALL.len() * 2,
+            "every face but {absent:?} at every size, weight and spill"
         );
         assert!(flush > 0, "control: no icon reaches its ceiling row");
+        if !absent.is_empty() {
+            aterm_spec::host::could_not_run(format!("{absent:?} not on this host: unmeasured"));
+        }
     }
 
     #[test]

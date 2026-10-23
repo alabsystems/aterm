@@ -20,19 +20,16 @@ const ROWS: usize = 40;
 const COLS: usize = 120;
 const CW: usize = 7;
 const CH: usize = 14;
-/// The composer's two text rows once the line has wrapped (0-based): the
-/// box is bottom-anchored, so row 1 of the text is 36 and row 2 is 37.
+/// Composer text rows once the line has wrapped (0-based).
 const ROW1: u16 = 36;
 const ROW2: u16 = 37;
-/// The wrapped row's indent: Claude Code writes its continuation from
-/// column 2 (`❯ ` on row 1, two blanks on every later row).
+/// Continuation-row indent (`❯ ` on row 1, two blanks on later rows).
 const INDENT: u16 = 2;
 /// The frame train.
 const FRAME_MS: u64 = 8;
 /// `app_render.rs`'s `BLINK_RECENT_MAX`.
 const BLINK_RECENT: Duration = Duration::from_secs(1);
-/// [`Present::PauseBeforeWrap`]'s pause: past the seam's typing rhythm
-/// (`PHASER_CHAIN_GAP_MAX`, 0.75 s), which the coalesced fold needs.
+/// Pause duration for [`Present::PauseBeforeWrap`], past `PHASER_CHAIN_GAP_MAX`.
 const WRAP_PAUSE_MS: u64 = 1_000;
 /// Row 1 must hold no band this long after the last key.
 const STRANDED_AFTER_MS: u64 = 2_500;
@@ -72,24 +69,15 @@ const FIXTURES: [(&str, &str); 7] = [
 /// How the host presents a key relative to its echo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Present {
-    /// The echo lands before the next frame (Claude Code echoes 1–3 ms after the
-    /// key): the key's `Typed` is replayed in the frame that observes its move.
+    /// Echo lands before the next frame.
     EchoInFrame,
-    /// A frame between each key's press and its echo, as a 120 Hz window renders
-    /// when one falls between: the key's `Typed` is held on the press frame and
-    /// its cell comes from the seam's sweep.
+    /// One frame renders between each key press and its echo.
     FrameBeforeEcho,
-    /// [`Present::EchoInFrame`] with a one-second pause before the key that
-    /// soft-wraps the caret. Past the typing rhythm the move is judged a typed
-    /// re-anchor, whose landing sweep must not lay the indent either.
+    /// [`Present::EchoInFrame`] with a one-second pause before the wrap key.
     PauseBeforeWrap,
-    /// [`Present::EchoInFrame`] with typeahead across the wrap: the next key is
-    /// pressed a millisecond after the wrap key, before its echo, so one frame
-    /// holds both keys' `Typed` and the soft wrap's `Move`. The reflow that
-    /// carries the word down is the second key's echo.
+    /// [`Present::EchoInFrame`] with typeahead across the wrap.
     TypeaheadAcrossWrap,
-    /// [`Present::PauseBeforeWrap`] with the same typeahead: the wrap judged
-    /// a typed re-anchor.
+    /// [`Present::PauseBeforeWrap`] with typeahead across the wrap.
     TypeaheadAfterPause,
 }
 
@@ -187,8 +175,7 @@ struct Host {
     last_blink: Option<Instant>,
     scroll: Option<ContentScrollState>,
     frames: Vec<Frame>,
-    /// `CLAUDE_WRAP_RING=<ms-from>:<ms-to>` prints every new admission
-    /// verdict and every ribbon cell in that window.
+    /// Optional `(from_ms, to_ms)` window for admission and ribbon debug logging.
     ring: Option<(u64, u64)>,
     ring_seen: u64,
 }
@@ -250,9 +237,7 @@ impl Host {
         );
     }
 
-    /// The host's order: content-scroll sync, the blink edge, the context, the
-    /// caret row probe (trust and neighbours), the print anchor, every ribbon
-    /// row, then the tick.
+    /// Run one host frame in production order.
     fn frame(&mut self) {
         sync_scroll(&self.term, &mut self.glow, &mut self.scroll, self.now);
         let (c, cur) = caret_sample(&self.term);
@@ -326,8 +311,7 @@ impl Host {
         });
     }
 
-    /// The frame train up to `ms`; the host withholds the present while a `?2026` bracket is
-    /// open, so no frame samples a torn screen.
+    /// Advance the frame train up to `ms`, withholding presents while `?2026` is open.
     fn run_to(&mut self, ms: u64) {
         let t = self.t0 + Duration::from_millis(ms);
         while self.now + Duration::from_millis(FRAME_MS) <= t {
@@ -343,10 +327,7 @@ impl Host {
         }
     }
 
-    /// The app's hint for what the keyboard sent: a printable byte is a typed key
-    /// (`note_typed_expected`, single-cell), an arrow is navigation (typed bank
-    /// cleared, then `note_motion`), Backspace erases one glyph. Terminal
-    /// replies stamp nothing.
+    /// Forward keyboard input hints to the cursor glow engine.
     fn hint(&mut self, bytes: &[u8]) {
         match bytes {
             [b] if (0x20..0x7f).contains(b) => {
@@ -365,8 +346,7 @@ impl Host {
     }
 }
 
-/// One take, replayed: its frames and its insert (the printable keys after
-/// the last arrow, up to the exit chord).
+/// Replayed take with its captured frames and inserted key sequence.
 struct Take {
     name: &'static str,
     present: Present,
@@ -390,8 +370,7 @@ impl Take {
             .unwrap_or_else(|| self.frames.last().expect("a frame"))
     }
 
-    /// The two rows frame by frame (`CLAUDE_WRAP_DUMP=1`), one line per
-    /// change of the plan.
+    /// Format a frame-by-frame summary of the two rows when the plan changes.
     fn story(&self) -> String {
         let mut s = format!(
             "{} {:?}: insert {:?} at {}..{} ms\n",
@@ -413,8 +392,7 @@ impl Take {
     }
 }
 
-/// The insert's wrap key: the key whose echo first carries the caret from row 1
-/// to row 2, measured on the bytes alone.
+/// Timestamp of the key whose echo first wraps the caret from row 1 to row 2.
 fn wrap_key_ms(rec: &[(u64, Rec)], from_ms: u64) -> Option<u64> {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     let mut key = None;
@@ -525,20 +503,15 @@ fn replay(name: &'static str, present: Present) -> Take {
 struct Verdict {
     /// When the wrapped row first held inserted text under a caret past it.
     landed_ms: Option<u64>,
-    /// Frames with a ribbon cell (or lit coverage) in the indent of the
-    /// wrapped row: `(ms, columns)`.
+    /// Frames with a ribbon cell or lit coverage in the wrapped row's indent.
     stub: Vec<(u64, Vec<u16>)>,
-    /// Frames where a column of typed text left of the caret on the wrapped
-    /// row has no live cell: `(ms, caret col, missing columns)`.
+    /// Frames missing a live cell under typed text left of the caret on the wrapped row.
     gaps: Vec<(u64, u16, Vec<u16>)>,
-    /// Frames from the landing to the last key with a live cell on the wrapped
-    /// row at or right of the caret, over text the reflow moved down with the
-    /// word: `(ms, caret col, columns)`.
+    /// Frames with a live cell at or right of the caret on the wrapped row.
     ahead: Vec<(u64, u16, Vec<u16>)>,
-    /// Row-1 cells and lit columns still there long after the last key.
+    /// Row-1 cells and lit columns remaining after `STRANDED_AFTER_MS`.
     stranded: Vec<(u64, Vec<u16>, Vec<usize>)>,
-    /// Frames from a retract fade after the landing to the last key with a live row-1 cell
-    /// right of the cell after row 1's text: `(ms, columns)`.
+    /// Frames with a live row-1 cell past row 1's text after retract fade.
     tail: Vec<(u64, Vec<u16>)>,
 }
 
@@ -656,9 +629,7 @@ fn assert_laws(name: &'static str, modes: &[Present]) {
     assert_laws_of(&[name], modes);
 }
 
-/// [`assert_laws`] on each of `names`, every take under every mode replayed on one pool first.
-/// Names are judged in turn; a replay's panic, caught in its thread, is re-raised in mode order
-/// before its name's verdicts.
+/// Run [`assert_laws`] across `names` and `modes` in parallel.
 fn assert_laws_of(names: &[&'static str], modes: &[Present]) {
     let takes: Vec<(&'static str, Present)> = names
         .iter()
@@ -683,38 +654,31 @@ fn assert_laws_of(names: &[&'static str], modes: &[Present]) {
     }
 }
 
-/// The main shape: the caret after row 1's last word, two columns from its end;
-/// ` already` typed: the `a` is written at the end of row 1 while the caret
-/// soft-wraps to the indent, and the `l` carries `al` down to column 2.
+/// Partial word carried down by the next key keeps its first letter without an indent stub.
 #[test]
 fn a_partial_word_carried_down_by_the_next_key_keeps_its_first_letter_and_no_indent_stub() {
     assert_laws("row1-end", &Present::ALL);
 }
 
-/// The same with more room: `alread` is laid on row 1, its `d` soft-wraps
-/// the caret, and the `y` carries the whole word down.
+/// Six-letter word carried down keeps every letter without an indent stub.
 #[test]
 fn a_six_letter_word_carried_down_keeps_every_letter_and_no_indent_stub() {
     assert_laws("row1-end-six", &Present::ALL);
 }
 
-/// Word hops: Alt+Left to the start of row 1, Alt+Right word by word back to the end of it,
-/// then the same insert.
+/// Word hops across row 1 followed by a wrapped insert keep the first letter.
 #[test]
 fn the_reflowed_word_after_word_hops_keeps_its_first_letter() {
     assert_laws("hops", &Present::ALL);
 }
 
-/// The same with the hops 140 ms apart and the insert typed at once, while
-/// the hops' wake still stands on row 1.
+/// Fast word hops followed immediately by a wrapped insert keep the first letter.
 #[test]
 fn the_reflowed_word_after_fast_word_hops_keeps_its_first_letter() {
     assert_laws("hops-fast", &Present::ALL);
 }
 
-/// Controls: an insert beginning at the continuation row's indent (no word
-/// changes row, no caret soft-wraps), and typing at the end of the text while
-/// `#1]` wraps with the box's growth.
+/// Control cases: insert at the continuation indent and wrap at the end of text.
 #[test]
 fn controls_an_insert_on_the_wrapped_row_and_an_end_of_text_wrap() {
     assert_laws_of(
@@ -723,10 +687,7 @@ fn controls_an_insert_on_the_wrapped_row_and_an_end_of_text_wrap() {
     );
 }
 
-/// The caret before `[image` at the end of row 1: the first key erases row 1 from the caret,
-/// writes `a[image #1]` at the indent and moves the caret down to column 3, the text with it.
-/// The key's glyph left of the landing and row 1's erased tail judge the move at once
-/// (`CursorGlow::key_pushed_text_down`) instead of a footer park (`wrap_code_reflow.rs`).
+/// Insert whose first key carries the caret and trailing text down to row 2 stays lit.
 #[test]
 fn an_insert_whose_first_key_carries_the_caret_down_is_lit() {
     assert_laws("eol-caret", &Present::ALL);

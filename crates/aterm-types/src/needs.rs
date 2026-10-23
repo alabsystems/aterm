@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE NEED WORDS (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.2): what a session needs of its
-//! owner now, in the one vocabulary `status needs=`, `survey needs=`, `aterm ctl survey`'s classes,
-//! the window and the presence engine all speak.
+//! THE NEED WORDS (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.2).
 
-/// How a need is shown: stuck (nothing moves until the owner acts) or decide (the owner's answer is
-/// awaited).
+/// How a need is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
     /// Nothing moves until the owner acts: the stop tone.
@@ -79,8 +76,7 @@ impl NeedWord {
         }
     }
 
-    /// The word a wire field names, or `None` (`-`, an older or newer build's word this one does
-    /// not know).
+    /// The word a wire field names, or `None`.
     #[must_use]
     pub fn parse(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|need| need.word() == word)
@@ -104,8 +100,7 @@ impl NeedWord {
 /// What aterm is waiting out for a session: a record shown in pull-only rows, never a need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WaitWord {
-    /// A usage limit: the harness waits it out, or an unsupervised one has not reached its reset
-    /// yet.
+    /// A usage limit.
     Limit,
     /// The API cannot be reached: the network coming back answers it.
     Api,
@@ -116,9 +111,8 @@ pub enum WaitWord {
     MemoryRestart,
     /// Claude Code's lost login, which the harness carries (an account move, or its own `/login`).
     Login,
-    /// An attention entry its writer marked `kind=wait` (`meta set attention owner=<k> kind=wait
-    /// <text>`), with no wall on the screen: what it waits on is the entry's own words (a script's
-    /// CI run, a supervisor's wait), never a usage limit by default.
+    /// An attention entry its writer marked `kind=wait`
+    /// (`meta set attention owner=<k> kind=wait <text>`), with no wall on the screen.
     Entry,
 }
 
@@ -193,8 +187,7 @@ impl HoldWord {
 pub enum AttentionKind {
     /// The owner is asked for: a need.
     Ask,
-    /// The writer is waiting something out by itself (the harness at a limit it continues after): a
-    /// record.
+    /// The writer is waiting something out by itself (the harness at a limit it continues after).
     Wait,
 }
 
@@ -222,7 +215,6 @@ impl AttentionKind {
 mod tests {
     use super::*;
 
-    /// Every word parses back to itself, and nothing else parses.
     #[test]
     fn every_word_round_trips_and_a_stranger_does_not_parse() {
         for need in NeedWord::ALL {
@@ -243,8 +235,6 @@ mod tests {
         assert_eq!(AttentionKind::parse("control"), None);
     }
 
-    /// `ALL` is the precedence order, and every stuck word outranks every
-    /// decide word.
     #[test]
     fn the_precedence_is_the_order_and_stuck_comes_first() {
         let mut sorted = NeedWord::ALL;

@@ -15,28 +15,19 @@ use std::collections::BTreeMap;
 #[cfg(not(macos_platform))]
 use crate::window::ResizeDirection;
 
-/// The shadow's depth beyond the visible border, logical px.
 pub(crate) const SHADOW_SIZE: u32 = 43;
-/// The visible border's width, logical px.
 pub(crate) const VISIBLE_BORDER_SIZE: u32 = 1;
-/// A border part's depth: the visible border and the shadow.
 pub(crate) const BORDER_SIZE: u32 = SHADOW_SIZE + VISIBLE_BORDER_SIZE;
-/// The radius of the corners the shadow is rounded around.
 pub(crate) const CORNER_RADIUS: u32 = 10;
-/// How far outside the window a part takes the pointer.
 pub(crate) const RESIZE_HANDLE_SIZE: u32 = 12;
-/// How far along an edge from a corner a press resizes by the corner.
 pub(crate) const RESIZE_HANDLE_CORNER_SIZE: u32 = 24;
 
 const SHADOW_PARAMS_ACTIVE: (f32, f32, f32) = (0.206_505_5, 0.104_617_53, -0.000_542_446_2);
 const SHADOW_PARAMS_INACTIVE: (f32, f32, f32) = (0.168_297_29, 0.204_299_8, 0.001_769_798_6);
 
-/// The visible border's colour (opaque, so premultiplied as it is): sctk-adwaita's light
-/// theme's and its dark theme's.
 const BORDER_LIGHT: [u8; 4] = [220, 220, 220, 255];
 const BORDER_DARK: [u8; 4] = [58, 58, 58, 255];
 
-/// One of the four border parts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Part {
     Top,
@@ -46,10 +37,8 @@ pub(crate) enum Part {
 }
 
 impl Part {
-    /// Every part, in sctk-adwaita's order.
     pub(crate) const ALL: [Part; 4] = [Part::Top, Part::Left, Part::Right, Part::Bottom];
 
-    /// Its position in [`Part::ALL`].
     #[inline]
     pub(crate) const fn index(self) -> usize {
         match self {
@@ -61,7 +50,6 @@ impl Part {
     }
 }
 
-/// A rectangle in logical px.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Rect {
     pub(crate) x: i32,
@@ -70,7 +58,6 @@ pub(crate) struct Rect {
     pub(crate) height: u32,
 }
 
-/// `v` as an `i32`, saturating (a window is never that large).
 #[inline]
 const fn signed(v: u32) -> i32 {
     if v > i32::MAX as u32 {
@@ -80,8 +67,6 @@ const fn signed(v: u32) -> i32 {
     }
 }
 
-/// Where `part` sits beside a `width`×`height` window, relative to the window's surface
-/// (sctk-adwaita's `DecorationParts::new` and `resize`, without a header of its own).
 #[inline]
 pub(crate) const fn surface_rect(part: Part, width: u32, height: u32) -> Rect {
     let b = BORDER_SIZE;
@@ -94,8 +79,6 @@ pub(crate) const fn surface_rect(part: Part, width: u32, height: u32) -> Rect {
     }
 }
 
-/// The part of `part` that takes the pointer, relative to the part: the [`RESIZE_HANDLE_SIZE`]
-/// px against the window, the top and bottom ones reaching as far past the sides.
 #[inline]
 pub(crate) const fn input_rect(part: Part, width: u32, height: u32) -> Rect {
     let (b, r) = (BORDER_SIZE, RESIZE_HANDLE_SIZE);
@@ -109,9 +92,6 @@ pub(crate) const fn input_rect(part: Part, width: u32, height: u32) -> Rect {
     }
 }
 
-/// Which way a press at (`x`, `y`) on `part` (logical px, relative to the part) resizes a
-/// `width`×`height` window: by a corner within [`RESIZE_HANDLE_CORNER_SIZE`] px of it along the
-/// edge, else by the edge (sctk-adwaita's `precise_location`).
 #[cfg(not(macos_platform))]
 #[inline]
 pub(crate) fn direction(part: Part, x: f64, y: f64, width: u32, height: u32) -> ResizeDirection {
@@ -135,8 +115,6 @@ pub(crate) fn direction(part: Part, x: f64, y: f64, width: u32, height: u32) -> 
     }
 }
 
-/// A part's pixels, row by row: premultiplied RGBA, as tiny-skia lays out the pixmap
-/// sctk-adwaita painted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Pixmap {
     pub(crate) width: usize,
@@ -149,12 +127,10 @@ impl Pixmap {
         Pixmap { width, height, pixels: vec![[0; 4]; width * height] }
     }
 
-    /// The bytes of a `wl_shm` ARGB8888 buffer: each pixel little-endian `0xAARRGGBB`.
     pub(crate) fn argb8888(&self) -> Vec<u8> {
         self.pixels.iter().flat_map(|&[r, g, b, a]| [b, g, r, a]).collect()
     }
 
-    /// Fill `[x0, x1)`×`[y0, y1)` (clipped) with `color`.
     fn fill(&mut self, (x0, y0, x1, y1): (usize, usize, usize, usize), color: [u8; 4]) {
         let (x1, y1) = (x1.min(self.width), y1.min(self.height));
         for y in y0.min(y1)..y1 {
@@ -170,14 +146,12 @@ fn shadow(pixel_dist: f32, scale: u32, active: bool) -> f32 {
     a * (-b * (pixel_dist / scale as f32)).exp() + c
 }
 
-/// The shadow's alpha at `dist` px from the window, as a premultiplied black pixel.
 #[inline]
 fn shadow_pixel(dist: f32, scale: u32, active: bool) -> [u8; 4] {
     let alpha = (shadow(dist, scale, active) * f32::from(u8::MAX)).round() as u8;
     [0, 0, 0, alpha]
 }
 
-/// A tiny-skia `Point::distance` (its `length`: f32, widened only where the square overflows).
 #[inline]
 fn distance(x: f32, y: f32) -> f32 {
     let mag2 = x * x + y * y;
@@ -189,8 +163,6 @@ fn distance(x: f32, y: f32) -> f32 {
     }
 }
 
-/// One scale's and focus's shadow: a run of it outward from an edge, and the square of its
-/// four rounded corners.
 #[derive(Debug)]
 struct RenderedShadow {
     side: Vec<[u8; 4]>,
@@ -434,15 +406,12 @@ impl RenderedShadow {
     }
 }
 
-/// `part`'s buffer size in px beside a `width`×`height` window at integer `scale`.
 #[inline]
 pub(crate) const fn buffer_size(part: Part, width: u32, height: u32, scale: u32) -> (usize, usize) {
     let rect = surface_rect(part, width, height);
     ((rect.width * scale) as usize, (rect.height * scale) as usize)
 }
 
-/// The shadow sctk-adwaita's `Shadow::draw` paints into `part`'s buffer beside a
-/// `width`×`height` window at `scale`.
 #[cfg(test)]
 pub(crate) fn shadow_plane(
     part: Part,
@@ -457,15 +426,12 @@ pub(crate) fn shadow_plane(
     pixmap
 }
 
-/// The shadows a frame has rendered, keyed by scale and focus for reuse across redraws.
 #[derive(Debug, Default)]
 pub(crate) struct Shadows {
     rendered: BTreeMap<(u32, bool), RenderedShadow>,
 }
 
 impl Shadows {
-    /// `part`'s buffer as the frame shows it: the shadow (none while tiled), then the visible
-    /// border over it.
     pub(crate) fn paint(&mut self, part: Part, look: Look) -> Pixmap {
         let (w, h) = buffer_size(part, look.width, look.height, look.scale);
         let mut pixmap = Pixmap::new(w, h);
@@ -481,24 +447,16 @@ impl Shadows {
     }
 }
 
-/// How a frame looks: what a redraw of the parts depends on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Look {
-    /// The window's size, logical px.
     pub(crate) width: u32,
     pub(crate) height: u32,
-    /// The buffers' integer scale (the window's scale, rounded up, as sctk-adwaita's).
     pub(crate) scale: u32,
-    /// Focused: the darker, wider shadow.
     pub(crate) active: bool,
-    /// The dark theme's border colour.
     pub(crate) dark: bool,
-    /// Tiled against another window or a screen edge: the border only, no shadow.
     pub(crate) tiled: bool,
 }
 
-/// `[x0, y0, x1, y1)` of the visible border on `part`'s buffer, px: the line against the
-/// window, reaching across the corners on the top and bottom parts.
 #[inline]
 pub(crate) const fn border_span(
     part: Part,
@@ -520,12 +478,10 @@ pub(crate) const fn border_span(
 mod tests {
     use super::*;
 
-    /// A part painted afresh, nothing kept.
     fn paint(part: Part, look: Look) -> Pixmap {
         Shadows::default().paint(part, look)
     }
 
-    /// Verifies that a cached shadow rendering paints the same pixels as a fresh rendering.
     #[test]
     fn a_kept_rendering_paints_what_a_fresh_one_does() {
         let mut shadows = Shadows::default();
@@ -557,7 +513,6 @@ mod tests {
         assert_eq!(shadows.rendered.len(), 4, "one rendering a scale and focus");
     }
 
-    /// sctk-adwaita 0.10.1's own `Shadow::draw`, recorded (`record planes`).
     const RECORDED: &str = include_str!("../tests/recorded/sctk-adwaita-0.10.1-shadow.tsv");
 
     fn fnv(bytes: impl Iterator<Item = u8>) -> u64 {
@@ -585,7 +540,6 @@ mod tests {
         }
     }
 
-    /// Every recorded plane, drawn here: the same buffer size, alpha and bytes.
     #[test]
     fn the_shadow_is_sctk_adwaita_s_to_the_byte() {
         let mut rows = 0;
@@ -607,8 +561,6 @@ mod tests {
         assert_eq!(rows, 120, "every recorded plane was drawn");
     }
 
-    /// NEGATIVE CONTROL for the oracle: the inactive curve, or a corner radius off by one,
-    /// draws other bytes; the hash tells them apart.
     #[test]
     fn a_shadow_off_its_curve_is_not_the_recorded_one() {
         let active = shadow_plane(Part::Right, 744, 528, 1, true);

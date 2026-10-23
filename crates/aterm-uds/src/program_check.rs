@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! MACOS'S PROGRAM CHECK, READ FROM OUTSIDE: `syspolicyd`'s thread pool, for
-//! [`aterm_vitals::program_check`]'s judge.
+//! macOS `syspolicyd` thread-pool reader for [`aterm_vitals::program_check`].
 
 use std::time::Duration;
 
@@ -11,8 +10,7 @@ pub use aterm_vitals::program_check::{Daemon, Reading};
 /// `syspolicyd`'s image.
 pub const SYSPOLICYD: &str = "/usr/libexec/syspolicyd";
 
-/// How long one `ps` may take before it is killed: a hang detector, never a budget (it answers in
-/// under 10 ms).
+/// How long one `ps` may take before it is killed.
 pub const PS_HANG: Duration = Duration::from_secs(10);
 
 /// Reaping reserve after killing our timed-out `ps`. A child the kernel
@@ -20,11 +18,7 @@ pub const PS_HANG: Duration = Duration::from_secs(10);
 #[cfg(target_os = "macos")]
 const PS_REAP: Duration = Duration::from_millis(250);
 
-/// The `syspolicyd` running now: root's process whose short name is
-/// `syspolicyd` and whose image is [`SYSPOLICYD`], so no process of another
-/// user stands in for it. [`Look::NoneRunning`] only when the process table
-/// was read and holds none (launchd starts one at the next request);
-/// [`Look::Unread`] when the table, or a candidate's image, could not be read.
+/// The `syspolicyd` running now ([`SYSPOLICYD`], [`Look::NoneRunning`], [`Look::Unread`]).
 #[cfg(target_os = "macos")]
 fn daemon() -> Result<Daemon, Look> {
     let records = aterm_sysprobe::kproc::records().ok_or(Look::Unread)?;
@@ -64,9 +58,7 @@ pub enum Look {
     Unread,
 }
 
-/// One look at `syspolicyd`'s pool: its workqueue threads and the kernel's limit flag from `ps -o
-/// wq=,wql= -p <pid>`, with the constrained limit the kernel sets
-/// (`kern.wq_max_constrained_threads`).
+/// One look at `syspolicyd`'s pool.
 #[must_use]
 pub fn look(hang: Duration) -> Look {
     #[cfg(target_os = "macos")]
@@ -106,8 +98,7 @@ fn read_daemon(daemon: Daemon, hang: Duration) -> Option<Reading> {
     })
 }
 
-/// `ps -o wq=,wql=`'s one line: the workqueue threads, and whether `wql` names a limit (`C`,
-/// constrained, or `T`, total; `-` for none).
+/// `ps -o wq=,wql=`'s one line.
 #[must_use]
 pub fn parse(out: &str) -> Option<(u64, bool)> {
     let mut lines = out.lines().filter(|l| !l.trim().is_empty());

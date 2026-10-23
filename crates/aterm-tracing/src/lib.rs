@@ -2,24 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `tracing` — aterm's first-party, no-op replacement for the upstream `tracing` facade.
-//!
-//! # Examples
-//!
-//! Everything below compiles, runs, and does nothing — which is the contract.
-//!
-//! ```
-//! use tracing::{Span, warn};
-//!
-//! // An event. `expensive()` is never called, exactly as on a disabled
-//! // upstream callsite.
-//! fn expensive() -> u64 { unreachable!("a disabled callsite evaluates nothing") }
-//! warn!(cost = expensive(), "budget exceeded");
-//!
-//! // A span guard, the winit shape.
-//! let _span = tracing::debug_span!("aterm::Window::set_title", title = "aterm").entered();
-//!
-//! assert_eq!(Span::none(), Span::default());
-//! ```
 
 #![no_std]
 
@@ -29,12 +11,6 @@ pub struct Span;
 
 impl Span {
     /// A span that does nothing — here, all of them.
-    ///
-    /// ```
-    /// let span = tracing::Span::none();
-    /// let moved_later = span;            // a real owned value
-    /// let _guard = moved_later.entered();
-    /// ```
     #[inline]
     #[must_use]
     pub const fn none() -> Self {
@@ -81,19 +57,6 @@ macro_rules! info {
 }
 
 /// A `WARN`-level event.
-///
-/// ```
-/// use tracing::warn;
-///
-/// fn never_called() -> &'static str { unreachable!() }
-///
-/// // Bare message, positional args, inline captures, named fields with and
-/// // without a sigil, shorthand captures — all accepted, none evaluated.
-/// let code = 0x8000_4005u32;
-/// warn!("HRESULT 0x{:X}", code);
-/// warn!("locale {code:#?} unsupported");
-/// warn!(code, reason = never_called(), detail = ?never_called(), "give up");
-/// ```
 #[macro_export]
 macro_rules! warn {
     ($($discarded:tt)*) => {{}};

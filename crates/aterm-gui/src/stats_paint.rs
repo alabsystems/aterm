@@ -111,7 +111,7 @@ impl Instrument {
     }
 }
 
-/// Which of the three scopes a hit region belongs to (§11.1's Scope).
+/// Scope bar a hit region belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Bar {
     /// The machine.
@@ -127,7 +127,7 @@ impl Bar {
     pub(crate) const ALL: [Self; 3] = [Self::Global, Self::Aterm, Self::Tab];
 }
 
-/// What a hit region names (§11.1, §11.2).
+/// Target kind of a stats hit region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum HitKind {
     /// A row, or one of its scope cells.
@@ -189,7 +189,7 @@ impl Hit {
     }
 }
 
-/// What a tile of a given drawn size can carry (§12.1's resolution ladder).
+/// Tile detail rung determined by drawn pixel size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Rung {
     /// Under 10 px: the level only.
@@ -318,8 +318,6 @@ impl WellMark {
         }
     }
 
-    /// Its own ink, where a phrase does not lend it one: frost for the jobs'
-    /// marks, the accent for waiting, warn for zombies and the levels.
     const fn ink(self, inks: &VitalsInks) -> Rgb {
         match self {
             Self::Stuck => inks.stuck,
@@ -456,7 +454,6 @@ impl<'a> Painter<'a> {
         crate::tray_raster::measure_text(s, size.get(), TextWeight::Regular).ceil()
     }
 
-    /// Draw `f` clipped to `clip`.
     fn clipped(&mut self, clip: Rect, f: impl FnOnce(&mut Self)) {
         if clip.2 <= 0.0 || clip.3 <= 0.0 {
             return;
@@ -959,7 +956,6 @@ impl<'a> Painter<'a> {
                 color: c,
             }),
             WellMark::Cause => {
-                // Two dots above and one below, inside the ● Dot's disc.
                 let disc = r * 0.33 / 0.36;
                 for (dx, dy) in [(-0.5, -0.42), (0.5, -0.42), (0.0, 0.5)] {
                     self.prims.push(DrawPrim::Dot {
@@ -1030,9 +1026,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// The marks are the engine's verdicts, counted, worst first: a calm
-    /// view (fine and busy jobs, zombies outside aterm) draws none, and each
-    /// mark's count is the rows of its verdict.
     #[test]
     fn the_marks_count_the_engines_verdicts_worst_first() {
         let calm = JobsView {
@@ -1077,8 +1070,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The ◔ arc follows the worst quiet job's φ: empty at the quiet line,
-    /// full at the stuck line, never past it.
     #[test]
     fn the_quiet_arc_fills_from_the_quiet_line_to_the_stuck_line() {
         assert_eq!(quiet_arc(aterm_vitals::jobs::PHI_QUIET_MILLI), 0.0);
@@ -1111,9 +1102,6 @@ pub(crate) mod tests {
         assert_eq!(Rung::of(7.0), Rung::Low);
     }
 
-    /// Every band inside a tile is drawn as the tile's rounded shape under a
-    /// clip, so no square fill corner pokes past the rounded rim (the
-    /// 2026-10-19 audit's corner artefact).
     #[test]
     fn a_tiles_bands_keep_its_rounded_silhouette() {
         let inks = inks();

@@ -29,9 +29,7 @@ impl Profile {
     }
 
     /// The arm `--profile <raw>` names.
-    ///
     /// # Errors
-    ///
     /// Anything but an arm's [`name`](Profile::name).
     pub fn parse(raw: &str) -> Result<Profile, String> {
         Profile::ALL
@@ -93,9 +91,7 @@ impl Profile {
 }
 
 /// Returns the built file's length and nanosecond modification time.
-///
 /// # Errors
-///
 /// A file whose metadata or time cannot be read.
 pub fn identity(path: &Path) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;

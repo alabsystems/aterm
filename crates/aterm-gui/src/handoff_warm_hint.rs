@@ -1,31 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Advisory launch-time warm hint.
-//!
-//! A successor runs its warm prologue (config, theme, fonts, backend worker) before it dials
-//! (`WarmOrder::BeforeDial`), before the authenticated carry names the outgoing window's font
-//! zoom. The outgoing process passes it in [`ENV_WARM_HINT`]: the zoom pair, plus window and
-//! session counts and window 0's grid for the log's hit/miss line.
-//!
-//! The hint is never authenticated. It decides only the px the backend worker pre-warms at; the
-//! launch font comes from the carry (`app_config::successor_font_px`) and a differing build px
-//! is re-selected at the backend join (`crate::warm_miss_px`), so a stale or hostile hint costs
-//! a logged warm miss. No digest, proof or admission reads it (`HintNotInProof`, checked by
-//! `seamless::handoff_env_conformance`). Without a hint (the fork lane) the successor warms at
-//! its config's size.
+//! Advisory launch-time warm hint passed via `ATERM_HANDOFF_WARM_HINT`.
 
 /// The launch-environment name. Captured (read and cleared) with every other
 /// handoff name by `HandoffEnv::capture`; read only from that snapshot.
 pub(crate) const ENV_WARM_HINT: crate::handoff_env::HandoffName =
     crate::handoff_env::HandoffName::new("ATERM_HANDOFF_WARM_HINT");
 
-/// The only wire version written or read; any other is ignored whole, which is
-/// always safe for a guess.
 const VERSION: &str = "w1";
-
-/// Longest value read. An encoded hint is at most 94 bytes; anything longer is not one this
-/// build wrote.
 const MAX_LEN: usize = 256;
 
 /// What the outgoing process expects its capture to carry, at launch time.
@@ -171,7 +154,6 @@ mod tests {
             plain.carried_zoom(),
             crate::app_config::CarriedZoom::default()
         );
-        // An older writer's hint holds the device pair alone.
         let older =
             WarmHint::parse("w1;windows=3;sessions=6;cols=100;rows=30;px=28000;reset=24000")
                 .expect("an older hint reads");
@@ -179,8 +161,6 @@ mod tests {
         assert_eq!(older.zoom, Some((28_000, 24_000)));
     }
 
-    /// The successor is the hostile-input boundary: whatever arrives, the
-    /// answer is a hint this build wrote or none.
     #[test]
     fn anything_else_reads_as_no_hint() {
         for raw in [
@@ -201,7 +181,6 @@ mod tests {
             "9".repeat(300)
         );
         assert_eq!(WarmHint::parse(&long), None, "oversized");
-        // A half pair is no zoom, as in the carry; an unknown field is skipped.
         assert_eq!(
             WarmHint::parse("w1;windows=1;sessions=2;cols=80;rows=24;px=20000;glyphs=x")
                 .map(|hint| hint.zoom),

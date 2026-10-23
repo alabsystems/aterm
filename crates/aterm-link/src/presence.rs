@@ -6,15 +6,9 @@ use std::time::{Duration, Instant};
 /// Minimum time between two presence records for one session.
 pub const REPUBLISH_MIN: Duration = Duration::from_secs(2);
 
-/// [`REPUBLISH_MIN`] at test pace: a tenth, as the round it is matched to
-/// runs a tenth (`bridge.rs`'s `FAST_ROSTER_REFRESH`), so a change inside the
-/// window is still carried by the next round and a row still costs at most one
-/// record per session per round.
+/// [`REPUBLISH_MIN`] at test pace (`bridge::fast_timers`), matched to `FAST_ROSTER_REFRESH`.
 const FAST_REPUBLISH_MIN: Duration = Duration::from_millis(200);
 
-/// The republish window in this process: [`REPUBLISH_MIN`], or
-/// [`FAST_REPUBLISH_MIN`] when the bridge runs at test pace
-/// (`bridge::fast_timers`, a development seam a shipped build never reads).
 fn republish_min() -> Duration {
     if crate::bridge::fast_timers() {
         FAST_REPUBLISH_MIN
@@ -157,10 +151,7 @@ pub fn token(raw: &str, cap: usize) -> String {
     out
 }
 
-/// The one escape-boundary clamp: the ASCII graphic bytes of `raw`, at most
-/// `cap` of them, with a trailing `%` or `%X` that the cap split off its escape
-/// trimmed away. Empty when nothing is left; each caller names its own default
-/// ([`token`]'s [`ABSENT`], the bridge's halt reason, `cli.rs`'s column).
+/// Clamps `raw` to at most `cap` ASCII graphic bytes, trimming any trailing split `%` or `%X`.
 #[must_use]
 pub(crate) fn clamp_pct(raw: &str, cap: usize) -> String {
     let mut out = String::with_capacity(cap.min(raw.len()));
@@ -185,12 +176,9 @@ pub struct Slot {
     pub fields: Fields,
     /// Whether `meta` has been read into `fields`.
     pub sampled: bool,
-    /// The tokens on the bus ([`Fields::tokens`] in the mode the row was published in) and
-    /// when. Tokens, not fields: a row is owed only when the row would differ.
-    /// A row SENT and not yet answered counts ([`Slot::mark_published`]).
+    /// Newest tokens sent onto the bus (including in-flight rows) and send timestamp.
     published: Option<(String, Instant)>,
-    /// The newest row the broker ANSWERED as landed: what `published` falls
-    /// back to when a row sent after it is refused ([`Slot::unmark`]).
+    /// Newest row the broker acknowledged as landed, used as fallback on refusal.
     landed: Option<(String, Instant)>,
 }
 
@@ -227,29 +215,19 @@ impl Slot {
         }
     }
 
-    /// Record that the fields as they are now were SENT onto the bus at `now`,
-    /// as a row in `mode`, and not yet answered — the bridge pipelines presence
-    /// rows, so the answer comes later — answering the mark its answer settles
-    /// ([`Slot::landed`], [`Slot::unmark`]). The one way a row is recorded:
-    /// there is no "it landed" without the send before it, so a refusal always
-    /// has a row that did land to fall back to.
+    /// Records that current `fields` in `mode` were pipelined onto the bus at `now`.
     pub(crate) fn mark_published(&mut self, mode: Mode, now: Instant) -> Marked {
         let sent = (self.fields.tokens(mode), now);
         self.published = Some(sent.clone());
         Marked(sent)
     }
 
-    /// The row `mark` stands for LANDED. Answers come in send order, so the
-    /// newest answered row is the last one recorded here.
+    /// Marks `mark` as acknowledged by the broker.
     pub(crate) fn landed(&mut self, mark: Marked) {
         self.landed = Some(mark.0);
     }
 
-    /// The row `mark` stands for did NOT land: fall back to the newest row the
-    /// broker answered as landed, so the next round owes the row again — what
-    /// an unanswered blocking publish left. Only while `mark` is the newest row
-    /// SENT: one sent after it is the bus's word as soon as it lands, and its
-    /// own answer settles it.
+    /// Rolls `published` back to `landed` if `mark` is still the newest sent row.
     pub(crate) fn unmark(&mut self, mark: Marked) {
         if self.published.as_ref() == Some(&mark.0) {
             self.published.clone_from(&self.landed);
@@ -265,8 +243,6 @@ pub(crate) struct Marked((String, Instant));
 mod tests {
     use super::*;
 
-    /// `phase=` carries the six words, a named wall and the legacy `limited`;
-    /// any other word — hostile, screen text, text riding on a wall — is `-`.
     #[test]
     fn phase_is_the_servers_word_from_the_closed_set_or_absent() {
         let mut f = Fields::default();
@@ -297,7 +273,6 @@ mod tests {
         }
     }
 
-    /// No row carries `context=`, in either mode.
     #[test]
     fn a_row_carries_no_context_token() {
         let mut f = Fields::default();
@@ -311,7 +286,6 @@ mod tests {
         );
     }
 
-    /// `minimal` writes `attention=` alone, whatever was read.
     #[test]
     fn minimal_writes_attention_alone() {
         let mut f = Fields::default();
@@ -325,8 +299,6 @@ mod tests {
         );
     }
 
-    /// Only the user's title is published, never the terminal's, and every
-    /// field is capped on an escape boundary.
     #[test]
     fn meta_fields_are_read_capped_and_only_the_user_title_is_published() {
         let mut f = Fields::default();
@@ -371,14 +343,11 @@ mod tests {
         assert_eq!(token("ab%2", 8), "ab");
     }
 
-    /// A row sent and answered as landed: what the bridge records for a
-    /// presence row whose ack came back.
     fn published(slot: &mut Slot, mode: Mode, now: Instant) {
         let mark = slot.mark_published(mode, now);
         slot.landed(mark);
     }
 
-    /// Change only, and at most once per [`REPUBLISH_MIN`].
     #[test]
     fn the_writer_publishes_on_change_only_and_at_most_once_per_window() {
         let t0 = Instant::now();
@@ -399,9 +368,6 @@ mod tests {
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN * 2), Due::Changed);
     }
 
-    /// A row marked at its SEND caps the window from the send; a refusal falls
-    /// back to the newest row that LANDED — not to a row sent before it that
-    /// was refused too — and leaves a newer row in flight standing.
     #[test]
     fn a_refused_row_falls_back_to_the_newest_row_that_landed() {
         let t0 = Instant::now();
@@ -450,7 +416,6 @@ mod tests {
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN * 3), Due::Changed);
     }
 
-    /// A `minimal` row is owed only when `attention=` moved.
     #[test]
     fn a_minimal_row_is_not_owed_for_a_field_it_never_writes() {
         let t0 = Instant::now();

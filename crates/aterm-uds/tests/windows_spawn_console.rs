@@ -4,6 +4,9 @@
 //! `aterm_uds::spawn`'s console rule, and `aterm_uds::spawnfd::command` — the constructor every
 //! shipped child is built with, which applies that rule off Unix — against real Windows processes:
 //! what console a child actually gets, read from inside the child.
+//!
+//! STOCK EXCEPTION: Windows only, and Trust has no Windows std, so only stock Rust builds this (the
+//! Windows lane's guest pins its version: `aterm-lab/src/windows_guest.rs`).
 
 #![cfg(windows)]
 #![allow(

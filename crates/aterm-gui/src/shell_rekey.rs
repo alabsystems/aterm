@@ -49,7 +49,8 @@ pub(crate) fn deliver(path: &Path, key_hex: &str) -> std::io::Result<()> {
     written
 }
 
-/// Remove session `sid`'s pending re-key file and any companion `<sid>.trap` file (`aterm_shell_integration::DEBUG_TRAP_SUFFIX`).
+/// Remove session `sid`'s pending re-key file and any companion `<sid>.trap` file
+/// (`aterm_shell_integration::DEBUG_TRAP_SUFFIX`).
 pub(crate) fn discard(sid: &SessionId) {
     if let Some(path) = path_for(sid) {
         let mut trap = path.clone().into_os_string();
@@ -93,7 +94,7 @@ impl std::fmt::Debug for Pending {
 }
 
 impl Pending {
-    /// The body pointer naming `rev` (a script folder's address) for the shell that reads `path` (`shell_body::pending`).
+    /// Body pointer naming `rev` (a script folder's address) for the shell reading `path`.
     pub(crate) fn body(path: &Path, rev: &str, id: u64) -> Self {
         Self {
             path: path.to_path_buf(),
@@ -237,7 +238,7 @@ pub(crate) mod typed {
     use super::{Path, PathBuf, SessionId};
     use super::{deliver, dir};
 
-    /// How long a typed re-key's file waits for the line that reads it before the window settles it ([`settle`]).
+    /// How long a typed re-key file waits before the window settles it ([`settle`]).
     pub(crate) const TTL: Duration = Duration::from_secs(120);
 
     /// Why a typed re-key was not issued.
@@ -247,7 +248,7 @@ pub(crate) mod typed {
         Healthy,
         /// `integration=off`.
         Off,
-        /// The re-key channel's own key waits in `<sid>` for this shell's next prompt, and a typed one would race it.
+        /// The re-key channel's own key waits in `<sid>` for this shell's next prompt.
         Pending,
         /// No private control dir to put the file in, or a sid that names none.
         NoDir,
@@ -336,10 +337,8 @@ pub(crate) mod typed {
     /// This process's typed re-key numbers: each file's name is its own.
     static SERIAL: AtomicU64 = AtomicU64::new(1);
 
-    /// One issue at a time. `issue_in` is a sequence (settle the previous key,
-    /// sweep, write, authorize, record); two interleaved issues of one tab each
-    /// settle nothing and the later record overwrites the earlier, leaving a
-    /// live key in an unsettled file.
+    /// Serializes `issue_upgrading_in` so concurrent issues on one tab settle the previous key
+    /// before recording the new one.
     static ISSUING: Mutex<()> = Mutex::new(());
 
     /// Whether the shell of `engine` is behind: the last revision it signed is not this
@@ -348,9 +347,7 @@ pub(crate) mod typed {
         engine.shell_integration_rev() != Some(crate::shell_body::own_rev())
     }
 
-    /// What `term`'s shell may be issued, and whether the upgrade's lines go with it
-    /// (`upgrading` and the shell is [`behind`]): a heal when degraded, an upgrade-only file
-    /// when healthy and upgrading, else why not.
+    /// Decide what `term`'s shell may be issued and whether the upgrade's lines go with it.
     fn plan(term: &Mutex<Terminal>, upgrading: bool) -> Result<(Plan, bool), Refusal> {
         let engine = crate::term_lock(term);
         let upgrading = upgrading && behind(&engine);
@@ -506,12 +503,12 @@ pub(crate) mod typed {
         }
     }
 
-    /// Settle the typed re-key waiting for session `sid` (the verb's `rekey withdraw`) by its file.
+    /// Settle the typed re-key waiting for session `sid` (`rekey withdraw`) by its file.
     pub(crate) fn settle(term: &Mutex<Terminal>, sid: &SessionId) -> Settled {
         settle_issued(term, sid, None)
     }
 
-    /// [`settle`] for the key numbered `serial` only (`None`: whichever is waiting), the expiry's form, which must never settle a later key.
+    /// [`settle`] for the key numbered `serial` only (`None` settles whichever is waiting).
     pub(crate) fn settle_issued(
         term: &Mutex<Terminal>,
         sid: &SessionId,
@@ -618,9 +615,8 @@ mod tests {
         assert_eq!(names(), ["s-ab", "s-cd", "victim"]);
     }
 
-    /// A command cycle (prompt, command line, start) signed with `id`
-    /// (`";id=<hex>"`, or `""` for none); `status detail=` reads the running
-    /// command from it, so it shows whether marks reach the engine.
+    /// A command cycle (prompt, command line, start) signed with `id` (`";id=<hex>"`, or `""` for
+    /// none).
     fn cycle(id: &str) -> String {
         format!(
             "\x1b]133;A{id}\x07$ \x1b]633;E;claude --resume{id}\x07\x1b]133;B{id}\x07\
@@ -752,10 +748,8 @@ mod tests {
         assert!(later.exists(), "released: written at once");
     }
 
-    /// Negative controls: a shell without the channel gets no file and stays
-    /// `degraded`; a channel whose file cannot be written authorizes nothing and
-    /// stays `degraded`; a session whose nonce did cross is `on` with nothing
-    /// written.
+    /// Negative controls: no channel or an unwritable path stays `degraded` without authorizing a
+    /// key, and a carried nonce stays `on` without writing a file.
     #[test]
     fn the_adoption_writes_no_key_where_none_is_wanted_or_deliverable() {
         let dir = scratch("rk-controls");
@@ -829,7 +823,6 @@ mod tests {
     }
 
     fn sid(n: u32) -> SessionId {
-        // Distinct per test: the issued-key table is process-wide.
         SessionId::new(format!("s-7e{n:04x}"))
     }
 
@@ -876,9 +869,8 @@ mod tests {
         );
     }
 
-    /// A healthy tab is refused (a re-key would move a working shell off its
-    /// key), as are one with no integration and one whose channel key already
-    /// waits for its next prompt, each with nothing written.
+    /// A healthy tab, a tab with integration off, or a tab with a pending channel key is refused
+    /// with nothing written.
     #[test]
     fn a_typed_rekey_is_refused_where_nothing_is_lost() {
         let dir = scratch("rk-typed-refused");
@@ -1081,10 +1073,8 @@ mod tests {
         assert_eq!(typed::settle(&term, &sid), typed::Settled::None);
     }
 
-    /// Leftovers of a window that exited first are swept by the next typed
-    /// re-key of the same session (a stale `<sid>.<n>` file, and a symlink at
-    /// such a name, removed without writing its target); the channel's own file
-    /// and another session's are left alone.
+    /// Leftovers from an exited window (`<sid>.<n>` files or symlinks) are swept by the next typed
+    /// re-key of the same session, leaving the channel's own file and other sessions' files alone.
     #[test]
     fn a_typed_rekey_sweeps_what_a_dead_window_left_and_nothing_else() {
         let dir = scratch("rk-typed-sweep");
@@ -1114,9 +1104,8 @@ mod tests {
         sid(0xffff)
     }
 
-    /// Two issues of one tab at once leave nothing standing: both are issued
-    /// (the second settling the first), and once the waiting one is settled no
-    /// file holds a key the engine would verify.
+    /// Two concurrent issues on one tab settle the first and leave no live key in a file once the
+    /// second is settled.
     #[test]
     fn two_issues_at_once_leave_no_key_in_a_file() {
         use std::sync::{Arc, Barrier};

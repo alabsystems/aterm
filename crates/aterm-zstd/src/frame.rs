@@ -25,12 +25,8 @@ pub enum Checksum {
     Xxh64,
 }
 
-/// `Frame_Header_Descriptor` bit 5: no `Window_Descriptor`, and the
-/// `Frame_Content_Size` field is always present.
 const SINGLE_SEGMENT: u8 = 1 << 5;
-/// `Frame_Header_Descriptor` bit 2.
 const CONTENT_CHECKSUM: u8 = 1 << 2;
-/// `Block_Header` bit 0.
 const LAST_BLOCK: u32 = 1;
 
 /// Writes `content` to `out` as one zstd frame of raw blocks.
@@ -69,10 +65,6 @@ pub fn write_raw<W: Write + ?Sized>(
     Ok(())
 }
 
-/// `Frame_Content_Size` in the narrowest field that holds it (RFC 8878
-/// §3.1.1.1.4). Under Single_Segment, flag 0 is a 1-byte field, flag 1 is
-/// 2 bytes holding the size less 256, and flag 2 is 4 bytes. [`WINDOW_MAX`]
-/// fits 4 bytes, so flag 3 (8 bytes) is never needed.
 enum ContentSize {
     One(u8),
     Two(u16),
@@ -128,7 +120,6 @@ const fn block_header(size: usize, last: bool) -> [u8; 3] {
 mod tests {
     use super::{BLOCK_MAX, Checksum, WINDOW_MAX, write_raw};
 
-    /// Counts what is written and keeps none of it.
     struct Count(usize);
 
     impl std::io::Write for Count {
@@ -141,9 +132,6 @@ mod tests {
         }
     }
 
-    /// Past the window cap nothing is written; at it the frame is whole. The
-    /// content is never read (no checksum, a sink that only counts), so its
-    /// zeroed pages are never touched.
     #[test]
     fn content_past_the_window_cap_is_refused() {
         let content = vec![0u8; WINDOW_MAX + 1];

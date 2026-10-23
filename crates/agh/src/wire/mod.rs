@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 
 //! Wire types: methods, phases, origins, endpoints, deadlines, and the transport trait.
 
@@ -280,17 +279,11 @@ pub(crate) fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str
     }
 }
 
-/// The scheme's default port: 443 for `https`, else (`http`) 80.
 fn default_port(scheme: &str) -> u16 {
     if scheme == "https" { 443 } else { 80 }
 }
 
-/// The origins agh speaks to. Opaque: its fields are crate-private and it has no other
-/// constructor, so outside agh an `Endpoints` is `github_com()` or, in a test or debug build,
-/// `loopback(..)`, and no caller names a host of its own (design §6.6). `#[non_exhaustive]`
-/// alone would not do: it stops a struct literal, not `e.api = Origin::https("mirror.example")`.
-/// The credential door checks GitHub's own hosts besides, so an `Endpoints` built in the crate
-/// cannot steer a token either.
+/// Opaque set of GitHub API, upload, web, and asset CDN origins.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoints {
     pub(crate) api: Origin,

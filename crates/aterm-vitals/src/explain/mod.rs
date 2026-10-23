@@ -410,6 +410,14 @@ pub enum Fault {
     SplitBySubtraction,
     /// The tab's figure is its last sweep's rate (a 1 s window) against the split's window.
     TabOverProcsWindow,
+    /// A delegated job's members' work stays in their launcher's part as
+    /// well as in their tab, the residual still read off the coalitions'
+    /// own total: the shared launcher is charged for the tabs' work.
+    ChargeSharedLauncher,
+    /// Aterm's part is its live members' work: what members that exited
+    /// inside the window ran (`unattributed_mc`) leaves it for services, the
+    /// reaper's (SA's `DropReapedChildTime`).
+    DropReapedChildTime,
     /// A named activity's members are matched by signing id alone, under any voucher (`tests/conformance_explain.rs`).
     MatchBySigningIdOnly,
     /// The Deck's clause shows and goes with its candidate, with no hold.
@@ -439,6 +447,20 @@ impl Fault {
                     .iter()
                     .map(|t| (t.key, millicores(t.scope.cores.raw)))
                     .collect();
+            }
+            Self::ChargeSharedLauncher => {
+                for r in &split.rows {
+                    match r.part {
+                        Part::Others => split.others_mc += r.delegated_mc,
+                        Part::Services => split.services_mc += r.delegated_mc,
+                        Part::Aterm => {}
+                    }
+                }
+            }
+            Self::DropReapedChildTime => {
+                let reaped = split.unattributed_mc.min(split.aterm_mc);
+                split.aterm_mc -= reaped;
+                split.services_mc += reaped;
             }
             Self::MatchBySigningIdOnly | Self::NoHold | Self::IgnoreUnaccounted => {}
         }

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TASK RECORD THROUGH THE ONE `aterm` BINARY against a real `aterm --headless`
-//! (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.2): a worker's record is marked and read
-//! over the socket, rides `status` and `sessions`, and `aterm ctl await task` — the manager's one
-//! wait — answers over two workers with `all` once both are done, and times out with exit 124 when
-//! the news it would answer was already read.
+//! THE TASK RECORD THROUGH THE ONE `aterm` BINARY against a real `aterm --headless`.
 
 #![cfg(unix)]
 
@@ -15,11 +11,8 @@ use crate::{child_output, headless_boot};
 
 use headless_boot::{Instance, boot_session, client_command, ctl, ctl_ok, field, status};
 
-/// A wait for something that MUST happen (AGENTS.md: a hang detector).
 const HANG_MS: &str = "timeout=60000";
 
-/// The headless instance at 24x80 under `prefix`'s scratch world (each test
-/// boots under its own), or COULD NOT RUN.
 fn boot(prefix: &str) -> Instance {
     headless_boot::boot_with(
         prefix,
@@ -30,7 +23,6 @@ fn boot(prefix: &str) -> Instance {
     )
 }
 
-/// The sid a `spawn` minted.
 fn spawn(inst: &Instance) -> String {
     let body = ctl_ok(inst, &["spawn"]);
     body.split_whitespace()
@@ -133,8 +125,6 @@ fn a_workers_record_is_marked_read_published_and_awaited() {
     assert!(row.ends_with(" task_state=done task_rev=2"), "{row}");
 }
 
-/// The instance's state root, as `aterm_types::dirs::state_dir` resolves it
-/// under the scratch world's `HOME` and `XDG_STATE_HOME`.
 fn state_root(inst: &Instance) -> std::path::PathBuf {
     if cfg!(target_os = "macos") {
         inst.tmp.join("home/Library/Application Support/aterm")
@@ -143,8 +133,6 @@ fn state_root(inst: &Instance) -> std::path::PathBuf {
     }
 }
 
-/// The control wire's percent escape (`aterm_codec::pct::encode`): every byte
-/// that is not ASCII-graphic, and `%`, as `%XX`.
 fn pct(s: &str) -> String {
     s.bytes()
         .map(|b| {
@@ -157,13 +145,6 @@ fn pct(s: &str) -> String {
         .collect()
 }
 
-/// THE WORKER'S RESULT, AND A TURN THAT OPENS IT AGAIN, through the one
-/// binary (design §2.3, §2.2): `result` answers `ERR no task`, then its
-/// task's state's word, until the record names a snapshot under the
-/// instance's `<state>/tasks/` — the files the window harness writes at the
-/// done edge — and then `aterm ctl` prints the stamp on stderr and the
-/// worker's text alone on stdout. A `turn` typed into the done worker from
-/// `aterm ctl` moves its record to `working why=turn` as it lands.
 #[test]
 fn a_workers_result_is_read_and_a_turn_opens_it_again() {
     let inst = boot("atres");

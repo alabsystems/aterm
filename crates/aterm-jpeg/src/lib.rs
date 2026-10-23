@@ -10,7 +10,6 @@ mod idct;
 use color::{ColorModel, Plane};
 use huffman::{BitReader, HuffmanTable};
 
-/// Where coefficient `k` of a zigzag-ordered block sits in natural order.
 const ZIGZAG: [usize; 64] = [
     0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
     13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
@@ -109,8 +108,6 @@ impl<'a> Decoder<'a> {
         })
     }
 
-    /// The next marker at or after `pos`, skipping fill bytes and any stray
-    /// entropy bytes before it.
     fn next_marker(&mut self) -> Option<u8> {
         loop {
             let byte = *self.data.get(self.pos)?;
@@ -130,7 +127,6 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// The payload of the length-prefixed segment at `pos`, stepping past it.
     fn segment(&mut self) -> Option<&'a [u8]> {
         let high = *self.data.get(self.pos)?;
         let low = *self.data.get(self.pos + 1)?;
@@ -311,8 +307,6 @@ impl<'a> Decoder<'a> {
         Some(())
     }
 
-    /// One scan: its header, then its entropy-coded data. `Some(true)` where
-    /// the data ran to the end of the file (a truncated image).
     fn scan(&mut self) -> Option<bool> {
         let payload = self.segment()?;
         let frame = self.frame.as_ref()?;
@@ -601,7 +595,6 @@ fn dequantize(value: i32, quant: u16) -> i32 {
         .clamp(-32_768, 32_767)
 }
 
-/// A progressive scan's first pass over an AC band (T.81 G.1.2.2).
 fn ac_first(
     coefficients: &mut [i16],
     table: &HuffmanTable,
@@ -636,9 +629,6 @@ fn ac_first(
     Some(())
 }
 
-/// A progressive scan's refinement of an AC band (T.81 G.1.2.3): one more
-/// bit for every coefficient already non-zero, and newly non-zero ones of
-/// magnitude one at this bit.
 fn ac_refine(
     coefficients: &mut [i16],
     table: &HuffmanTable,
@@ -699,8 +689,6 @@ fn ac_refine(
     Some(())
 }
 
-/// The orientation (TIFF tag 274) in an EXIF payload: a TIFF header and its
-/// first IFD.
 fn exif_orientation(tiff: &[u8]) -> Option<u16> {
     let little = match tiff.get(..2)? {
         b"II" => true,
@@ -746,7 +734,6 @@ fn exif_orientation(tiff: &[u8]) -> Option<u16> {
 mod tests {
     use super::{decode_rgba8, exif_orientation};
 
-    /// Not a JPEG, or a JPEG cut off before its frame, is `None`.
     #[test]
     fn what_is_not_a_framed_jpeg_is_refused() {
         assert!(decode_rgba8(b"\x89PNG\r\n\x1a\n", 64).is_none());
@@ -754,7 +741,6 @@ mod tests {
         assert!(decode_rgba8(&[], 64).is_none());
     }
 
-    /// The orientation tag is read from either byte order.
     #[test]
     fn the_exif_orientation_is_read_in_both_byte_orders() {
         let little = [

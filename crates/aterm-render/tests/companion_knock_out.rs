@@ -47,7 +47,6 @@ fn contrast(a: u32, b: u32) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-/// An opaque single-colour coat, `w`×`h` texels.
 fn coat(rgb: u32, w: u32, h: u32, version: u64) -> SceneAtlas {
     let px = [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 255];
     SceneAtlas {
@@ -76,7 +75,6 @@ fn body(x: i32, y: i32, w: u16, h: u16) -> FreeSprite {
     }
 }
 
-/// A terminal with `LINE` on row 1 (the caret hidden), its page and ink set by OSC 10/11.
 fn page(ink: &str, paper: &str) -> Terminal {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(format!("\x1b]10;{ink}\x07\x1b]11;{paper}\x07\x1b[?25l\r\n{LINE}").as_bytes());
@@ -92,9 +90,6 @@ struct Judged {
     under: usize,
 }
 
-/// Each ink pixel of `clean` (the frame with no body, 4.5:1 or more against the page) inside
-/// `bx`, judged in `frame` against the median of the nearest ring (Chebyshev 1, else 2) of
-/// pixels the glyphs leave at the page colour in `clean`.
 fn judge(clean: &[u32], frame: &[u32], width: usize, paper: u32, bx: [usize; 4]) -> Judged {
     let height = clean.len() / width;
     let mut out = Judged {
@@ -158,13 +153,8 @@ fn with_body(term: &mut Terminal, fur: u32, sprite: FreeSprite) -> RenderInput {
     input
 }
 
-/// Every ink pixel on the body reads at least 4.5:1 against the page ring the knock-out cuts
-/// round it, on dark and on paper, for coats near the ink's own lightness; with the knock-out
-/// off the same letters read under the bar against the fur.
 #[test]
 fn letters_on_a_body_drawn_under_the_text_read_against_the_page() {
-    // (ink, page, coats): the 2026-10-22 burst landings' tan and cream on dark, and the
-    // slate and grey-brown on paper.
     let cases = [
         (
             "#d0d0d0",
@@ -200,8 +190,6 @@ fn letters_on_a_body_drawn_under_the_text_read_against_the_page() {
                 .any(|&p| p == ink_rgb || contrast(p, paper_rgb) > 7.0),
             "the line must ink"
         );
-        // The body: over "kitty" (cols 4..9), from the middle of row 0 to the middle of row 2,
-        // so it covers whole letters and parts of them, as a resting head does.
         let (bx0, by0) = (4 * cw, ch / 2);
         let (bw, bh) = (5 * cw, 2 * ch);
         let sprite = body(bx0 as i32, by0 as i32, bw as u16, bh as u16);
@@ -223,8 +211,6 @@ fn letters_on_a_body_drawn_under_the_text_read_against_the_page() {
                  (worst {:.2})",
                 j.under, j.ink, j.worst
             );
-            // The body keeps every pixel no glyph touches: the knock-out is the glyphs' own
-            // dilation, never a box.
             let kept = (bx[1]..bx[3])
                 .flat_map(|y| (bx[0]..bx[2]).map(move |x| (x, y)))
                 .filter(|&(x, y)| {
@@ -259,14 +245,11 @@ fn letters_on_a_body_drawn_under_the_text_read_against_the_page() {
     }
 }
 
-/// Away from the letters the knock-out changes nothing: a body on blank cells is byte-equal
-/// with and without it, on the full and the damaged path.
 #[test]
 fn a_body_off_the_letters_is_untouched_by_the_knock_out() {
     let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = page("#d0d0d0", "#111318");
-    // Rows 2..4 are blank: the body sits there, a pixel clear of row 1's letters.
     let sprite = body(
         2 * cw as i32,
         2 * ch as i32 + 1,
@@ -283,7 +266,6 @@ fn a_body_off_the_letters_is_untouched_by_the_knock_out() {
         "a body off the letters must be untouched by the knock-out"
     );
 
-    // The damaged path repaints a moved body onto the letters exactly as a fresh frame does.
     let mut wc = WindowCpu::new();
     let _ = rend.render_input_cached(&mut wc, &input);
     let onto = with_body(
@@ -304,12 +286,6 @@ fn a_body_off_the_letters_is_untouched_by_the_knock_out() {
     );
 }
 
-/// ON GLASS THE KNOCK-OUT LAYS THE PAGE'S COLOUR, NEVER ITS OPACITY (2026-10-23, review: at
-/// background opacity 0.8 a stamp in the opaque page turned 789 px round the letters under an
-/// all-transparent body box solid). A body box over the letters whose texels are all
-/// transparent (a tile's border, the air round a silhouette) leaves the frame byte-equal with
-/// and without the knock-out; a tan coat over them has its letters read against the page's
-/// colour as on an opaque window, and no pixel is made more opaque than the body left it.
 #[test]
 fn on_a_translucent_window_the_knock_out_keeps_the_glass() {
     let mut rend = renderer();

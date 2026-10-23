@@ -1872,14 +1872,21 @@ fn upkeep(
         let secrets = home.join(".secrets");
         let unconfigured_with_secrets = configured_source(Some(&config), Some(roster_path))
             .is_none()
-            && [
+            && ([
                 FLEET_ROSTER_FILE,
                 "ai-accounts.csv",
                 super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
                 super::headless_oauth::MAILBOX_TOML_FILE,
             ]
             .into_iter()
-            .any(|name| secrets.join(name).is_file());
+            .any(|name| secrets.join(name).is_file())
+                || (secrets.is_dir()
+                    && super::headless_oauth::discover_mailbox_config_files(
+                        Some(home),
+                        None,
+                        Some(&config),
+                    )
+                    .is_some()));
         if unconfigured_with_secrets || needs_init_accounts_sync(home, state_dir, roster_path, now)
         {
             let _ = sync_accounts_for_init(home, state_dir, roster_path, now);
@@ -2046,12 +2053,20 @@ pub fn needs_init_accounts_sync(
     if secrets_fleet.is_file() && fs::read(&secrets_fleet).ok() != fs::read(&fb).ok() {
         return true;
     }
+    let config_path = config_beside(roster_path);
     if ![
         super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
         super::headless_oauth::MAILBOX_TOML_FILE,
     ]
     .into_iter()
     .any(|name| secrets.join(name).is_file())
+        && !(secrets.is_dir()
+            && super::headless_oauth::discover_mailbox_config_files(
+                Some(home),
+                None,
+                Some(&config_path),
+            )
+            .is_some())
     {
         return false;
     }
@@ -2061,7 +2076,6 @@ pub fn needs_init_accounts_sync(
     let Ok(existing_fleet) = FleetRoster::from_toml(&existing_text, "fleet-accounts.toml") else {
         return false;
     };
-    let config_path = config_beside(roster_path);
     let env = Env {
         state: state_dir.to_path_buf(),
         aterm_state: state_dir
@@ -2534,17 +2548,31 @@ fn latest_mailbox_mtime(
                 .join(super::headless_oauth::MAILBOX_TOML_FILE),
         );
     }
+    let push_maildir_paths = |paths: &mut Vec<PathBuf>, root: &Path| {
+        for dir in [root.to_path_buf(), root.join("new"), root.join("cur")] {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if !name_str.starts_with('.')
+                        && !name_str.ends_with(".clicked")
+                        && !name_str.ends_with(".seen")
+                        && entry.file_type().is_ok_and(|ft| ft.is_file())
+                    {
+                        paths.push(entry.path());
+                    }
+                }
+            }
+            paths.push(dir);
+        }
+    };
     if let Some(mb_dir) = resolve_mailbox_dir(home, store) {
-        paths.push(mb_dir.join("new"));
-        paths.push(mb_dir.join("cur"));
-        paths.push(mb_dir);
+        push_maildir_paths(&mut paths, &mb_dir);
     }
     if let Some(cfg_dir) =
         super::headless_oauth::discover_mailbox_config(home, Some(&store.dir)).and_then(|c| c.dir)
     {
-        paths.push(cfg_dir.join("new"));
-        paths.push(cfg_dir.join("cur"));
-        paths.push(cfg_dir);
+        push_maildir_paths(&mut paths, &cfg_dir);
     }
     paths
         .into_iter()
@@ -2659,7 +2687,7 @@ pub(super) fn next_auto_renew_target(
         .next()
 }
 
-fn complete_staging_renewal(
+fn complete_staging_renewal_result(
     store: &accounts::Store,
     file_roster: &Roster,
     requested_label: &str,
@@ -2667,16 +2695,24 @@ fn complete_staging_renewal(
     staging_text: &str,
     status_got: &super::align::Captured,
     now_done: i64,
-) -> bool {
+) -> super::cli::Renewal {
+    use super::cli::Renewal;
+
     // A failed status cannot qualify any row, irrespective of the store's bindings.
-    if super::cli::status_facts(status_got, "")
+    let facts = super::cli::status_facts(status_got, "");
+    if facts
+        .as_ref()
         .is_none_or(|facts| !facts.signed_in || !facts.claude_ai)
     {
         let _ = fs::remove_dir_all(staging);
-        return false;
+        return if facts.is_some() {
+            Renewal::authentication_failed(status_got.code)
+        } else {
+            Renewal::Failed
+        };
     }
     let mut note = None;
-    let mut accepted = false;
+    let mut outcome = Renewal::Failed;
     let result = (|| {
         let held = store.acquire().map_err(|why| why.to_string())?;
         let (_, read) = store.load(now_done)?;
@@ -2730,6 +2766,7 @@ fn complete_staging_renewal(
                 });
             let Some((matched_label, matched_email, subscription)) = matched else {
                 return Ok(if wrong_account {
+                    outcome = Renewal::WrongAccount;
                     accounts::note_wrong_account(logins, requested_label, now_done)
                 } else {
                     Vec::new()
@@ -2746,7 +2783,7 @@ fn complete_staging_renewal(
             let own_dir = file_roster
                 .row(&matched_label)
                 .and_then(|r| r.dir.as_deref());
-            accepted = true;
+            outcome = Renewal::Renewed;
             Ok(accounts::note_renewed(
                 state,
                 logins,
@@ -2759,10 +2796,10 @@ fn complete_staging_renewal(
         })
     })();
     match result {
-        Ok(_) if accepted => true,
+        Ok(_) if outcome == Renewal::Renewed => outcome,
         Ok(_) => {
             let _ = fs::remove_dir_all(staging);
-            false
+            outcome
         }
         Err(why) => {
             let _ = writeln!(
@@ -2772,9 +2809,30 @@ fn complete_staging_renewal(
                 super::one_line(&why, 160),
                 staging.display(),
             );
-            false
+            Renewal::Failed
         }
     }
+}
+
+#[cfg(test)]
+fn complete_staging_renewal(
+    store: &accounts::Store,
+    file_roster: &Roster,
+    requested_label: &str,
+    staging: &Path,
+    staging_text: &str,
+    status_got: &super::align::Captured,
+    now_done: i64,
+) -> bool {
+    complete_staging_renewal_result(
+        store,
+        file_roster,
+        requested_label,
+        staging,
+        staging_text,
+        status_got,
+        now_done,
+    ) == super::cli::Renewal::Renewed
 }
 
 fn select_auto_renew_browser(
@@ -3154,14 +3212,18 @@ fn spawn_row_renewal(
     start_auto_renew(
         permit,
         move || {
+            use super::cli::Renewal;
+
             let store = accounts::Store::at(&state_owned);
-            let run_attempt = |browser: &super::cli::RenewBrowser, force_headless: bool| -> bool {
+            let run_attempt = |browser: &super::cli::RenewBrowser,
+                               force_headless: bool|
+             -> Renewal {
                 let Ok(staging) = store.claim_staging_dir(&next_label) else {
-                    return false;
+                    return Renewal::Failed;
                 };
                 let Some(staging_text) = staging.to_str().map(str::to_owned) else {
                     let _ = fs::remove_dir_all(&staging);
-                    return false;
+                    return Renewal::Failed;
                 };
                 let env_var = |name: &str| {
                     if name == "HOME" {
@@ -3172,7 +3234,7 @@ fn spawn_row_renewal(
                 };
                 let Ok(pass_env) = super::cli::auth_check_env(&env_var) else {
                     let _ = fs::remove_dir_all(&staging);
-                    return false;
+                    return Renewal::Failed;
                 };
                 let claude_prog = resolve_claude_program(&home_owned);
                 let mut cmd = super::cli::renew_command(
@@ -3214,9 +3276,16 @@ fn spawn_row_renewal(
                     cmd.env(super::headless_oauth::HEADLESS_ENV, "1");
                 }
                 let ran = super::align::capture_bounded(cmd, Duration::from_secs(300), 64 * 1024);
-                if !ran.is_ok_and(|cap| cap.code == Some(0)) || !accounts::login_made(&staging) {
+                let ran = match ran {
+                    Ok(ran) => ran,
+                    Err(_) => {
+                        let _ = fs::remove_dir_all(&staging);
+                        return Renewal::Failed;
+                    }
+                };
+                if ran.code != Some(0) || !accounts::login_made(&staging) {
                     let _ = fs::remove_dir_all(&staging);
-                    return false;
+                    return Renewal::authentication_failed(ran.code);
                 }
                 let Ok(status_got) = super::cli::status_in_home_within(
                     claude_prog.as_os_str(),
@@ -3225,10 +3294,10 @@ fn spawn_row_renewal(
                     super::cli::AUTH_CHECK_BUDGET,
                 ) else {
                     let _ = fs::remove_dir_all(&staging);
-                    return false;
+                    return Renewal::Failed;
                 };
                 let now_done = crate::supervise::limit::unix_now().max(now);
-                complete_staging_renewal(
+                complete_staging_renewal_result(
                     &store,
                     &file_roster,
                     &next_row.label,
@@ -3254,14 +3323,16 @@ fn spawn_row_renewal(
                     };
                     b
                 };
-                if run_attempt(&browser, !has_mailbox && has_headless_profile) {
+                let result = run_attempt(&browser, !has_mailbox && has_headless_profile);
+                if result == Renewal::Renewed {
                     return true;
                 }
-                if !has_mailbox
+                if result.can_retry_authentication()
+                    && !has_mailbox
                     && has_headless_profile
                     && let Some(fallback) = non_headless_fallback
                 {
-                    return run_attempt(&fallback, false);
+                    return run_attempt(&fallback, false) == Renewal::Renewed;
                 }
                 false
             })();
@@ -6755,6 +6826,123 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
     }
 
     #[test]
+    fn staging_completion_failures_stop_fallback_and_keep_verified_logins() {
+        use super::super::cli::Renewal;
+
+        for case in [
+            "checkpoint",
+            "ledger",
+            "wrong-account",
+            "signed-out",
+            "interrupted-status",
+        ] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("aterm-renewal-completion-")
+                .tempdir()
+                .unwrap();
+            let store = accounts::Store::at(dir.path());
+            store.machine_id("0123456789abcdef").unwrap();
+            let roster = Roster {
+                rows: vec![Row {
+                    label: "main".to_owned(),
+                    email: Some("owner@example.test".to_owned()),
+                    ..Row::default()
+                }],
+            };
+            let staging = store.claim_staging_dir("main").unwrap();
+            let profile = b"private verified login fixture";
+            fs::write(staging.join(".claude.json"), profile).unwrap();
+            let checkpoint = staging.join(accounts::RENEWAL_CHECKPOINT_FILE);
+            if case == "checkpoint" {
+                fs::write(&checkpoint, b"unrecognized private work").unwrap();
+            } else if case == "ledger" {
+                fs::create_dir(store.ledger_path()).unwrap();
+            }
+            let status = super::super::align::Captured {
+                stdout: if case == "signed-out" {
+                    br#"{"loggedIn":false,"authMethod":"none"}"#.to_vec()
+                } else {
+                    let email = if case == "wrong-account" {
+                        "foreign@example.test"
+                    } else {
+                        "owner@example.test"
+                    };
+                    format!(
+                        r#"{{"loggedIn":true,"authMethod":"claude.ai","email":"{email}","subscriptionType":"max"}}"#
+                    )
+                    .into_bytes()
+                },
+                code: if case == "interrupted-status" {
+                    None
+                } else {
+                    Some(if case == "signed-out" { 1 } else { 0 })
+                },
+            };
+            let outcome = complete_staging_renewal_result(
+                &store,
+                &roster,
+                "main",
+                &staging,
+                staging.to_str().unwrap(),
+                &status,
+                UPKEEP_NOW,
+            );
+            match case {
+                "checkpoint" | "ledger" => {
+                    assert_eq!(outcome, Renewal::Failed);
+                    assert!(!outcome.can_retry_authentication());
+                    assert_eq!(fs::read(staging.join(".claude.json")).unwrap(), profile);
+                    if case == "checkpoint" {
+                        assert_eq!(fs::read(&checkpoint).unwrap(), b"unrecognized private work");
+                        assert!(!store.logins_file().exists() && !store.state_file().exists());
+                        assert!(store.tail(10).unwrap().is_empty());
+                    } else {
+                        let binding = store.load_logins(UPKEEP_NOW).unwrap().0;
+                        assert_eq!(
+                            binding.get("main").unwrap().dir.as_deref(),
+                            staging.to_str()
+                        );
+                        assert_eq!(
+                            store.load(UPKEEP_NOW).unwrap().0.account("main").auth,
+                            accounts::Auth::Ok
+                        );
+                        let proof = accounts::read_renewal_checkpoint(
+                            &staging,
+                            &fs::canonicalize(&staging).unwrap(),
+                            UPKEEP_NOW,
+                        )
+                        .unwrap();
+                        assert_eq!(proof.dir, staging.to_str().unwrap());
+                        assert_eq!(proof.checked_at, UPKEEP_NOW);
+                        assert!(store.ledger_path().is_dir());
+                    }
+                }
+                "wrong-account" => {
+                    assert_eq!(outcome, Renewal::WrongAccount);
+                    assert!(outcome.can_retry_authentication());
+                    assert!(!staging.exists());
+                    let bindings = store.load_logins(UPKEEP_NOW).unwrap().0;
+                    let binding = bindings.get("main").unwrap();
+                    assert_eq!(binding.dir, None);
+                    assert_eq!(binding.wrong_at, Some(UPKEEP_NOW));
+                }
+                "interrupted-status" => {
+                    assert_eq!(outcome, Renewal::Failed);
+                    assert!(!outcome.can_retry_authentication());
+                    assert!(!staging.exists());
+                    assert!(!store.logins_file().exists() && !store.state_file().exists());
+                }
+                _ => {
+                    assert_eq!(outcome, Renewal::AuthFailed);
+                    assert!(outcome.can_retry_authentication());
+                    assert!(!staging.exists());
+                    assert!(!store.logins_file().exists() && !store.state_file().exists());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn complete_staging_renewal_records_wrong_account_and_auto_renew_advances_past_cooldown_or_unconfigured_row()
      {
         let w = World::new();
@@ -7115,6 +7303,22 @@ totp = "JBSWY3DPEHPK3PXP"
         );
         let _ = fs::remove_file(&secret_file);
 
+        let maildir_new = store.dir.join("mailbox/new");
+        fs::create_dir_all(&maildir_new).unwrap();
+        let eml_file = maildir_new.join("msg1.eml");
+        fs::write(
+            &eml_file,
+            "To: <sun.m27.2@example.test>\r\n\r\nCode: 123456\r\n",
+        )
+        .unwrap();
+        let eml_meta_mtime = fs::metadata(&eml_file).unwrap().modified().unwrap();
+        let mtime_with_eml = latest_mailbox_mtime(Some(&w.home), &store).expect("eml mtime");
+        assert!(
+            mtime_with_eml >= eml_meta_mtime,
+            "latest_mailbox_mtime must include individual unclicked message files in Maildir"
+        );
+        let _ = fs::remove_dir_all(store.dir.join("mailbox"));
+
         // A cached headless browser profile for m27-2 must not be treated as headless-capable
         // when m27-2 already has wrong_at recorded and no mailbox is configured for m27-2.
         let m27_2_browser_dir =
@@ -7257,5 +7461,50 @@ totp = "JBSWY3DPEHPK3PXP"
                 Some(&renewed),
             );
         }
+
+        // An interrupted staging renewal with a valid checkpoint must be recovered by `accounts use`.
+        store
+            .transact(UPKEEP_NOW + 45, &mut None, |state| {
+                Ok(accounts::note_auth(
+                    state,
+                    "m27-3",
+                    accounts::Auth::SignedOut,
+                    UPKEEP_NOW + 45,
+                ))
+            })
+            .unwrap();
+        let use_staging = store.claim_staging_dir("m27-3").unwrap();
+        fs::write(use_staging.join(".claude.json"), b"checkpointed m27-3").unwrap();
+        let use_staging_text = use_staging.to_str().unwrap();
+        accounts::write_renewal_checkpoint(
+            "m27-3",
+            "star.m27.3@example.test",
+            use_staging_text,
+            Some("max"),
+            UPKEEP_NOW + 50,
+        )
+        .unwrap();
+        let env_use = w.env(UPKEEP_NOW + 55);
+        out.clear();
+        err.clear();
+        let use_code = super::super::cli::run_accounts(
+            &super::super::cli::AccountsCmd::Use {
+                label: "m27-3".to_owned(),
+            },
+            &env_use,
+            &non_tty_host,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(use_code, ExitCode::SUCCESS);
+        let recovered_m27_3 = store
+            .load_logins(UPKEEP_NOW + 55)
+            .unwrap()
+            .0
+            .get("m27-3")
+            .cloned()
+            .expect("m27-3 login recovered by accounts use");
+        assert_eq!(recovered_m27_3.dir.as_deref(), Some(use_staging_text));
+        assert_eq!(recovered_m27_3.renewed_at, Some(UPKEEP_NOW + 50));
     }
 }

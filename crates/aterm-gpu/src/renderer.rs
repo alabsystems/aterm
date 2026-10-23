@@ -939,6 +939,34 @@ fn fs_fx_linear(in: FxVsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(s2l(vec3<f32>(p.xyz) / 255.0), f32(p.w) / 255.0);
 }
 
+// The Exact law where every pixel the layer draws is opaque (`FxContent`'s
+// `draws_opaque`, route (1) of the pass economy): `over_premul` at a = 255 is
+// the entry's colour, so the draw stores it through the sRGB view with no
+// blend, as `fs_bg` stores a cell's background, and the Color mask keeps alpha.
+@fragment
+fn fs_fx_store(in: FxVsOut) -> @location(0) vec4<f32> {
+    let l = fx_local(in.pos, in.origin);
+    let kind = in.flags & 3u;
+    var c: vec4<u32>;
+    if (kind == 2u) {
+        let t = fx_texel(l, in.dst, in.src, in.flags);
+        if (((in.flags >> 3u) & 3u) == 0u) {
+            let k = fx_byte4(textureLoad(fx_r8, t, 0)).x;
+            let reach = (in.flags >> 8u) & 255u;
+            if (k == 0u || k > reach) {
+                discard;
+            }
+            c = fx_ink(in.pal + clamp(k, 1u, reach) - 1u);
+        } else {
+            c = fx_byte4(textureLoad(fx_rgba, t, 0));
+        }
+    } else {
+        let j = in.pal + 2u * select(0u, l.y, kind == 1u);
+        c = glow_lerp4(fx_ink(j), fx_ink(j + 1u), l.x, max(in.src.x, 1u));
+    }
+    return vec4<f32>(s2l(vec3<f32>(c.rgb) / 255.0), 1.0);
+}
+
 "#;
 
 #[cfg(wgpu_arm)]
@@ -1974,6 +2002,7 @@ pub(crate) enum DrawPipe {
     FreeOver,
     Fx,
     FxLinear,
+    FxStore,
 }
 
 impl DrawPipe {
@@ -2001,6 +2030,7 @@ impl DrawPipe {
             | Self::FreeOver => Pipeline::SpriteOver,
             Self::Fx => Pipeline::Fx,
             Self::FxLinear => Pipeline::FxLinear,
+            Self::FxStore => Pipeline::FxStore,
         }
     }
 }
@@ -2175,6 +2205,12 @@ pub struct FrameShape {
     pub ablation: UnormAblation,
     pub unorm_draws: u32,
     pub unorm_instances: u64,
+    /// Where those Unorm-law draws went: passes of their own, or inside the sRGB passes through framebuffer fetch.
+    pub route: UnormRoute,
+    /// Whether the frame's Exact Under fx stored at the end of the base pass through the sRGB view (route (1) of the pass economy: every Exact Under layer drew opaque and no cursor glow drew under the text).
+    pub under_store: bool,
+    /// The renderer's framebuffer-fetch verdict as of the frame ([`GpuRenderer::fetch_probe`]): `None` until a frame that drew Unorm-law light settled it.
+    pub fetch_probe: Option<FetchProbe>,
     pub fx_instances: u32,
     pub fx_upload_bytes: u64,
     pub fx_refused: u64,
@@ -2211,6 +2247,86 @@ impl UnormAblation {
     }
 }
 
+/// How a frame's Unorm-law draws (the additive and glow groups) reached the offscreen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnormRoute {
+    /// In passes of their own on the Unorm view: every arm, and Metal until its device passed the fetch probe.
+    #[default]
+    Split,
+    /// Inside the sRGB passes, through framebuffer fetch (Metal on an Apple GPU whose probe passed): no pass of their own.
+    Fetch,
+}
+
+impl UnormRoute {
+    /// The seam's spelling, and `metrics`' `gpu_unorm_route=` word.
+    #[must_use]
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Fetch => "fetch",
+        }
+    }
+
+    #[inline]
+    fn from_seam(value: &str) -> Self {
+        match value {
+            "split" => Self::Split,
+            _ => Self::Fetch,
+        }
+    }
+
+    /// The route a renderer starts on: the fetch route wherever the device allows it, unless the `ATERM_GPU_UNORM_ROUTE` dev seam (`seam`, which no release reads) names the split.
+    #[inline]
+    fn initial(seam: Option<&std::ffi::OsStr>) -> Self {
+        seam.and_then(std::ffi::OsStr::to_str)
+            .map_or(Self::Fetch, Self::from_seam)
+    }
+}
+
+/// Which stage of the framebuffer-fetch probe a byte failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchStage {
+    /// A byte's linear value did not store as that byte.
+    Store,
+    /// A stored byte, fetched and stored again, came back another byte.
+    RoundTrip,
+    /// A fetch after a fixed-function sRGB blend in the same pass read another byte than the pass stores.
+    InPass,
+}
+
+/// What a device's framebuffer-fetch probe found: whether `encode(decode(b)) == b` for all 256 bytes of every channel through its sRGB store and fetch (Metal, lane B6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchProbe {
+    /// The device has no framebuffer fetch (not an Apple GPU), or the arm has none: the split stays.
+    Unsupported,
+    /// Every byte came back: Unorm-law draws blend inside the sRGB passes.
+    Passed,
+    /// `stage` returned `got` for `want` in `channel` (0 red … 3 alpha): the split stays.
+    Failed {
+        stage: FetchStage,
+        channel: u8,
+        want: u8,
+        got: u8,
+    },
+    /// The probe could not run (a build, an encode or a readback failed): the split stays.
+    Refused,
+}
+
+impl FetchProbe {
+    /// `metrics`' `gpu_fetch_probe=` word.
+    #[must_use]
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Passed => "passed",
+            Self::Failed { .. } => "failed",
+            Self::Refused => "refused",
+        }
+    }
+}
+
 impl Default for FrameShape {
     fn default() -> Self {
         Self {
@@ -2222,6 +2338,9 @@ impl Default for FrameShape {
             ablation: UnormAblation::Off,
             unorm_draws: 0,
             unorm_instances: 0,
+            route: UnormRoute::Split,
+            under_store: false,
+            fetch_probe: None,
             fx_instances: 0,
             fx_upload_bytes: 0,
             fx_refused: 0,
@@ -2259,15 +2378,17 @@ impl FrameShape {
     }
 }
 
-/// What a built frame plan holds on the Unorm view, and the ablation it was built under.
+/// What a built frame plan holds by the Unorm byte law, the ablation it was built under, the route those draws took ([`route_frame_plan`]), and whether its Exact Under fx stores in the base pass (route (1)).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PlanUnorm {
     pub(crate) ablation: UnormAblation,
     pub(crate) draws: u32,
     pub(crate) instances: u64,
+    pub(crate) route: UnormRoute,
+    pub(crate) under_store: bool,
 }
 
-/// One draw: bind `pipe` and `atlas` on change, bind `stream`, draw `count` instanced quads, inside the pass `group` coalesces into.
+/// One draw: bind `pipe` (its fetch twin when `fetch`) and `atlas` on change, bind `stream`, draw `count` instanced quads, inside the pass `group` coalesces into.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DrawItem {
     pub(crate) group: u8,
@@ -2275,6 +2396,16 @@ pub(crate) struct DrawItem {
     pub(crate) atlas: Option<DrawAtlas>,
     pub(crate) stream: StreamId,
     pub(crate) count: u32,
+    /// A Unorm-law draw routed through its framebuffer-fetch twin, inside the sRGB view ([`UnormRoute::Fetch`]).
+    pub(crate) fetch: bool,
+}
+
+impl DrawItem {
+    /// Whether this draw renders through the offscreen's sRGB view: an sRGB group's, or a fetch twin's.
+    #[inline]
+    pub(crate) const fn srgb(&self) -> bool {
+        GROUP_SRGB[self.group as usize] || self.fetch
+    }
 }
 
 /// The presence flags [`build_frame_plan`] gates on.
@@ -2288,6 +2419,22 @@ pub(crate) struct FramePlanCtx {
     pub(crate) has_wallpaper: bool,
     pub(crate) cursor_opaque: bool,
     pub(crate) ablation: UnormAblation,
+    /// Every Exact layer at Under draws only opaque pixels ([`fx_gpu::under_draws_opaque`]): route (1) of the pass economy may store its fx at the end of the base pass.
+    pub(crate) under_opaque: bool,
+}
+
+/// Route `plan`'s Unorm-law draws, which [`build_frame_plan`] builds on the split, by `route`: under [`UnormRoute::Fetch`] (Metal, on a device whose framebuffer-fetch probe passed) each takes its row's twin in the sRGB view, so the frame opens no Unorm-view pass.
+#[cfg(target_os = "macos")]
+pub(crate) fn route_frame_plan(plan: &mut [DrawItem], unorm: &mut PlanUnorm, route: UnormRoute) {
+    unorm.route = route;
+    if route == UnormRoute::Fetch {
+        for item in plan
+            .iter_mut()
+            .filter(|item| !GROUP_SRGB[usize::from(item.group)])
+        {
+            item.fetch = true;
+        }
+    }
 }
 
 #[allow(
@@ -2316,9 +2463,14 @@ pub(crate) fn build_frame_plan(
                 atlas,
                 stream,
                 count,
+                fetch: false,
             });
         }
     };
+    // Route (1) of the pass economy: an opaque Exact Under layer's fx is a store, so it may
+    // draw at the end of the base pass through the sRGB view, where it lands in the same
+    // order against every other draw unless a cursor glow under the text sits between.
+    let under_store = ctx.under_opaque && counts[StreamId::GlowUnder as usize].is_none();
 
     push(
         G_BASE_BG,
@@ -2370,14 +2522,24 @@ pub(crate) fn build_frame_plan(
         Some(DrawAtlas::Fx),
     );
     push(G_BASE_BG, StreamId::Trail, DrawPipe::Bg, None);
+    if under_store {
+        push(
+            G_BASE_BG,
+            StreamId::FxUnder,
+            DrawPipe::FxStore,
+            Some(DrawAtlas::Fx),
+        );
+    }
 
     push(G_GLOW_UNDER, StreamId::GlowUnder, DrawPipe::GlowAdd, None);
-    push(
-        G_GLOW_UNDER,
-        StreamId::FxUnder,
-        DrawPipe::Fx,
-        Some(DrawAtlas::Fx),
-    );
+    if !under_store {
+        push(
+            G_GLOW_UNDER,
+            StreamId::FxUnder,
+            DrawPipe::Fx,
+            Some(DrawAtlas::Fx),
+        );
+    }
     push(G_GLOW_UNDER, StreamId::FireAdd, DrawPipe::FireAdd, None);
     push(G_GLOW_UNDER, StreamId::FireOver, DrawPipe::FireOver, None);
 
@@ -2491,6 +2653,8 @@ pub(crate) fn build_frame_plan(
         ablation: ctx.ablation,
         draws: u32::try_from(unorm.clone().count()).unwrap_or(u32::MAX),
         instances: unorm.map(|item| u64::from(item.count)).sum(),
+        route: UnormRoute::Split,
+        under_store: under_store && counts[StreamId::FxUnder as usize].is_some(),
     }
 }
 
@@ -2569,34 +2733,48 @@ impl FrameRes<'_> {
     }
 
     #[inline]
-    fn pipeline(&self, pipe: DrawPipe) -> crate::device_layer::FramePipeline<'_> {
+    fn pipeline(&self, pipe: DrawPipe, fetch: bool) -> crate::device_layer::FramePipeline<'_> {
+        #[cfg(any(wgpu_arm, gl_arm))]
+        let split_only = || {
+            assert!(
+                !fetch,
+                "only the Metal arm routes a draw through framebuffer fetch"
+            );
+        };
         match self {
             #[cfg(wgpu_arm)]
-            Self::Wgpu(r) => crate::device_layer::FramePipeline::Wgpu(match pipe {
-                DrawPipe::Bg => r.bg_pipeline,
-                DrawPipe::Glyph => r.glyph_pipeline,
-                DrawPipe::Color => r.color_glyph_pipeline,
-                DrawPipe::CursorBlend => r.effects.get(EffectPipeline::CursorBlend),
-                DrawPipe::GlowAdd => r.effects.get(EffectPipeline::GlowAdd),
-                DrawPipe::RainGlow => r.effects.get(EffectPipeline::RainGlow),
-                DrawPipe::RainGlowOver => r.effects.get(EffectPipeline::RainGlowOver),
-                DrawPipe::FireAdd => r.effects.get(EffectPipeline::FireAdd),
-                DrawPipe::FireOver => r.effects.get(EffectPipeline::FireOver),
-                DrawPipe::DecoOver => r.effects.get(EffectPipeline::DecoOver),
-                DrawPipe::DecoAdd => r.effects.get(EffectPipeline::DecoAdd),
-                DrawPipe::KnockOver => r.effects.get(EffectPipeline::KnockOver),
-                DrawPipe::Wallpaper
-                | DrawPipe::RainUnder
-                | DrawPipe::CatOver
-                | DrawPipe::FreeUnder
-                | DrawPipe::FreeOver => r.effects.get(EffectPipeline::SpriteOver),
-                DrawPipe::Fx => r.effects.get(EffectPipeline::Fx),
-                DrawPipe::FxLinear => r.effects.get(EffectPipeline::FxLinear),
+            Self::Wgpu(r) => crate::device_layer::FramePipeline::Wgpu({
+                split_only();
+                match pipe {
+                    DrawPipe::Bg => r.bg_pipeline,
+                    DrawPipe::Glyph => r.glyph_pipeline,
+                    DrawPipe::Color => r.color_glyph_pipeline,
+                    DrawPipe::CursorBlend => r.effects.get(EffectPipeline::CursorBlend),
+                    DrawPipe::GlowAdd => r.effects.get(EffectPipeline::GlowAdd),
+                    DrawPipe::RainGlow => r.effects.get(EffectPipeline::RainGlow),
+                    DrawPipe::RainGlowOver => r.effects.get(EffectPipeline::RainGlowOver),
+                    DrawPipe::FireAdd => r.effects.get(EffectPipeline::FireAdd),
+                    DrawPipe::FireOver => r.effects.get(EffectPipeline::FireOver),
+                    DrawPipe::DecoOver => r.effects.get(EffectPipeline::DecoOver),
+                    DrawPipe::DecoAdd => r.effects.get(EffectPipeline::DecoAdd),
+                    DrawPipe::KnockOver => r.effects.get(EffectPipeline::KnockOver),
+                    DrawPipe::Wallpaper
+                    | DrawPipe::RainUnder
+                    | DrawPipe::CatOver
+                    | DrawPipe::FreeUnder
+                    | DrawPipe::FreeOver => r.effects.get(EffectPipeline::SpriteOver),
+                    DrawPipe::Fx => r.effects.get(EffectPipeline::Fx),
+                    DrawPipe::FxLinear => r.effects.get(EffectPipeline::FxLinear),
+                    DrawPipe::FxStore => r.effects.get(EffectPipeline::FxStore),
+                }
             }),
             #[cfg(target_os = "macos")]
-            Self::Metal(rig) => rig.pipeline(pipe),
+            Self::Metal(rig) => rig.pipeline(pipe, fetch),
             #[cfg(gl_arm)]
-            Self::Gl(rig) => rig.pipeline(pipe),
+            Self::Gl(rig) => {
+                split_only();
+                rig.pipeline(pipe)
+            }
         }
     }
 
@@ -2748,6 +2926,8 @@ pub(crate) struct MetalFrameRig {
     pub(crate) offscreen: crate::metal::resources::SealedTexture,
     pub(crate) offscreen_srgb: crate::metal::resources::SealedTexture,
     pub(crate) psos: [Option<crate::metal::ffi::Obj>; pipeline_table::PIPELINE_COUNT],
+    /// The framebuffer-fetch twins the plan's fetch draws bind, by [`pipeline_table::FetchTwin`].
+    pub(crate) fetch_psos: [Option<crate::metal::ffi::Obj>; pipeline_table::FETCH_TWIN_COUNT],
     pub(crate) uniform: crate::metal::ffi::Obj,
     pub(crate) uniform_vertex_slot: u32,
     pub(crate) uniform_fragment_slot: Option<u32>,
@@ -2779,13 +2959,18 @@ impl MetalFrameRig {
     }
 
     #[inline]
-    fn pipeline(&self, pipe: DrawPipe) -> crate::device_layer::FramePipeline<'_> {
+    fn pipeline(&self, pipe: DrawPipe, fetch: bool) -> crate::device_layer::FramePipeline<'_> {
         let row = pipe.row();
-        crate::device_layer::FramePipeline::Metal(
-            self.psos[row as usize].as_ref().unwrap_or_else(|| {
-                panic!("metal frame rig: no PSO for row {row:?} (pipe {pipe:?})")
-            }),
-        )
+        let pso = if fetch {
+            let twin = pipeline_table::FetchTwin::of(row)
+                .unwrap_or_else(|| panic!("metal frame rig: row {row:?} has no fetch twin"));
+            self.fetch_psos[twin as usize].as_ref()
+        } else {
+            self.psos[row as usize].as_ref()
+        };
+        crate::device_layer::FramePipeline::Metal(pso.unwrap_or_else(|| {
+            panic!("metal frame rig: no PSO for row {row:?} (pipe {pipe:?}, fetch {fetch})")
+        }))
     }
 
     #[inline]
@@ -2904,10 +3089,15 @@ struct ArmSubmitBSlot {
 
 #[cfg(target_os = "macos")]
 struct MetalArmLive {
+    /// The first-frame warm this arm waits out and takes the framebuffer-fetch verdict from (&[`crate::metal::warm::FIRST_FRAME`] but in a test that runs a warm of its own).
+    warm: &'static crate::metal::warm::WarmLatch,
     mint: crate::metal::resources::MetalResourceDevice,
     session: crate::metal::encoder::EncodeSession,
     lib: crate::metal::ffi::Library,
     psos: [Option<crate::metal::ffi::Obj>; pipeline_table::PIPELINE_COUNT],
+    /// The device's framebuffer-fetch verdict ([`crate::metal::fetch::verdict`]), `None` until the first frame that draws Unorm-law light settles it ([`Self::fetch_verdict`]): [`FetchProbe::Passed`] routes those draws through [`Self::fetch_psos`].
+    fetch: Option<FetchProbe>,
+    fetch_psos: [Option<crate::metal::ffi::Obj>; pipeline_table::FETCH_TWIN_COUNT],
     nearest: crate::metal::ffi::Obj,
     linear: crate::metal::ffi::Obj,
     frame_slots: [ArmFrameSlot; ARM_FRAME_SLOTS],
@@ -2995,7 +3185,10 @@ impl FxHazard {
 
 #[cfg(target_os = "macos")]
 impl MetalArmLive {
-    fn new(latch: Arc<crate::metal::loss::LossLatch>) -> Result<Self, String> {
+    fn new(
+        latch: Arc<crate::metal::loss::LossLatch>,
+        warm: &'static crate::metal::warm::WarmLatch,
+    ) -> Result<Self, String> {
         #[cfg(test)]
         if let Some(injected) = INJECTED_MINT_FAILURE.with(std::cell::Cell::take) {
             return Err(injected.to_owned());
@@ -3006,6 +3199,7 @@ impl MetalArmLive {
         let session = crate::metal::encoder::EncodeSession::new(&dev, Arc::clone(&latch))?;
         let mint = crate::metal::resources::MetalResourceDevice::new(&dev, latch);
         let lib = crate::metal::pipelines::compile_library(&dev, ShaderLibrary::Cell)?;
+        let fetch = crate::metal::fetch::known(&dev, &lib);
         let layer = crate::device_layer::DeviceHandle::Metal(&mint);
         let nearest = layer
             .try_create_sampler(
@@ -3034,10 +3228,13 @@ impl MetalArmLive {
             inflight: None,
         });
         Ok(Self {
+            warm,
             mint,
             session,
             lib,
             psos: std::array::from_fn(|_| None),
+            fetch,
+            fetch_psos: std::array::from_fn(|_| None),
             nearest,
             linear,
             frame_slots,
@@ -3084,7 +3281,8 @@ impl MetalArmLive {
 
     fn library(&mut self, lib: ShaderLibrary) -> Result<&crate::metal::ffi::Library, String> {
         if !self.libs.iter().any(|(l, _)| *l == lib) {
-            crate::metal::warm::FIRST_FRAME.await_item(crate::metal::warm::WarmItem::Library(lib));
+            self.warm
+                .await_item(crate::metal::warm::WarmItem::Library(lib));
             let compiled = crate::metal::pipelines::compile_library(self.mint.device(), lib)?;
             self.libs.push((lib, compiled));
         }
@@ -3112,7 +3310,7 @@ impl MetalArmLive {
             .find(|(l, _)| *l == spec.library)
             .map(|(_, c)| c)
             .expect("compiled above");
-        crate::metal::warm::FIRST_FRAME
+        self.warm
             .await_item(crate::metal::warm::WarmItem::pipeline(row, present));
         let pso = crate::metal::pipelines::build(self.mint.device(), lib, spec, present)?;
         self.present_psos
@@ -3296,7 +3494,7 @@ impl MetalArmLive {
         }
         let slot = &mut self.psos[row as usize];
         if slot.is_none() {
-            crate::metal::warm::FIRST_FRAME.await_item(crate::metal::warm::WarmItem::pipeline(
+            self.warm.await_item(crate::metal::warm::WarmItem::pipeline(
                 row,
                 crate::metal::ffi::PixelFormat::Bgra8Unorm,
             ));
@@ -3304,6 +3502,37 @@ impl MetalArmLive {
                 self.mint.device(),
                 &self.lib,
                 spec,
+                crate::metal::ffi::PixelFormat::Bgra8Unorm,
+            )?);
+        }
+        Ok(slot.as_ref().expect("filled above"))
+    }
+
+    /// The device's framebuffer-fetch verdict, settled for a frame that draws Unorm-law light: the warm's once it landed, `None` (the split, for this frame) while the first-frame warm still owes it, so no window waits on the probe, else this arm's own [`crate::metal::fetch::verdict`] (headless, a test, or a warm whose probe could not run).
+    fn fetch_verdict(&mut self) -> Option<FetchProbe> {
+        if self.fetch.is_none() && !self.warm.probe_pending() {
+            self.fetch = Some(crate::metal::fetch::verdict(
+                &self.mint,
+                &self.session,
+                &self.lib,
+            ));
+        }
+        self.fetch
+    }
+
+    /// The framebuffer-fetch twin's PSO, built on first use.
+    fn fetch_pso(
+        &mut self,
+        twin: pipeline_table::FetchTwin,
+    ) -> Result<&crate::metal::ffi::Obj, String> {
+        let slot = &mut self.fetch_psos[twin as usize];
+        if slot.is_none() {
+            self.warm
+                .await_item(crate::metal::warm::WarmItem::Twin(twin));
+            *slot = Some(crate::metal::pipelines::build(
+                self.mint.device(),
+                &self.lib,
+                &twin.spec(),
                 crate::metal::ffi::PixelFormat::Bgra8Unorm,
             )?);
         }
@@ -3734,6 +3963,18 @@ impl MetalArmCell {
 unsafe impl Send for MetalArmCell {}
 
 /// The shared frame walk both backends execute.
+/// `plan`'s passes ([`coalesce_frame_passes`]): the base group always, each group a draw names, each on the view its draws take (a fetch draw takes the sRGB view in a Unorm-law group).
+fn plan_passes(plan: &[DrawItem]) -> ([usize; FRAME_GROUPS], [bool; FRAME_GROUPS], usize) {
+    let mut enabled = [false; FRAME_GROUPS];
+    let mut srgb = GROUP_SRGB;
+    enabled[G_BASE_BG] = true;
+    for item in plan {
+        enabled[item.group as usize] = true;
+        srgb[item.group as usize] = item.srgb();
+    }
+    coalesce_frame_passes(&enabled, &srgb)
+}
+
 pub(crate) fn run_frame_plan(
     enc: &mut crate::device_layer::FrameEncoder<'_>,
     res: &FrameRes<'_>,
@@ -3741,12 +3982,7 @@ pub(crate) fn run_frame_plan(
     load0: crate::device_layer::FrameLoad,
     scissor: Option<(u32, u32, u32, u32)>,
 ) -> Result<usize, String> {
-    let mut enabled = [false; FRAME_GROUPS];
-    enabled[G_BASE_BG] = true;
-    for item in plan {
-        enabled[item.group as usize] = true;
-    }
-    let (pass_of, pass_srgb, passes) = coalesce_frame_passes(&enabled, &GROUP_SRGB);
+    let (pass_of, pass_srgb, passes) = plan_passes(plan);
     for (p, &srgb) in pass_srgb.iter().enumerate().take(passes) {
         let load = if p == 0 {
             load0
@@ -3760,12 +3996,12 @@ pub(crate) fn run_frame_plan(
             scissor,
             res.uniforms(),
         )?;
-        let mut cur_pipe: Option<DrawPipe> = None;
+        let mut cur_pipe: Option<(DrawPipe, bool)> = None;
         let mut cur_atlas: Option<DrawAtlas> = None;
         for item in plan.iter().filter(|it| pass_of[it.group as usize] == p) {
-            if cur_pipe != Some(item.pipe) {
-                pass.set_pipeline(res.pipeline(item.pipe));
-                cur_pipe = Some(item.pipe);
+            if cur_pipe != Some((item.pipe, item.fetch)) {
+                pass.set_pipeline(res.pipeline(item.pipe, item.fetch));
+                cur_pipe = Some((item.pipe, item.fetch));
             }
             if let Some(atlas) = item.atlas
                 && cur_atlas != Some(atlas)
@@ -5332,6 +5568,14 @@ pub struct GpuRenderer {
     last_frame_passes: u32,
     frame_shape: FrameShape,
     ablation: UnormAblation,
+    /// The route the Metal arm's frame plans take where the device passed the fetch probe ([`UnormRoute::Fetch`] unless the `ATERM_GPU_UNORM_ROUTE` seam or [`Self::set_unorm_route`] chose the split).
+    unorm_route: UnormRoute,
+    /// A verdict standing in for the Metal arm's ([`Self::set_fetch_probe_seam`]).
+    #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+    fetch_probe_seam: Option<FetchProbe>,
+    /// The first-frame warm the Metal arm's mint waits out (&[`crate::metal::warm::FIRST_FRAME`] but in a test that runs a warm of its own, [`Self::set_first_frame_latch_for_test`]).
+    #[cfg(target_os = "macos")]
+    first_frame: &'static crate::metal::warm::WarmLatch,
     last_gpu_time_serial: Option<u64>,
     #[cfg(wgpu_arm)]
     wgpu_timer: Option<crate::wgpu_timer::WgpuGpuTimer>,
@@ -5776,9 +6020,10 @@ fn fx_wgpu_sync(
     effects: &mut EffectPipelines,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    drawing: bool,
     inst: &Instances,
+    under_opaque: bool,
 ) -> bool {
+    let drawing = inst.fx_instances() > 0;
     let handle = crate::device_layer::DeviceHandle::Wgpu { device, queue };
     let mut atlas_bytes = 0;
     for kind in [fx_gpu::FxAtlasKind::R8, fx_gpu::FxAtlasKind::Rgba] {
@@ -5804,13 +6049,10 @@ fn fx_wgpu_sync(
         return false;
     }
     let resident = effects.resident();
-    let fx_of = |s: fx_gpu::FxStream| !inst.fx[s as usize].is_empty();
-    let exact = fx_of(fx_gpu::FxStream::Under)
-        || fx_of(fx_gpu::FxStream::Glow)
-        || fx_of(fx_gpu::FxStream::Over);
-    let linear = fx_of(fx_gpu::FxStream::LinearUnder) || fx_of(fx_gpu::FxStream::LinearOver);
+    let (exact, linear, store) = fx_effect_demand(inst, under_opaque);
     if (exact && !resident[EffectPipeline::Fx as usize])
         || (linear && !resident[EffectPipeline::FxLinear as usize])
+        || (store && !resident[EffectPipeline::FxStore as usize])
     {
         return false;
     }
@@ -6282,10 +6524,11 @@ pub enum EffectPipeline {
     Fx = 9,
     FxLinear = 10,
     KnockOver = 11,
+    FxStore = 12,
 }
 
 /// How many effect pipelines exist.
-pub const EFFECT_PIPELINE_COUNT: usize = 12;
+pub const EFFECT_PIPELINE_COUNT: usize = 13;
 
 /// Names of the [`EFFECT_PIPELINE_COUNT`] slots, in [`EffectPipeline`] order.
 pub const EFFECT_PIPELINE_NAMES: [&str; EFFECT_PIPELINE_COUNT] = [
@@ -6301,6 +6544,7 @@ pub const EFFECT_PIPELINE_NAMES: [&str; EFFECT_PIPELINE_COUNT] = [
     "fx",
     "fx_linear",
     "knock_over",
+    "fx_store",
 ];
 
 /// Every [`EffectPipeline`], in slot order.
@@ -6317,6 +6561,7 @@ pub const EFFECT_PIPELINES: [EffectPipeline; EFFECT_PIPELINE_COUNT] = [
     EffectPipeline::Fx,
     EffectPipeline::FxLinear,
     EffectPipeline::KnockOver,
+    EffectPipeline::FxStore,
 ];
 
 /// Demand-driven cache of the effect-only cell pipelines.
@@ -6360,7 +6605,7 @@ impl EffectPipelines {
             return;
         }
         let fx_layout = match which {
-            EffectPipeline::Fx | EffectPipeline::FxLinear => {
+            EffectPipeline::Fx | EffectPipeline::FxLinear | EffectPipeline::FxStore => {
                 if self.fx_layouts(device).is_err() {
                     return;
                 }
@@ -6467,12 +6712,29 @@ fn frame_effect_pipelines(
         || !inst.cat_over.is_empty()
         || !inst.free_under.is_empty()
         || !inst.free_over.is_empty();
-    let fx = |s: fx_gpu::FxStream| !inst.fx[s as usize].is_empty();
-    want[EffectPipeline::Fx as usize] =
-        fx(fx_gpu::FxStream::Under) || fx(fx_gpu::FxStream::Glow) || fx(fx_gpu::FxStream::Over);
-    want[EffectPipeline::FxLinear as usize] =
-        fx(fx_gpu::FxStream::LinearUnder) || fx(fx_gpu::FxStream::LinearOver);
+    let (fx, linear, store) = fx_effect_demand(inst, fx_gpu::under_draws_opaque(input));
+    want[EffectPipeline::Fx as usize] = fx;
+    want[EffectPipeline::FxLinear as usize] = linear;
+    want[EffectPipeline::FxStore as usize] = store;
     want
+}
+
+/// Which fx pipelines a frame's fx streams need, as `(fx, fx_linear, fx_store)`.
+///
+/// An opaque Exact Under stream is stored in the base pass (route (1),
+/// [`build_frame_plan`]) whenever the frame's GlowUnder stream turns out
+/// empty, so `fx_store` is demanded for it; `fx` covers it only when the
+/// frame may keep it at its own group (a GlowUnder stream to draw).
+#[cfg(wgpu_arm)]
+fn fx_effect_demand(inst: &Instances, under_opaque: bool) -> (bool, bool, bool) {
+    let fx = |s: fx_gpu::FxStream| !inst.fx[s as usize].is_empty();
+    let under = fx(fx_gpu::FxStream::Under);
+    let stored = under_opaque && inst.glow_under.is_empty();
+    (
+        (under && !stored) || fx(fx_gpu::FxStream::Glow) || fx(fx_gpu::FxStream::Over),
+        fx(fx_gpu::FxStream::LinearUnder) || fx(fx_gpu::FxStream::LinearOver),
+        under && under_opaque,
+    )
 }
 
 #[cfg(wgpu_arm)]
@@ -6498,6 +6760,7 @@ fn build_effect_pipeline(
         EffectPipeline::Fx => (Pipeline::Fx, fx()),
         EffectPipeline::FxLinear => (Pipeline::FxLinear, fx()),
         EffectPipeline::KnockOver => (Pipeline::KnockOver, &layouts.glyph),
+        EffectPipeline::FxStore => (Pipeline::FxStore, fx()),
     };
     crate::pipeline_table::build_wgpu(row.spec(), device, shader, layout, targets)
 }
@@ -6932,6 +7195,13 @@ impl GpuRenderer {
             ablation: aterm_types::dev_seam!("ATERM_GPU_ABLATE_UNORM")
                 .and_then(|v| v.to_str().map(UnormAblation::from_seam))
                 .unwrap_or_default(),
+            unorm_route: UnormRoute::initial(
+                aterm_types::dev_seam!("ATERM_GPU_UNORM_ROUTE").as_deref(),
+            ),
+            #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+            fetch_probe_seam: None,
+            #[cfg(target_os = "macos")]
+            first_frame: &crate::metal::warm::FIRST_FRAME,
             last_gpu_time_serial: None,
             #[cfg(wgpu_arm)]
             wgpu_timer: None,
@@ -7575,6 +7845,86 @@ impl GpuRenderer {
         self.ablation = ablation;
     }
 
+    /// The route frame plans take where the device allows it ([`UnormRoute::Fetch`] by default); [`FrameShape::route`] is the route the latest frame took.
+    #[must_use]
+    #[inline]
+    pub const fn unorm_route(&self) -> UnormRoute {
+        self.unorm_route
+    }
+
+    /// Choose the route frame plans take where the device allows it (the `ATERM_GPU_UNORM_ROUTE` seam's programmatic twin): [`UnormRoute::Split`] keeps a fetch-capable device on the split, for the effects perf lane's A/B and the fetch differentials.
+    #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+    #[inline]
+    pub const fn set_unorm_route(&mut self, route: UnormRoute) {
+        self.unorm_route = route;
+    }
+
+    /// The renderer's framebuffer-fetch verdict: the Metal arm's device's probe ([`FetchProbe`]), [`FetchProbe::Unsupported`] on any other arm, and `None` until the Metal arm has minted and a frame that draws Unorm-law light settled it.
+    #[must_use]
+    pub fn fetch_probe(&self) -> Option<FetchProbe> {
+        #[cfg(target_os = "macos")]
+        if self.metal_armed {
+            #[cfg(any(test, debug_assertions))]
+            if self.fetch_probe_seam.is_some() {
+                return self.fetch_probe_seam;
+            }
+            return self.metal_arm.as_ref().and_then(|c| c.live_ref().fetch);
+        }
+        Some(FetchProbe::Unsupported)
+    }
+
+    /// Stand `verdict` in for the Metal arm's framebuffer-fetch verdict (`None`: the device's own), so a test drives a device that failed, refused or lacks the probe on hardware that passes it.
+    #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+    #[inline]
+    pub const fn set_fetch_probe_seam(&mut self, verdict: Option<FetchProbe>) {
+        self.fetch_probe_seam = verdict;
+    }
+
+    /// The verdict [`Self::set_fetch_probe_seam`] stands in, `None` in a release build.
+    #[cfg(target_os = "macos")]
+    #[inline]
+    const fn fetch_seam(&self) -> Option<FetchProbe> {
+        #[cfg(any(test, debug_assertions))]
+        return self.fetch_probe_seam;
+        #[cfg(not(any(test, debug_assertions)))]
+        None
+    }
+
+    /// Mint the Metal arm against `latch` rather than the process's first-frame warm, so a test that runs a warm of its own never holds another test's frames on it.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) const fn set_first_frame_latch_for_test(
+        &mut self,
+        latch: &'static crate::metal::warm::WarmLatch,
+    ) {
+        self.first_frame = latch;
+    }
+
+    /// The route the Metal arm (`arm`) gives a frame, `unorm` saying whether the frame draws Unorm-law light: [`UnormRoute::Fetch`] only where `want` (the renderer's [`Self::unorm_route`]) asks for it and the device's verdict (or the test `seam`'s) is [`FetchProbe::Passed`]. Only a frame with that light settles a verdict ([`MetalArmLive::fetch_verdict`]), so a session that draws none never probes.
+    #[cfg(target_os = "macos")]
+    fn metal_unorm_route(
+        arm: Option<&mut MetalArmCell>,
+        want: UnormRoute,
+        seam: Option<FetchProbe>,
+        unorm: bool,
+    ) -> UnormRoute {
+        if want != UnormRoute::Fetch {
+            return UnormRoute::Split;
+        }
+        let verdict = seam.or_else(|| {
+            let live = arm?.live_mut();
+            if unorm {
+                live.fetch_verdict()
+            } else {
+                live.fetch
+            }
+        });
+        if verdict == Some(FetchProbe::Passed) {
+            UnormRoute::Fetch
+        } else {
+            UnormRoute::Split
+        }
+    }
+
     /// The `crate::gpu_time` serial of the latest present this renderer timed.
     #[must_use]
     #[inline]
@@ -7761,9 +8111,9 @@ impl GpuRenderer {
         if self.metal_arm.is_some() {
             return true;
         }
-        crate::metal::warm::FIRST_FRAME
+        self.first_frame
             .await_item(crate::metal::warm::WarmItem::Library(ShaderLibrary::Cell));
-        match MetalArmLive::new(self.ctx.metal_loss_latch_or_wire()) {
+        match MetalArmLive::new(self.ctx.metal_loss_latch_or_wire(), self.first_frame) {
             Ok(live) => {
                 self.metal_arm = Some(MetalArmCell::new(live));
                 true
@@ -11034,6 +11384,11 @@ impl GpuRenderer {
             let item = WarmItem::pipeline(*row, *present);
             if !built.contains(&item) {
                 built.push(item);
+            }
+        }
+        for twin in pipeline_table::FetchTwin::ALL {
+            if live.fetch_psos[twin as usize].is_some() {
+                built.push(WarmItem::Twin(twin));
             }
         }
         built
@@ -15230,6 +15585,9 @@ impl GpuRenderer {
             ablation: unorm.ablation,
             unorm_draws: unorm.draws,
             unorm_instances: unorm.instances,
+            route: unorm.route,
+            under_store: unorm.under_store,
+            fetch_probe: self.fetch_probe(),
             ..FrameShape::default()
         };
         for id in StreamId::ALL {
@@ -17066,6 +17424,7 @@ impl GpuRenderer {
                     text_blend,
                     cursor_opaque,
                     ablation: self.ablation,
+                    under_opaque: fx_gpu::under_draws_opaque(input),
                     fx: &self.fx,
                 },
             );
@@ -17168,7 +17527,7 @@ impl GpuRenderer {
                     );
                 }
                 let mut plan = std::mem::take(&mut self.frame_plan);
-                let unorm = build_frame_plan(
+                let mut unorm = build_frame_plan(
                     &mut plan,
                     &counts,
                     FramePlanCtx {
@@ -17180,8 +17539,17 @@ impl GpuRenderer {
                         has_wallpaper: win.wallpaper_tex.is_some(),
                         cursor_opaque,
                         ablation: self.ablation,
+                        under_opaque: fx_gpu::under_draws_opaque(input),
                     },
                 );
+                let seam = self.fetch_seam();
+                let route = Self::metal_unorm_route(
+                    self.metal_arm.as_mut(),
+                    self.unorm_route,
+                    seam,
+                    unorm.draws > 0,
+                );
+                route_frame_plan(&mut plan, &mut unorm, route);
                 macro_rules! armed_try {
                     ($what:literal, $e:expr) => {
                         match $e {
@@ -17257,6 +17625,8 @@ impl GpuRenderer {
                     let mut uniform_fragment_slot: Option<u32> = None;
                     let mut psos: [Option<crate::metal::ffi::Obj>; pipeline_table::PIPELINE_COUNT] =
                         std::array::from_fn(|_| None);
+                    let mut fetch_psos: [Option<crate::metal::ffi::Obj>;
+                        pipeline_table::FETCH_TWIN_COUNT] = std::array::from_fn(|_| None);
                     let mut rig_err: Option<String> = None;
                     for item in &plan {
                         let row = item.pipe.row();
@@ -17285,14 +17655,26 @@ impl GpuRenderer {
                                 }
                             }
                         }
-                        if psos[row as usize].is_none() {
-                            match live.pso(row) {
-                                Ok(pso) => psos[row as usize] = Some(pso.clone_retained()),
-                                Err(e) => {
-                                    rig_err = Some(e);
-                                    break;
-                                }
+                        let built = if item.fetch {
+                            let twin = pipeline_table::FetchTwin::of(row).unwrap_or_else(|| {
+                                panic!("a fetch draw's row {row:?} has no fetch twin")
+                            });
+                            let slot = &mut fetch_psos[twin as usize];
+                            if slot.is_some() {
+                                continue;
                             }
+                            live.fetch_pso(twin)
+                                .map(|pso| *slot = Some(pso.clone_retained()))
+                        } else {
+                            let slot = &mut psos[row as usize];
+                            if slot.is_some() {
+                                continue;
+                            }
+                            live.pso(row).map(|pso| *slot = Some(pso.clone_retained()))
+                        };
+                        if let Err(e) = built {
+                            rig_err = Some(e);
+                            break;
                         }
                     }
 
@@ -17469,6 +17851,7 @@ impl GpuRenderer {
                         offscreen: off.tex.clone_handle(),
                         offscreen_srgb: off.srgb.clone_handle(),
                         psos,
+                        fetch_psos,
                         uniform: live.current_slot().uniform.metal().clone_retained(),
                         uniform_vertex_slot: uniform_vertex_slot.unwrap_or(0),
                         uniform_fragment_slot,
@@ -17565,8 +17948,8 @@ impl GpuRenderer {
                 &mut self.effects,
                 device,
                 queue,
-                self.inst.fx_instances() > 0,
                 &self.inst,
+                fx_gpu::under_draws_opaque(input),
             );
             let mut streams: [Option<wgpu::BufferSlice<'_>>; STREAM_COUNT] = [None; STREAM_COUNT];
             let mut counts: [Option<u32>; STREAM_COUNT] = [None; STREAM_COUNT];
@@ -17668,6 +18051,7 @@ impl GpuRenderer {
                     has_wallpaper: wallpaper_bind.is_some(),
                     cursor_opaque,
                     ablation: self.ablation,
+                    under_opaque: fx_gpu::under_draws_opaque(input),
                 },
             );
             let load0 = load_op;
@@ -18076,6 +18460,10 @@ impl GpuRenderer {
         let mut uniform_vertex_slot: Option<u32> = None;
         let mut uniform_fragment_slot: Option<u32> = None;
         for item in &plan {
+            assert!(
+                !item.fetch,
+                "the differential replays a wgpu plan, which keeps the split"
+            );
             let row = item.pipe.row();
             let spec = row.spec();
             assert!(
@@ -18260,6 +18648,7 @@ impl GpuRenderer {
             offscreen,
             offscreen_srgb,
             psos,
+            fetch_psos: std::array::from_fn(|_| None),
             uniform: ubuf,
             uniform_vertex_slot: uniform_vertex_slot.unwrap_or(0),
             uniform_fragment_slot,
@@ -19253,15 +19642,9 @@ mod tests {
             has_wallpaper: true,
             cursor_opaque: true,
             ablation,
+            under_opaque: false,
         };
-        let passes_of = |plan: &[DrawItem]| {
-            let mut enabled = [false; FRAME_GROUPS];
-            enabled[G_BASE_BG] = true;
-            for item in plan {
-                enabled[item.group as usize] = true;
-            }
-            super::coalesce_frame_passes(&enabled, &GROUP_SRGB).2
-        };
+        let passes_of = |plan: &[DrawItem]| super::plan_passes(plan).2;
         let plan = |ablation| {
             let mut plan = Vec::new();
             let record = build_frame_plan(&mut plan, &counts, ctx(ablation));
@@ -19275,6 +19658,8 @@ mod tests {
                     ablation,
                     draws: unorm.len() as u32,
                     instances: unorm.iter().map(|i| u64::from(i.count)).sum(),
+                    route: UnormRoute::Split,
+                    under_store: false,
                 }
             );
             plan
@@ -19319,6 +19704,166 @@ mod tests {
         for (thin, item) in thinned.iter().zip(&full) {
             let want = if unorm(item) { 1 } else { item.count };
             assert_eq!(thin.count, want, "{:?}", item.stream);
+        }
+    }
+
+    /// The fetch route moves every Unorm-law draw, and only those, onto its row's twin in the sRGB view, in the same order with the same counts, so a full plan is one pass; the record still counts the Unorm-law draws (the ablation's subject), under the route they took.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_fetch_route_draws_every_unorm_law_row_through_its_twin_in_one_pass() {
+        let counts = [Some(7u32); STREAM_COUNT];
+        let ctx = FramePlanCtx {
+            has_image_plane: true,
+            has_deco: true,
+            has_rain: true,
+            has_cat: true,
+            has_free: true,
+            has_wallpaper: true,
+            cursor_opaque: false,
+            ablation: UnormAblation::Off,
+            under_opaque: false,
+        };
+        let (mut split, mut fetch) = (Vec::new(), Vec::new());
+        let mut split_record = build_frame_plan(&mut split, &counts, ctx);
+        route_frame_plan(&mut split, &mut split_record, UnormRoute::Split);
+        let mut fetch_record = build_frame_plan(&mut fetch, &counts, ctx);
+        route_frame_plan(&mut fetch, &mut fetch_record, UnormRoute::Fetch);
+        assert_eq!(
+            fetch_record,
+            PlanUnorm {
+                route: UnormRoute::Fetch,
+                ..split_record
+            }
+        );
+        assert!(
+            split_record.draws > 0,
+            "the full plan holds Unorm-law draws"
+        );
+        let key = |i: &DrawItem| (i.group, i.pipe, i.atlas, i.stream, i.count);
+        assert_eq!(
+            fetch.iter().map(key).collect::<Vec<_>>(),
+            split.iter().map(key).collect::<Vec<_>>(),
+            "the route changes no draw but its view and pipeline"
+        );
+        let mut twins = std::collections::BTreeSet::new();
+        for item in &fetch {
+            let unorm = !GROUP_SRGB[item.group as usize];
+            assert_eq!(item.fetch, unorm, "{:?}", item.stream);
+            assert!(item.srgb(), "{:?} draws in the sRGB view", item.stream);
+            if unorm {
+                let row = item.pipe.row();
+                let twin = pipeline_table::FetchTwin::of(row)
+                    .unwrap_or_else(|| panic!("{row:?} draws by the Unorm law but has no twin"));
+                assert_eq!(twin.row(), row);
+                let (spec, base) = (twin.spec(), row.spec());
+                assert_eq!(spec.target, pipeline_table::TargetRole::OffscreenSrgb);
+                assert!(spec.blend.is_none(), "{twin:?} blends in its fragment");
+                assert_eq!(
+                    (spec.vs, spec.write_mask, spec.library),
+                    (base.vs, base.write_mask, base.library),
+                    "{twin:?} keeps its row's vertex stage, mask and library"
+                );
+                twins.insert(twin);
+            }
+        }
+        assert_eq!(
+            twins.into_iter().collect::<Vec<_>>(),
+            pipeline_table::FetchTwin::ALL.to_vec(),
+            "every twin stands in for a draw of the full plan"
+        );
+        assert!(!split.iter().any(|i| i.fetch), "the split routes nothing");
+        assert!(super::plan_passes(&split).2 > 1);
+        assert_eq!(
+            super::plan_passes(&fetch).2,
+            1,
+            "the fetch route is one pass"
+        );
+    }
+
+    /// Route (1) of the pass economy: an opaque Exact Under fx is stored at the end of the base pass through the sRGB view, in the CPU's draw order, only while no cursor glow under the text sits between; its Unorm group then empties and its passes merge away.
+    #[test]
+    fn an_opaque_under_fx_stores_in_the_base_pass_only_without_a_glow_under() {
+        let ctx = |under_opaque| FramePlanCtx {
+            has_image_plane: false,
+            has_deco: false,
+            has_rain: false,
+            has_cat: false,
+            has_free: false,
+            has_wallpaper: false,
+            cursor_opaque: true,
+            ablation: UnormAblation::Off,
+            under_opaque,
+        };
+        let mut counts = [None; STREAM_COUNT];
+        for id in [
+            StreamId::Bg,
+            StreamId::Trail,
+            StreamId::FxUnder,
+            StreamId::FireAdd,
+            StreamId::Glyph,
+        ] {
+            counts[id as usize] = Some(3);
+        }
+        let order = |plan: &[DrawItem]| plan.iter().map(|i| i.stream).collect::<Vec<_>>();
+        let under = |plan: &[DrawItem]| {
+            let item = plan
+                .iter()
+                .find(|i| i.stream == StreamId::FxUnder)
+                .expect("the Under fx draws");
+            (usize::from(item.group), item.pipe)
+        };
+        let (mut kept, mut stored) = (Vec::new(), Vec::new());
+        let kept_rec = build_frame_plan(&mut kept, &counts, ctx(false));
+        let stored_rec = build_frame_plan(&mut stored, &counts, ctx(true));
+        assert!(!kept_rec.under_store && stored_rec.under_store);
+        assert_eq!(under(&kept), (G_GLOW_UNDER, DrawPipe::Fx));
+        assert_eq!(under(&stored), (G_BASE_BG, DrawPipe::FxStore));
+        assert_eq!(
+            order(&stored),
+            order(&kept),
+            "the store draws where the CPU draws the layer"
+        );
+        assert_eq!(stored_rec.draws + 1, kept_rec.draws);
+        assert_eq!(
+            (super::plan_passes(&kept).2, super::plan_passes(&stored).2),
+            (3, 3),
+            "the fire still opens its own group"
+        );
+        counts[StreamId::FireAdd as usize] = None;
+        build_frame_plan(&mut kept, &counts, ctx(false));
+        build_frame_plan(&mut stored, &counts, ctx(true));
+        assert_eq!(
+            (super::plan_passes(&kept).2, super::plan_passes(&stored).2),
+            (3, 1),
+            "with the Under group empty its passes merge away"
+        );
+
+        counts[StreamId::GlowUnder as usize] = Some(1);
+        let mut glow = Vec::new();
+        let glow_rec = build_frame_plan(&mut glow, &counts, ctx(true));
+        assert!(!glow_rec.under_store);
+        assert_eq!(
+            under(&glow),
+            (G_GLOW_UNDER, DrawPipe::Fx),
+            "a cursor glow under the text keeps the Under fx after it"
+        );
+
+        counts[StreamId::GlowUnder as usize] = None;
+        counts[StreamId::FxUnder as usize] = None;
+        let mut none = Vec::new();
+        assert!(
+            !build_frame_plan(&mut none, &counts, ctx(true)).under_store,
+            "a frame without Under fx stores nothing"
+        );
+    }
+
+    #[test]
+    fn the_unorm_route_seam_reads_its_modes() {
+        assert_eq!(UnormRoute::from_seam("split"), UnormRoute::Split);
+        assert_eq!(UnormRoute::from_seam("fetch"), UnormRoute::Fetch);
+        assert_eq!(UnormRoute::from_seam(""), UnormRoute::Fetch);
+        for route in [UnormRoute::Split, UnormRoute::Fetch] {
+            assert_eq!(UnormRoute::from_seam(route.name()), route);
         }
     }
 
@@ -20571,15 +21116,16 @@ mod tests {
     fn a_failed_first_frame_warm_leaves_the_inline_mint_and_its_failure_route() {
         let dev = crate::metal::ffi::Device::preferred()
             .unwrap_or_else(|| aterm_spec::host::could_not_run("no Metal device"));
+        static LATCH: crate::metal::warm::WarmLatch =
+            crate::metal::warm::WarmLatch::new(crate::metal::warm::DEADLINE);
         let renderer = || {
             let mut g = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
             g.arm_metal_for_test();
+            g.set_first_frame_latch_for_test(&LATCH);
             g
         };
         let mut gpu = renderer();
-        let mut warm = crate::metal::warm::FIRST_FRAME
-            .begin()
-            .expect("no other test claims the process's first-frame warm");
+        let mut warm = LATCH.begin().expect("the latch's first warm");
         let failed = warm.run_on(
             &dev,
             crate::metal::warm::FirstFrameKnobs::default(),
@@ -20604,22 +21150,144 @@ mod tests {
         );
     }
 
+    /// A small text frame lit by one cursor-aurora quad: Unorm-law light for the route to place.
+    #[cfg(target_os = "macos")]
+    fn glow_over_text(gpu: &GpuRenderer) -> RenderInput {
+        let (rows, cols) = (6usize, 24usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"glow over text");
+        let mut input = term.cell_frame(rows, cols);
+        let (cw, ch) = gpu.cpu.cell_size();
+        input.cursor_glow_add.push(GlowQuad {
+            row: 0,
+            x: 0,
+            y: 0,
+            w: (4 * cw) as u16,
+            h: ch as u16,
+            color: 0x0040_6080,
+            alpha: 0,
+            color2: 0x0040_6080,
+            alpha2: 0,
+        });
+        input
+    }
+
+    /// One frame of [`glow_over_text`] on a fresh armed renderer that `setup` configured: the shape it took and how many framebuffer-fetch twins it built.
+    #[cfg(target_os = "macos")]
+    fn glow_frame_on(setup: impl FnOnce(&mut GpuRenderer)) -> (FrameShape, usize) {
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+        gpu.arm_metal_for_test();
+        gpu.set_bloom(false);
+        gpu.set_shimmer(false);
+        setup(&mut gpu);
+        let input = glow_over_text(&gpu);
+        let mut win = WindowGpu::new();
+        let _ = gpu.render_input(&mut win, &input, None);
+        assert!(gpu.metal_render_armed(), "the frame minted the Metal arm");
+        let twins = gpu
+            .metal_built_for_test()
+            .into_iter()
+            .filter(|item| matches!(item, crate::metal::warm::WarmItem::Twin(_)))
+            .count();
+        (gpu.frame_shape(), twins)
+    }
+
+    /// FAIL CLOSED: a device whose framebuffer-fetch verdict is anything but Passed (it failed, its probe could not run, or it has no fetch) draws its Unorm-law light on the split, whatever route the renderer asks for: the frame pays its passes and builds no twin.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_device_that_did_not_pass_the_probe_draws_its_unorm_light_on_the_split() {
+        let dev = crate::metal::ffi::Device::preferred()
+            .unwrap_or_else(|| aterm_spec::host::could_not_run("no Metal device"));
+        let failed = FetchProbe::Failed {
+            stage: crate::FetchStage::InPass,
+            channel: 2,
+            want: 9,
+            got: 10,
+        };
+        for verdict in [failed, FetchProbe::Refused, FetchProbe::Unsupported] {
+            let (shape, twins) = glow_frame_on(|gpu| {
+                gpu.set_unorm_route(UnormRoute::Fetch);
+                gpu.set_fetch_probe_seam(Some(verdict));
+            });
+            assert_eq!(shape.route, UnormRoute::Split, "{verdict:?}");
+            assert!(
+                shape.unorm_draws > 0 && shape.passes > 1,
+                "{verdict:?}: the light draws on the Unorm view, {} passes",
+                shape.passes
+            );
+            assert_eq!(twins, 0, "{verdict:?}: no twin is built");
+        }
+        if !crate::metal::fetch::capable(&dev) {
+            aterm_spec::host::could_not_run("the device has no framebuffer fetch");
+        }
+        let (shape, twins) = glow_frame_on(|gpu| {
+            gpu.set_unorm_route(UnormRoute::Fetch);
+            gpu.set_fetch_probe_seam(Some(FetchProbe::Passed));
+        });
+        assert_eq!(
+            (shape.route, shape.passes),
+            (UnormRoute::Fetch, 1),
+            "the same frame under a passed verdict takes the fetch: the verdict kept the split"
+        );
+        assert!(twins > 0);
+    }
+
+    /// THE SHIPPED ROUTE: a renderer nothing configured routes Unorm-law light through framebuffer fetch, every Apple GPU has it, and this device passes its probe, so its default glow frame is one pass.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_default_route_is_the_fetch_and_this_device_takes_it() {
+        use std::ffi::OsStr;
+        assert_eq!(UnormRoute::initial(None), UnormRoute::Fetch);
+        assert_eq!(
+            UnormRoute::initial(Some(OsStr::new("split"))),
+            UnormRoute::Split
+        );
+        assert_eq!(
+            UnormRoute::initial(Some(OsStr::new("fetch"))),
+            UnormRoute::Fetch
+        );
+        let dev = crate::metal::ffi::Device::preferred()
+            .unwrap_or_else(|| aterm_spec::host::could_not_run("no Metal device"));
+        if cfg!(target_arch = "aarch64") {
+            assert!(
+                crate::metal::fetch::capable(&dev),
+                "{}: an Apple GPU has framebuffer fetch",
+                dev.name()
+            );
+        } else if !crate::metal::fetch::capable(&dev) {
+            aterm_spec::host::could_not_run("the device has no framebuffer fetch");
+        }
+        if aterm_types::dev_seam!("ATERM_GPU_UNORM_ROUTE").is_some() {
+            aterm_spec::host::could_not_run("ATERM_GPU_UNORM_ROUTE chooses the route here");
+        }
+        let (shape, twins) = glow_frame_on(|_| {});
+        assert_eq!(
+            (shape.route, shape.passes),
+            (UnormRoute::Fetch, 1),
+            "{}: the default glow frame",
+            dev.name()
+        );
+        assert!(twins > 0, "it drew through a twin");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn the_first_frame_warm_builds_what_a_default_windows_first_frames_build() {
         use crate::device_layer::TexelFormat;
-        use crate::metal::warm::{FirstFrameKnobs, WarmItem, first_frame_rows};
+        use crate::metal::warm::{FirstFrameKnobs, WarmItem, first_frame_rows, first_frame_twins};
         if crate::metal::ffi::Device::preferred().is_none() {
             aterm_spec::host::could_not_run("no Metal device");
         }
         let (rows, cols) = (24usize, 80usize);
         let mut built: Vec<WarmItem> = Vec::new();
+        let mut fetch = false;
         for (format, edr) in [
             (TexelFormat::Bgra8Unorm, 1.0),
             (TexelFormat::Rgba16Float, 2.0),
         ] {
             let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
             gpu.arm_metal_for_test();
+            gpu.set_unorm_route(UnormRoute::Fetch);
             gpu.set_bloom(true);
             gpu.set_bloom_params(0.85, 2.2);
             gpu.set_shimmer(true);
@@ -20685,6 +21353,7 @@ mod tests {
                     built.push(item);
                 }
             }
+            fetch = gpu.fetch_probe() == Some(FetchProbe::Passed);
         }
         let knobs = FirstFrameKnobs {
             aurora: true,
@@ -20694,7 +21363,7 @@ mod tests {
             fx: true,
         };
         let mut warmed: Vec<WarmItem> = Vec::new();
-        for (row, present) in first_frame_rows(knobs) {
+        for (row, present) in first_frame_rows(knobs, fetch) {
             for item in [
                 WarmItem::Library(row.spec().library),
                 WarmItem::pipeline(row, present),
@@ -20704,6 +21373,11 @@ mod tests {
                 }
             }
         }
+        warmed.extend(
+            first_frame_twins(knobs, fetch)
+                .into_iter()
+                .map(WarmItem::Twin),
+        );
         let missed: Vec<&WarmItem> = built.iter().filter(|i| !warmed.contains(i)).collect();
         let idle: Vec<&WarmItem> = warmed.iter().filter(|i| !built.contains(i)).collect();
         assert!(
@@ -21420,7 +22094,10 @@ mod atlas_upload_sync_tests {
     }
 
     fn live_or_skip() -> MetalArmLive {
-        match MetalArmLive::new(std::sync::Arc::new(LossLatch::new())) {
+        match MetalArmLive::new(
+            std::sync::Arc::new(LossLatch::new()),
+            &crate::metal::warm::FIRST_FRAME,
+        ) {
             Ok(live) => live,
             Err(error) => aterm_spec::host::could_not_run(format!("no Metal arm: {error}")),
         }
@@ -21598,7 +22275,10 @@ mod atlas_upload_sync_tests {
     #[test]
     fn an_in_place_atlas_upload_settles_every_frame_reader() {
         let _pool = AutoreleasePool::new();
-        let mut live = match MetalArmLive::new(std::sync::Arc::new(LossLatch::new())) {
+        let mut live = match MetalArmLive::new(
+            std::sync::Arc::new(LossLatch::new()),
+            &crate::metal::warm::FIRST_FRAME,
+        ) {
             Ok(live) => live,
             Err(error) => {
                 aterm_spec::host::could_not_run(format!("no Metal arm: {error}"));
@@ -22062,4 +22742,4 @@ mod gl_present;
 mod gl_replay_tests;
 
 #[path = "fx_gpu.rs"]
-mod fx_gpu;
+pub(crate) mod fx_gpu;

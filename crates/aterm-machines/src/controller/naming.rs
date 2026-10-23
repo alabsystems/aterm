@@ -21,9 +21,6 @@ pub fn vars(host: &Host) -> [(&'static str, &str); 3] {
     ]
 }
 
-/// `[names] local_host_name` of `text` (a baseline) as the controller sends it to `host`:
-/// its placeholders filled, `{serial}` too when it is known. `None` when the baseline sets
-/// none or does not parse.
 fn template(text: &str, host: &Host, serial: Option<&str>) -> Option<String> {
     let mut vars = vars(host).to_vec();
     if let Some(serial) = serial {
@@ -46,8 +43,6 @@ pub fn local_host_name(text: &str, host: &Host) -> Option<String> {
     (!name.contains("{serial}")).then(|| hardware::label_form_keeping(&name, PLACEHOLDER))
 }
 
-/// The baseline file `name` (`default` when a host names none), as text: `None` when it is
-/// not a plain name or cannot be read.
 fn baseline_text(sys: &dyn System, paths: &Paths, name: &str) -> Option<String> {
     if name.contains('/') || name.contains("..") {
         return None;
@@ -73,11 +68,6 @@ pub fn wanted(sys: &dyn System, paths: &Paths, inv: &Inventory) -> BTreeMap<Stri
     out
 }
 
-/// The Local hostname machines.toml reaches `host` by, when its address is one (`lab-03` of
-/// `lab-03.local`, or of `lab-03.local.`): a single label before `.local`, as Bonjour
-/// answers for a Mac. A longer name in `.local` (`lab03.corp.local`, a network whose
-/// unicast DNS uses the domain) is no Local hostname: the owner chose it, and it is never
-/// moved to one.
 fn dot_local(host: &Host) -> Option<&str> {
     let address = host.address.trim_end_matches('.');
     let (name, domain) = address.split_once('.')?;
@@ -312,7 +302,6 @@ mod tests {
         );
     }
 
-    /// The VM's hello (27.0), describing its hardware.
     fn vm_hello() -> Hello {
         Hello {
             serial_number: "ZPXWJY6KDJ".into(),

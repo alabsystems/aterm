@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHO MAY TOUCH A SESSION'S WAKES (`docs/DESIGN-harness-occupancy-2026-10-20.md` §4.1; the
-//! slice-2 plan's S1, S10): a process of the session's own tree, proven by `(pid, birth)` from
-//! the connection's kernel peer up to the tab's PTY child, and narrowed to the hosted agent where
-//! the host knows it. Every verb that changes or consumes the book (`wake`, `wake rm|taken`,
-//! `await wake`) runs [`prove`] first; `await` is a read by its op class, so the class guards
-//! nothing here.
-//!
-//! Pure: the caller walks the chain (the kernel's records, from the serving peer's pid up) and
-//! hands it in. A birth is the kernel's start time, in microseconds.
+//! WHO MAY TOUCH A SESSION'S WAKES.
 
 use serde::{Deserialize, Serialize};
 
@@ -49,11 +41,9 @@ impl ProcLink {
 pub enum DeclarerRefusal {
     /// The connection carries no kernel peer (the bridge, a relay).
     NoPeer,
-    /// The peer's proven ancestry never meets this session's PTY child: another session's, or
-    /// none's.
+    /// The peer's proven ancestry never meets this session's PTY child: another session's.
     OtherSession,
-    /// The peer's ancestry does not hold up (a parent born after its child: a reused pid), or it
-    /// meets the tab but not the agent it hosts.
+    /// The peer's ancestry does not hold up (a parent born after its child: a reused pid).
     NotInTree,
 }
 
@@ -69,18 +59,8 @@ impl DeclarerRefusal {
     }
 }
 
-/// THE PROOF THAT A PEER IS OF THIS SESSION'S TREE: `chain` is the peer's ancestry from the peer
-/// itself up, `pty_child` the tab's PTY child, `agent` the hosted agent where the host's snapshot
-/// names one. Each link's parent must be the next link, born no later than its child. The chain
-/// must meet the PTY child (pid and birth both), and the agent too where one is named, at or
-/// above the peer.
-///
-/// Answers the agent the wake is declared for: the hosted agent where one is named, else the
-/// chain's member that is the PTY child's own child, else the PTY child itself (the peer is the
-/// tab's program).
-///
+/// THE PROOF THAT A PEER IS OF THIS SESSION'S TREE.
 /// # Errors
-///
 /// [`DeclarerRefusal`]: no peer, a chain that never meets the tab, or one that does not hold up.
 pub fn prove(
     chain: &[ProcLink],

@@ -132,7 +132,6 @@ fn as_args(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_string()).collect()
 }
 
-/// Claude Code's sign-in.
 fn claude(h: &Host<'_>, f: &Facts, out: &mut dyn Write) -> Done {
     if let Some(dir) = (h.var)(
         super::connector::CLAUDE

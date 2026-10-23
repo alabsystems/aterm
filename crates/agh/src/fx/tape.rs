@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! agh's tapes (design §21.3): a strict subset of atape-text 1, the text form of aterm-agent's harness tape (`crates/aterm-agent/src/supervise/tape/text.rs`), written as the run goes through a redacting sink. aterm-agent's `text::parse` reads every agh tape back to the same records; agh does not link aterm-agent.
+//! `agh` effect tapes (`atape-text 1` subset) written through a redacting sink.
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
@@ -15,25 +15,18 @@ use crate::error::{Error, Replay, Result, Sub};
 use crate::redact::Redactor;
 use crate::wire::Endpoints;
 
-/// The first line of every tape.
+/// First line of every tape.
 pub const MAGIC: &str = "atape-text 1";
-/// The largest tape `Fx::replay` reads: 64 MiB.
+/// Maximum tape size `Fx::replay` reads (64 MiB).
 pub const TAPE_MAX: u64 = 64 << 20;
 
-/// The header item's head line.
 const HEADER: &str = "header";
-/// The doors aterm-agent writes as words and a reply, which agh's subset never holds.
 const CONTROL_DOORS: [&str; 2] = ["ctl", "teller"];
-/// Every prefix a body line may carry in atape-text 1: a head never starts with one.
 const BODY_PREFIXES: [char; 5] = ['|', '>', '<', '=', '!'];
-/// The most arguments a header's `argv` holds: no exec takes more (each argument costs at
-/// least a byte of `ARG_MAX`, 1 MiB on macOS, and Linux's is a few MiB of strings and
-/// pointers).
 const ARGV_MAX: usize = 1 << 20;
-/// The header item's line count: `agh`, `api`, `argv`, `mode`, `endpoints`.
 const HEADER_LINES: usize = 5;
 
-/// What a tape says about its run: the header item's five lines.
+/// Header metadata recorded at the start of a tape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TapeHeader {
     /// `agh {version}`: the build that recorded it.
@@ -48,7 +41,7 @@ pub struct TapeHeader {
     pub endpoints: TapeEndpoints,
 }
 
-/// How a taped run spoke to GitHub.
+/// Credential mode of a taped run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TapeMode {
@@ -56,7 +49,7 @@ pub enum TapeMode {
     Anonymous,
 }
 
-/// Which GitHub a taped run spoke to.
+/// Endpoint target of a taped run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapeEndpoints {
     /// `Endpoints::github_com()`.
@@ -69,13 +62,10 @@ pub enum TapeEndpoints {
 pub(crate) const RECORD_AGAIN: &str =
     "record a new tape: agh --record NEW followed by the command line, then replay that one";
 
-/// `Replay::Format`, naming the tape's line `at` (1-based).
 fn format_at(at: usize, what: impl std::fmt::Display) -> Error {
     Error::replay(Replay::Format, format!("line {at}: {what}")).with_next(RECORD_AGAIN)
 }
 
-/// aterm-agent's escape (`tape/header.rs`): `\\`, `\n`, `\r`, `\t`, and `\xHH` for each byte
-/// of a character `aterm_codec::tty::is_active` flags and for each byte that is not UTF-8.
 fn escape(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     for chunk in bytes.utf8_chunks() {
@@ -100,8 +90,6 @@ fn escape(bytes: &[u8]) -> String {
     out
 }
 
-/// `escape`'s inverse. A `\` followed by anything but `\`, `n`, `r`, `t` or `x` and two hex
-/// digits is refused, its text the reason.
 fn unescape(text: &str) -> std::result::Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(text.len());
     let mut bytes = text.bytes();
@@ -133,21 +121,16 @@ fn unescape(text: &str) -> std::result::Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// One name as a token: escaped, with a space written `\x20` and `=` written `\x3d`, so no
-/// name reads as a field's end or a stamp.
 fn token(name: &str) -> String {
     escape(name.as_bytes())
         .replace(' ', "\\x20")
         .replace('=', "\\x3d")
 }
 
-/// A token read back.
 fn name(word: &str) -> std::result::Result<String, String> {
     String::from_utf8(unescape(word)?).map_err(|_| "a name that is not UTF-8".to_string())
 }
 
-/// `body`'s pieces, each behind `prefix`: the body split at every `\n`, each piece escaped
-/// after one space, or the prefix alone for an empty piece.
 fn pieces(out: &mut String, prefix: char, body: &[u8]) {
     for piece in body.split(|&b| b == b'\n') {
         out.push(prefix);
@@ -160,7 +143,7 @@ fn pieces(out: &mut String, prefix: char, body: &[u8]) {
 }
 
 impl TapeHeader {
-    /// This build's `VERSION`, `API_VERSION`, `argv`, Anonymous, and GithubCom when `endpoints` equals `Endpoints::github_com()`, else Loopback.
+    /// Build a header for `argv` and `endpoints`.
     #[must_use]
     pub fn for_run(argv: &[String], endpoints: &Endpoints) -> TapeHeader {
         TapeHeader {
@@ -176,7 +159,7 @@ impl TapeHeader {
         }
     }
 
-    /// The five lines, in field order, joined by `\n`, with no final newline.
+    /// Render the five header lines joined by `\n`.
     #[must_use]
     pub fn render(&self) -> String {
         let mut argv = String::from("argv");
@@ -197,14 +180,14 @@ impl TapeHeader {
         )
     }
 
-    /// The header `render` wrote.
+    /// Parse a header written by `render`.
+    ///
     /// # Errors
     /// `Replay::Format`: a line missing, out of order or unknown; an `api` other than `API_VERSION`; a `mode` other than `anonymous`; an endpoints value that is neither.
     pub fn parse(text: &str) -> Result<TapeHeader> {
         TapeHeader::parse_lines(&header_lines(text), 1)
     }
 
-    /// The header's lines, the first of them line `first` of the text they came from.
     fn parse_lines(lines: &[&str], first: usize) -> Result<TapeHeader> {
         let line = |i: usize, word: &str| -> Result<&str> {
             let at = first + i;
@@ -281,13 +264,11 @@ impl TapeHeader {
     }
 }
 
-/// The header text's lines, at most one past `HEADER_LINES`, so `parse_lines` can refuse the
-/// first extra line without holding a slice for every one.
 fn header_lines(text: &str) -> Vec<&str> {
     text.split('\n').take(HEADER_LINES + 1).collect()
 }
 
-/// A whole tape: `MAGIC`, `header` and the header's lines as `|` pieces, then each record.
+/// Render a full tape from `header` and `records`.
 #[must_use]
 pub fn render(header: &TapeHeader, records: &[EffectRecord]) -> String {
     let mut out = head_text(header);
@@ -299,19 +280,13 @@ pub fn render(header: &TapeHeader, records: &[EffectRecord]) -> String {
     out
 }
 
-/// `MAGIC` and the header item, each line ending `\n`.
 fn head_text(header: &TapeHeader) -> String {
     let mut out = format!("{MAGIC}\n{HEADER}\n");
     pieces(&mut out, '|', header.render().as_bytes());
     out
 }
 
-/// One record's lines, each ending `\n`, or `None` for a kind outside the subset (`Rand`,
-/// `File`, `FileErr`, `Raised`, which no agh door makes):
-/// - `Clock(ns)` → `clock {ns}`; `Mono(ns)` → `mono {ns}`;
-/// - `Exchange { door, request, reply }` → `exchange {token(door)}`, the request's pieces as
-///   `>` lines, then the reply's as `<` lines;
-/// - `Emit { door, bytes }` → `emit {token(door)}`, then the bytes' pieces as `|` lines.
+/// Render one record's lines, or `None` for record kinds outside the `agh` subset.
 #[must_use]
 pub fn render_record(record: &EffectRecord) -> Option<String> {
     let mut out = String::new();
@@ -339,8 +314,6 @@ pub fn render_record(record: &EffectRecord) -> Option<String> {
     Some(out)
 }
 
-/// A tape's lines, read one by one as the text is split, so a parse holds no slice per line:
-/// a file of newlines costs no more than its own bytes before its first line is judged.
 struct Lines<'a> {
     lines: std::iter::Peekable<std::str::Split<'a, char>>,
     /// How many lines have been read: the 1-based number of the last one.
@@ -348,12 +321,9 @@ struct Lines<'a> {
 }
 
 impl<'a> Lines<'a> {
-    /// `text`'s lines. Every line ends with a newline, so the empty text after the last one is
-    /// no line.
     fn of(text: &'a str) -> Lines<'a> {
         let mut lines = text.strip_suffix('\n').unwrap_or(text).split('\n');
         if text.is_empty() {
-            // `"".split` yields one empty piece: an empty text has no line at all.
             let _ = lines.next();
         }
         Lines {
@@ -368,13 +338,10 @@ impl<'a> Lines<'a> {
         Some(line)
     }
 
-    /// The next line, not read yet.
     fn peek(&mut self) -> Option<&'a str> {
         self.lines.peek().copied()
     }
 
-    /// The next line's piece, when it is a body line behind `prefix`. A glue (`=`) line is
-    /// refused: atape-text 1 writes one only for a control door's screen, outside the subset.
     fn piece(&mut self, prefix: char) -> Result<Option<Vec<u8>>> {
         let Some(line) = self.peek() else {
             return Ok(None);
@@ -398,7 +365,6 @@ impl<'a> Lines<'a> {
         unescape(piece).map(Some).map_err(|e| format_at(self.at, e))
     }
 
-    /// A body behind `prefix`: its pieces joined by newlines, at least one.
     fn bytes(&mut self, prefix: char) -> Result<Vec<u8>> {
         let Some(mut body) = self.piece(prefix)? else {
             let at = self.at + 1;
@@ -419,12 +385,10 @@ impl<'a> Lines<'a> {
     }
 }
 
-/// A number on a head line: ASCII digits alone (`str::parse` alone would take a `+`).
 fn number(word: &str, at: usize) -> Result<u64> {
     crate::path::digits(word).ok_or_else(|| format_at(at, format!("{word:?} is no number")))
 }
 
-/// One item from its head, at line `at`.
 fn item(head: &str, lines: &mut Lines<'_>, at: usize) -> Result<EffectRecord> {
     if head.is_empty() {
         return Err(format_at(at, "an empty line"));
@@ -478,7 +442,8 @@ fn item(head: &str, lines: &mut Lines<'_>, at: usize) -> Result<EffectRecord> {
     Ok(record)
 }
 
-/// A tape read back.
+/// Parse a tape back into its header and effect records.
+///
 /// # Errors
 /// `Replay::Format`, naming the line number: no `MAGIC` first line; no header item, or one `TapeHeader::parse` refuses; anything outside the subset (a stamp, `note`, `mark`, `end`, a `=` line, `rand`, `file`, `file-err`, `raised`, `exchange … raw`, the doors `ctl` and `teller`); a body line with the wrong prefix; an escape that does not decode.
 pub fn parse(text: &str) -> Result<(TapeHeader, Vec<EffectRecord>)> {
@@ -505,7 +470,6 @@ pub fn parse(text: &str) -> Result<(TapeHeader, Vec<EffectRecord>)> {
     Ok((header, records))
 }
 
-/// The open tape file a sink shares.
 struct SinkState {
     file: std::fs::File,
     path: PathBuf,
@@ -550,13 +514,12 @@ enum Remedy {
     Unflushed,
 }
 
-/// What a recording Fx writes through: a cheap handle on one open file.
+/// Shared handle to an open recording tape file.
 #[derive(Clone)]
 pub struct TapeSink {
     state: Arc<Mutex<SinkState>>,
 }
 
-/// CouldNotRun, `Sub::Local`, why `the tape {path} could not be written: {e}`.
 fn not_written(path: &Path, e: &str) -> Error {
     Error::could_not_run(format!(
         "the tape {} could not be written: {e}",
@@ -565,14 +528,10 @@ fn not_written(path: &Path, e: &str) -> Error {
     .with_sub(Sub::Local)
 }
 
-/// `path` as one POSIX shell word, for a next meant to be pasted (`super::shell_word`).
 fn path_word(path: &Path) -> String {
     super::shell_word(&path.display().to_string())
 }
 
-/// The next for a `--record` path that exists: `--record` never wrote it, so removing it is
-/// named only when it is a tape (a regular file whose first bytes are `MAGIC` and a newline):
-/// `record to a new path, or remove the tape {path} first`, `{path}` one shell word.
 fn in_the_way(path: &Path) -> String {
     let magic = format!("{MAGIC}\n");
     let mut head = Vec::new();
@@ -594,8 +553,6 @@ fn in_the_way(path: &Path) -> String {
     }
 }
 
-/// `not_written` for a sink's latched `why`, with the next its `remedy` names; each path in a
-/// next is one shell word.
 fn latched_error(path: &Path, why: &str, remedy: Remedy) -> Error {
     let replay_it = || format!("replay it: agh --replay {}", path_word(path));
     match remedy {
@@ -616,7 +573,8 @@ fn latched_error(path: &Path, why: &str, remedy: Remedy) -> Error {
 }
 
 impl TapeSink {
-    /// Create `path` (`create_new`; mode 0600 on unix) and write `MAGIC` and the header item, each argument of its `argv` through `Redactor::shapes`.
+    /// Create `path` and write `MAGIC` and the shaped header item.
+    ///
     /// # Errors
     /// As `Fx::record`. A header whose rendered lines the shapes would still change (two
     /// arguments that read as one shape once joined, `Bearer` then a long word) is CouldNotRun,
@@ -626,7 +584,8 @@ impl TapeSink {
         Self::open_within(path, header, TAPE_MAX)
     }
 
-    /// `create` with the file held to `max` bytes in place of `TAPE_MAX`, so a test reaches the bound with kilobytes, not the 64 MiB the shapes and the rendering would walk in a debug build (2 s).
+    /// Create `path` with the file held to `max` bytes in place of `TAPE_MAX`.
+    ///
     /// # Errors
     /// As `create`.
     #[cfg(any(test, debug_assertions))]
@@ -695,7 +654,7 @@ impl TapeSink {
         })
     }
 
-    /// The first error latched, as its text, if any.
+    /// First latched error message, if any.
     #[must_use]
     pub fn failed(&self) -> Option<String> {
         self.state
@@ -706,6 +665,7 @@ impl TapeSink {
     }
 
     /// Flush the file, then make it durable (`aterm_durable::durable`).
+    ///
     /// # Errors
     /// CouldNotRun, `Sub::Local`, why `the tape {path} could not be written: {e}`: the latched
     /// error, or the flush's own. A refusal every run would meet again (a record outside the
@@ -772,7 +732,7 @@ impl TapeSink {
             .discarded
     }
 
-    /// Append one record as `render_record` writes it, its bytes through `Redactor::shapes` first (`shaped_record`), so the tape decodes to exactly the redacted bytes; a rendering the shapes would still change is latched, not written.
+    /// Append one redacted record to the tape.
     pub fn append(&self, record: &EffectRecord) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.failed.is_some() {
@@ -825,8 +785,6 @@ pub(crate) fn shaped(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `header` with each argument of its `argv` through the shapes as raw text, before `token`
-/// writes its spaces as `\x20`, which the shapes would not read as blanks.
 fn shaped_header(header: &TapeHeader) -> TapeHeader {
     TapeHeader {
         argv: header
@@ -844,7 +802,6 @@ pub(crate) fn head_redacts(header: &TapeHeader) -> bool {
     Redactor::shapes(&head) != head
 }
 
-/// `record` with every byte field `shaped`: an exchange's request and reply, an emit's bytes.
 fn shaped_record(record: &EffectRecord) -> EffectRecord {
     match record {
         EffectRecord::Exchange {
@@ -882,7 +839,6 @@ pub(crate) fn redacts_a_reply(reply: &[u8]) -> bool {
         .is_some_and(|value| json_redacts(&value))
 }
 
-/// Whether the shapes would change a string of `value`, a key or a value, at any depth.
 fn json_redacts(value: &aterm_json::Value) -> bool {
     let changes = |text: &str| Redactor::shapes(text) != text;
     match value {
@@ -896,7 +852,6 @@ fn json_redacts(value: &aterm_json::Value) -> bool {
 }
 
 impl std::fmt::Debug for TapeSink {
-    /// `TapeSink({path})`: the file it writes, never a record.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         write!(f, "TapeSink({})", state.path.display())

@@ -29,7 +29,7 @@ pub struct Opts {
 /// The receiver of a method.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Receiver {
-    /// None: a free function, a static method, a constructor.
+    /// Free function, static method, or constructor.
     None,
     /// `&self`.
     Shared,
@@ -57,7 +57,7 @@ pub struct Sig {
     pub receiver: Receiver,
     /// The parameters after the receiver.
     pub params: Vec<Param>,
-    /// The return type; `None` is `()`.
+    /// Return type (`None` for `()`).
     pub ret: Option<Vec<Tt>>,
 }
 
@@ -80,7 +80,7 @@ pub enum Item {
     Fn {
         /// Its doc comment.
         docs: String,
-        /// Whether it is plain `pub`.
+        /// Whether visibility is plain `pub`.
         public: bool,
         /// Its signature.
         sig: Sig,

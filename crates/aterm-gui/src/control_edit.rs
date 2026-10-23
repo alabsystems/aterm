@@ -257,8 +257,7 @@ mod tests {
         Box::leak(Box::new(Hops::new()))
     }
 
-    /// A main thread made of `serve`, which is handed each wake as
-    /// `user_event` is, its hop taken first.
+    /// Injected `MainPost` that unwraps each `Wake` hop before calling `serve`.
     fn main_thread<'a>(mut serve: impl FnMut(Wake) -> bool + 'a) -> MainPost<'a> {
         MainPost::injected(move |wake| serve(take_hop(wake)), fresh_hops())
     }
@@ -319,8 +318,7 @@ mod tests {
         assert!(line.starts_with("OK edit ticket="), "{line}");
     }
 
-    /// The `call_main` deadline: the ticket is cancelled, and the reply names
-    /// it so a log can match the late admission the main thread drops.
+    /// Deadline expiry cancels the ticket and names it in the timeout reply.
     #[test]
     fn timeout_cancels_the_ticket_it_names() {
         let mut held = None;
@@ -347,13 +345,7 @@ mod tests {
         assert_eq!(cancelled, Some(ticket));
     }
 
-    /// `edit` and `await edit` post their requests as counted main-thread
-    /// hops ([`MainPost::ask`]): each is counted while the main thread has not
-    /// taken it, so the next verb's stall refusal sees a lane parked behind a
-    /// main thread that does not take it, and is counted out once taken or
-    /// once its lane returns. The cancel and the withdrawal wait for nothing
-    /// and are posted uncounted. Negative control: the same request posted
-    /// raw leaves the count empty, so what the count sees is the hop.
+    /// `edit` and `await edit` count their request hops until taken or returned.
     #[test]
     fn edit_requests_are_counted_hops_until_taken() {
         let hops = fresh_hops();
@@ -579,8 +571,7 @@ mod tests {
         );
     }
 
-    /// The lane hands the main thread both spellings of a file it can resolve:
-    /// a symlinked directory's and the realpath the store keys documents by.
+    /// Resolves and forwards both the requested URI and its canonical realpath URI.
     #[cfg(unix)]
     #[test]
     fn edit_lanes_resolve_the_realpath_spelling() {

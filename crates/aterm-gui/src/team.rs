@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHO DRIVES (`docs/DESIGN-owner-surfaces-2026-10-16.md` §5, S9): the team
-//! a session is in — the manager its task reports to (the record's `from=`)
-//! and how many workers name it — as the Claude rule's Team chip
-//! (`crate::claude_lights`), the strip's marks (`tab_bar::TabTeam`) and the
-//! tab's hover read it.
-//!
-//! It is the one team table: the tab menu's AGENT rows (a worker's Go to
-//! its manager, a manager's Workers rows) and the long hold's entry read it
-//! too, so no reader walks the task records for teams again.
-//!
-//! A RECORD: no need, no colour, no wake of its own. The table is built whole
-//! at change rate (`App::rebuild_teams`: a task moved, a role or a title
-//! moved, a tab retired, and `App::refresh_presence_all_windows` — a
-//! restore, a successor's commit, a config adopt; never a focus change,
-//! which moves nothing it holds) from one [`Row`] per pooled
-//! session, and every frame reads it without a lock. Pure, so it is tested
-//! off macOS.
+//! WHO DRIVES (`docs/DESIGN-owner-surfaces-2026-10-16.md` §5, S9).
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -33,12 +17,9 @@ pub(crate) struct Row {
     pub(crate) local: u64,
     /// Its global sid.
     pub(crate) sid: String,
-    /// What a worker's chip names it by, raw: its tab's label as every
-    /// Agents surface names it (`App::tab_label_of_session`).
+    /// What a worker's chip names it by, raw.
     pub(crate) name: String,
-    /// Its task's `from=` where that names a session: `None` with no task
-    /// record, and for `from=ctl` (a task the instance's own client started,
-    /// which no chip names).
+    /// Its task's `from=` where that names a session.
     pub(crate) from: Option<String>,
     /// Its task's state word and when it entered it, for a worker's hover.
     pub(crate) task: Option<(&'static str, std::time::Instant)>,
@@ -49,8 +30,7 @@ pub(crate) struct Row {
 pub(crate) struct Manager {
     /// Its local id, where it is a session of this instance.
     pub(crate) local: Option<u64>,
-    /// Its name as the chip and the hover print it: its [`Row::name`], or its
-    /// short sid where it is not here, held to the presence token rule.
+    /// Its name as the chip and the hover print it.
     pub(crate) label: Arc<str>,
 }
 
@@ -61,16 +41,11 @@ pub(crate) struct Team {
     pub(crate) manager: Option<Manager>,
     /// How many sessions' tasks name it.
     pub(crate) workers: u16,
-    /// Those sessions' local ids, in the order they were made (ascending:
-    /// the pool is a map, so its own order is none): what its tab menu's
-    /// Workers rows list (`App::agent_menu_facts`), each read off its own
-    /// [`Team::task`].
+    /// Those sessions' local ids, in the order they were made.
     pub(crate) members: Vec<u64>,
-    /// `⇉<workers>`, composed once a build (empty with none): the manager's
-    /// chip prints it.
+    /// `⇉<workers>`, composed once a build (empty with none): the manager's chip prints it.
     pub(crate) workers_mark: Arc<str>,
-    /// A worker's task state word and when it entered it (`task working 4m`
-    /// on the chip's hover).
+    /// A worker's task state word and when it entered it (`task working 4m` on the chip's hover).
     pub(crate) task: Option<(&'static str, std::time::Instant)>,
 }
 
@@ -98,9 +73,6 @@ impl Team {
 }
 
 /// THE TABLE: each session that is a worker or a manager, from `rows`.
-/// A worker's manager is the row whose sid its `from=` names, else the
-/// short sid it names (a manager not here); a manager's count is the rows
-/// whose `from=` names it. A row naming itself is neither.
 #[must_use]
 pub(crate) fn table(rows: &[Row]) -> HashMap<u64, Team> {
     let by_sid: HashMap<&str, &Row> = rows.iter().map(|row| (row.sid.as_str(), row)).collect();
@@ -149,8 +121,6 @@ mod tests {
         }
     }
 
-    /// A manager with three workers here, one worker of a manager not here,
-    /// a task the instance's own client started, and a row naming itself.
     #[test]
     fn workers_name_their_manager_and_a_manager_counts_them() {
         let rows = [
@@ -192,8 +162,6 @@ mod tests {
         );
     }
 
-    /// A manager's workers are listed in the order they were made, whatever
-    /// order the pool (a map) hands the rows over in.
     #[test]
     fn a_managers_workers_are_listed_in_the_order_they_were_made() {
         let rows = [
@@ -205,8 +173,6 @@ mod tests {
         assert_eq!(table(&rows)[&1].members, [2, 3, 4]);
     }
 
-    /// A manager's name is held to the presence token rule: no control byte,
-    /// no bidi override, no presence glyph, at most [`LABEL_CELLS`] cells.
     #[test]
     fn a_managers_name_is_sanitized() {
         let rows = [
@@ -224,7 +190,6 @@ mod tests {
         assert!(label.chars().count() <= LABEL_CELLS, "{label:?}");
     }
 
-    /// The footer's term moves with the chip's words and only with them.
     #[test]
     fn the_term_moves_with_what_the_chip_says() {
         let rows = |name: &str| {

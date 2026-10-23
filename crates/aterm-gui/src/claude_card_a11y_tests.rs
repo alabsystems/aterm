@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A screen reader hears Claude's words under the harness's glass: the accessibility tree's grid
-//! text is read from the cells Claude wrote (`claude_footer::ProgramCells`), as copy and
-//! `text`/`screen` keep them, never the glass's `YOLO on`, `✦ alab.systems`, facts or the card's
-//! line.
+//! Tests that accessibility grid text reads Claude's program cells rather than glass overlays.
 
 use super::*;
 
@@ -12,17 +9,10 @@ use aterm_a11y::model::Role;
 
 use crate::accessibility::AccessibleSnapshot;
 
-/// Claude Code's bypass pill: the row the glass relabels `YOLO on`.
 const BYPASS: &str = "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)";
 
-/// Claude Code's lockup as the composer's top rule wears it under the
-/// harness's glass (`claude_footer::compose_top`): two `─`, the icon's
-/// blank cells under its sprite, the name and the next `─` — aterm's
-/// drawing, not the card's own mascot (`▐▛███▛█`), which the reader hears.
 const LOGO: &str = "\u{2500}\u{2500}    claude \u{2500}";
 
-/// The session's foreground program is Claude Code's: what the pill
-/// relabel's gate asks of the pane, with the composer border.
 fn claude_program(app: &App, session: u64) {
     let entry = app.pool.get(session).expect("session");
     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -30,8 +20,6 @@ fn claude_program(app: &App, session: u64) {
     timeline.set_program(PGID, Some("claude".into()));
 }
 
-/// Rows of text as a snapshot reads them: each glyph (a NUL or a control
-/// as a blank), trailing blanks trimmed, each row ended by a newline.
 fn as_read(rows: &[String]) -> String {
     rows.iter()
         .map(|row| {
@@ -44,17 +32,6 @@ fn as_read(rows: &[String]) -> String {
         .collect()
 }
 
-/// THE READER HEARS CLAUDE'S ROWS. On the MEASURED update-notice capture at
-/// 120 columns ([`WIDE`]) with Claude's bypass pill on its mode row, under a
-/// supervising host: the glass shows `✦ alab.systems` over the notice, `YOLO
-/// on` over the pill, the card's line, the rule's facts and the top rule's
-/// logo — and the grid's snapshot ([`App::grid_snapshot`]) and the tree's
-/// terminal document read exactly the terminal's own rows: Claude's notice
-/// and its changelog link, `⏵⏵ bypass permissions on`, the rules' own
-/// glyphs — allocating no more than the same words read off the engine's
-/// cells; the logo, decoration, has no node. NEGATIVE CONTROL: the
-/// presented scratch, read as the snapshot read it before, holds the glass's
-/// words and the logo.
 #[test]
 fn a_reader_hears_claudes_words_under_the_glass() {
     let c = WIDE;
@@ -140,12 +117,6 @@ fn a_reader_hears_claudes_words_under_the_glass() {
     host.shutdown_and_join();
 }
 
-/// THE SAME IN A SPLIT: Claude Code's pane on the right of a 160-column
-/// window ([`split_card`]), its pill relabelled `YOLO on` and its card's
-/// line on the glass, is published as its own terminal document that reads
-/// the pane's own rows — `⏵⏵ bypass permissions on`, no `YOLO`, no line —
-/// and the shell's pane beside it reads its own. NEGATIVE CONTROL: the
-/// presented scratch through the pane's rectangle reads `YOLO on`.
 #[test]
 fn a_split_panes_reader_hears_its_own_claudes_words() {
     let (mut app, wid, shell, session, cols) = split_card("", "");

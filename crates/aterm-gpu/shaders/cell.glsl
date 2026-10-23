@@ -510,9 +510,9 @@ void fs_sprite_over() {
 // mod 2^16), 2 => Uint16x2 (a sprite's dw, dh), 3 => Uint16x4 (the atlas
 // region; [w, 0, 0, 0] for Rect and Ramps), 4 => Uint32 (the absolute
 // palette entry), 5 => Uint32 (flags), all integers. Pixel law F, the WGSL
-// fs_fx / fs_fx_linear twins op for op (see their comment): flat operands,
-// the fragment's own pixel and the item's unclamped origin, texels read with
-// texelFetch and their bytes recovered with roundEven.
+// fs_fx / fs_fx_linear / fs_fx_store twins op for op (see their comment):
+// flat operands, the fragment's own pixel and the item's unclamped origin,
+// texels read with texelFetch and their bytes recovered with roundEven.
 //
 // BINDINGS (BindSpec::FX): the Index8 atlas is aterm_t0, the RGBA atlas
 // aterm_t1, and the frame palette aterm_t2: GLSL ES 3.00 has no storage
@@ -546,7 +546,7 @@ void vs_fx() {
 }
 #endif
 
-#if defined(ATERM_FRAGMENT) && (defined(ATERM_FS_fs_fx) || defined(ATERM_FS_fs_fx_linear))
+#if defined(ATERM_FRAGMENT) && (defined(ATERM_FS_fs_fx) || defined(ATERM_FS_fs_fx_linear) || defined(ATERM_FS_fs_fx_store))
 uniform highp sampler2D aterm_t1;
 uniform highp sampler2D aterm_t2;
 
@@ -605,6 +605,34 @@ void fs_fx() {
         c = glow_lerp4(fx_ink(j), fx_ink(j + 1u), l.x, max(v_src.x, 1u));
     }
     o_frag = vec4(c) / vec4(255.0);
+}
+#endif
+
+// The Exact law where every pixel the layer draws is opaque (route (1) of the
+// pass economy): the entry's colour, stored on the sRGB view with no blend
+// under the Color mask.
+#if defined(ATERM_FRAGMENT) && defined(ATERM_FS_fs_fx_store)
+void fs_fx_store() {
+    uvec2 l = fx_local();
+    uint kind = v_flags & 3u;
+    uvec4 c;
+    if (kind == 2u) {
+        ivec2 t = fx_texel(l);
+        if (((v_flags >> 3u) & 3u) == 0u) {
+            uint k = fx_byte4(texelFetch(aterm_t0, t, 0)).x;
+            uint reach = (v_flags >> 8u) & 255u;
+            if (k == 0u || k > reach) {
+                discard;
+            }
+            c = fx_ink(v_pal + clamp(k, 1u, reach) - 1u);
+        } else {
+            c = fx_byte4(texelFetch(aterm_t1, t, 0));
+        }
+    } else {
+        uint j = v_pal + 2u * (kind == 1u ? l.y : 0u);
+        c = glow_lerp4(fx_ink(j), fx_ink(j + 1u), l.x, max(v_src.x, 1u));
+    }
+    o_frag = vec4(s2l(vec3(c.rgb) / vec3(255.0)), 1.0);
 }
 #endif
 

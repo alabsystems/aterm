@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Immediate actuator egress over a non-blocking pipe, which gives deterministic backpressure and,
-//! like a raw PTY master, can refuse with EAGAIN or short-write.
+//! Immediate actuator egress tests over a non-blocking pipe.
 
 #![cfg(unix)]
 
@@ -105,15 +104,6 @@ fn short_write_is_partial_in_doubt_and_tail_is_never_injected() {
     assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
 }
 
-/// THE GUARDED WRITE FINISHES A FRAME IT BEGAN, IN ORDER
-/// (`try_write_frame_whole_with_receipt`): over the same partly-full pipe as
-/// [`short_write_is_partial_in_doubt_and_tail_is_never_injected`], the kernel
-/// takes a prefix and the rest is queued behind it — `Queued`, with the
-/// prefix's count and an accepted order — and a frame another writer sends
-/// right after lands after ALL of it: the reader drains the old fill, every
-/// `P` of the frame, then `after`, with nothing between. A second guarded
-/// write while the rest is queued is refused with zero bytes (`BusyZero`), so a
-/// guarded Enter can never overtake the text it submits.
 #[test]
 fn the_guarded_write_queues_the_rest_of_a_short_write_and_delivers_it_whole() {
     let (read, write) = pipe_pair();
@@ -177,17 +167,6 @@ fn the_guarded_write_queues_the_rest_of_a_short_write_and_delivers_it_whole() {
     assert_eq!(&landed[old_remaining + frame.len()..], b"after");
 }
 
-/// One run of the race the spill's active bit decides: a blocking frame
-/// (`write_frame`, a paste or a control verb's) has looked at the spill,
-/// found it empty, and is stopped before it waits for the fd lock
-/// (`Seam::FrameLock`); meanwhile `write` (an immediate write) takes a short
-/// write over a partly-full pipe. Then the blocking frame goes on, and the
-/// reader drains everything for at most a minute (a hang detector). The
-/// drainer the immediate write deferred to the arranger is spawned only once
-/// the blocking frame has returned, so the frame took the fd lock with no
-/// drainer to race it for the lock: nothing but the code orders the bytes.
-/// Returns what the immediate write answered, the reader's bytes past the
-/// old fill, and the frame written.
 fn a_blocking_frame_behind(
     write: impl FnOnce(&SinkWriter, &[u8]) -> ImmediateWrite,
 ) -> (ImmediateWrite, Vec<u8>, Vec<u8>) {
@@ -272,15 +251,6 @@ fn a_blocking_frame_behind(
     (outcome, landed.split_off(filled - room), frame)
 }
 
-/// A BLOCKING FRAME THAT SAW THE SPILL EMPTY NEVER OVERTAKES THE GUARDED
-/// WRITE'S QUEUED REST. A blocking writer looks at the spill before it waits
-/// for the fd lock (so a wedged drainer holding that lock cannot park it
-/// behind the cap), so it can find the spill empty, wait while a guarded
-/// write holds the lock and queues the rest of a short write, and take the
-/// lock after it. The guarded write sets the spill's active bit as it queues
-/// (`Shared::queue_rest_held`), so that writer is refused the direct lane
-/// (`direct_order_if_spill_empty`) and queues behind the rest: the reader
-/// gets the frame whole, then `after`.
 #[test]
 fn a_blocking_frame_that_saw_the_spill_empty_queues_behind_the_guarded_rest() {
     let (outcome, landed, frame) =

@@ -13,31 +13,14 @@ use aterm_toml::edit::{DocumentMut, Item};
 /// The directory under `vendor/` this obligation owns.
 pub(crate) const DIRECTORY: &str = "astream";
 const SUBMODULE: &str = "vendor/astream";
-/// Accepted with or without a trailing `.git`, and in no other spelling.
 const URL: &str = "https://github.com/alabsystems/astream";
 const GITLINK_MODE: &str = "160000";
-/// The line of work the pin is judged against. The full ref name, so a local
-/// branch or tag spelled `origin/main` cannot stand in for it.
 const BASE_REF: &str = "refs/remotes/origin/main";
-/// How messages spell [`BASE_REF`].
 const BASE_NAME: &str = "origin/main";
-/// A commit-message line on this branch that declares a deliberate backward move, with its
-/// reason: `astream-pin-rollback: <why the older astream is needed>`.
 const ROLLBACK_TRAILER: &str = "astream-pin-rollback:";
-/// What every astream crate's name starts with. The crates `[OB-1]` holds to
-/// the submodule are READ FROM THE GRAPH — every package so named, and every
-/// package whose manifest is under `vendor/astream` — not listed here: a list
-/// went stale twice in a day (astream-term for aterm-conformance's VT oracle,
-/// then astream-effects for aterm-agent's harness tape, which ships), and a
-/// crate missing from it was never checked for resolving from the pin, for
-/// its licence or for staying outside this workspace.
 const CRATE_PREFIX: &str = "astream-";
 const CONSUMER: &str = "crates/aterm-link/Cargo.toml";
-/// aterm-link's direct path dependencies into the submodule.
 const CONSUMER_DEPS: [&str; 2] = ["astream-broker", "astream-cap"];
-/// The variables that point git at a repository. A hook exports them for the
-/// superproject, so they are cleared before asking git inside the submodule
-/// (as git's own submodule code does).
 const REPO_ENV: [&str; 6] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -181,8 +164,6 @@ fn nul_separated(bytes: Vec<u8>) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Read by git, not by hand: `.gitmodules` is git-config syntax (quoting,
-/// comments, case rules), and git's reading of it is the one that fetches.
 fn gitmodules(root: &Path) -> Result<Vec<(String, String)>, String> {
     if !root.join(".gitmodules").is_file() {
         return Ok(Vec::new());
@@ -223,8 +204,6 @@ fn index(root: &Path) -> Result<Vec<IndexEntry>, String> {
         .collect()
 }
 
-/// Never an error: whatever keeps git from answering inside the submodule is the finding, and
-/// [`validate`] names the fix for it.
 fn checkout(root: &Path) -> Checkout {
     let dir = root.join(SUBMODULE);
     if !dir.is_dir() {
@@ -264,8 +243,6 @@ fn checkout(root: &Path) -> Checkout {
     }
 }
 
-/// Never an error: what git cannot answer is [`PinMotion::Undecided`], and an
-/// unreadable gitlink is [`validate`]'s finding, not this function's.
 fn pin_motion(root: &Path, index: &[IndexEntry]) -> PinMotion {
     let Ok(pin) = gitlink(index) else {
         return PinMotion::Unchanged;
@@ -336,8 +313,6 @@ fn pin_motion(root: &Path, index: &[IndexEntry]) -> PinMotion {
     }
 }
 
-/// `git merge-base --is-ancestor`: exit 0 yes, 1 no, anything else an error,
-/// which [`git`] cannot tell apart from "no".
 fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
     let mut cmd = command(aterm_uds::os_path!("git"));
     cmd.args(["merge-base", "--is-ancestor", ancestor, descendant])
@@ -358,8 +333,6 @@ fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, Str
     }
 }
 
-/// The reason a commit on this branch (`merge_base..HEAD`) gives for moving
-/// the pin backward, if any does.
 fn rollback_reason(root: &Path, merge_base: &str) -> Option<String> {
     let range = format!("{merge_base}..HEAD");
     let log = git(root, &["log", "--format=%B%x00", &range], false).ok()?;
@@ -396,14 +369,10 @@ pub(crate) fn machine_refusal(why: &str) -> bool {
     why.starts_with(CACHE_LACKS_A_LOCKED_CRATE)
 }
 
-/// Whether Cargo's `stderr` is an offline run's refusal for a crate the local cache
-/// does not hold (the download it would need, or a resolution offline mode cut short).
 fn offline_cache_miss(stderr: &str) -> bool {
     stderr.contains("--offline was specified") || stderr.contains("you're using offline mode")
 }
 
-/// The full resolution, not `--no-deps` (which lists members only; the astream
-/// crates are excluded from the workspace).
 fn metadata(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Value, String> {
     let out = cargo
         .command("metadata", root)
@@ -448,7 +417,6 @@ fn validate(root: &Path, facts: &Facts) -> Result<Pin, String> {
     })
 }
 
-/// (7) The pin did not go backward against `origin/main` at the merge-base.
 fn pin_did_not_move_back(motion: &PinMotion, commit: &str) -> Result<(), String> {
     match motion {
         PinMotion::Backward {
@@ -476,7 +444,6 @@ fn pin_did_not_move_back(motion: &PinMotion, commit: &str) -> Result<(), String>
     }
 }
 
-/// A short, bounded rendering of a path list for a one-line failure.
 fn preview(items: &[&str]) -> String {
     const SHOWN: usize = 5;
     let mut s = items
@@ -491,7 +458,6 @@ fn preview(items: &[&str]) -> String {
     s
 }
 
-/// (1) `.gitmodules` names this path exactly once, with astream's URL.
 fn declared_url(entries: &[(String, String)]) -> Result<String, String> {
     let names: Vec<&str> = entries
         .iter()
@@ -536,7 +502,6 @@ fn declared_url(entries: &[(String, String)]) -> Result<String, String> {
     }
 }
 
-/// (2) The index holds one gitlink at the path and nothing beneath it.
 fn gitlink(index: &[IndexEntry]) -> Result<String, String> {
     let beneath: Vec<&str> = index
         .iter()
@@ -595,7 +560,6 @@ fn gitlink(index: &[IndexEntry]) -> Result<String, String> {
     Ok(entry.object.clone())
 }
 
-/// (3) The checkout is the pinned commit, unmodified.
 fn checked_out_at(checkout: &Checkout, commit: &str) -> Result<(), String> {
     match checkout {
         Checkout::Uninitialised(why) => Err(format!(
@@ -622,8 +586,6 @@ fn checked_out_at(checkout: &Checkout, commit: &str) -> Result<(), String> {
     }
 }
 
-/// (5) cargo leaves the submodule to astream's workspace. Cargo's rule is a
-/// path prefix, so an entry naming an ancestor directory covers it too.
 fn excluded(exclude: &[String]) -> Result<(), String> {
     let covers = |entry: &String| {
         let entry = entry.trim_start_matches("./").trim_end_matches('/');
@@ -651,10 +613,6 @@ fn packages_and_members(metadata: &Value) -> Result<(&Vec<Value>, &Vec<Value>), 
     Ok((packages, members))
 }
 
-/// (4) Every astream crate the graph resolves — every package named
-/// [`CRATE_PREFIX`]`*`, and every package whose manifest is under the
-/// submodule — resolves once, from the submodule, as a path package outside
-/// this workspace: the crates checked, sorted.
 fn resolved_from_submodule(root: &Path, metadata: &Value) -> Result<Vec<String>, String> {
     let (packages, members) = packages_and_members(metadata)?;
     let under = root.join(SUBMODULE);
@@ -726,8 +684,6 @@ fn resolved_from_submodule(root: &Path, metadata: &Value) -> Result<Vec<String>,
     Ok(names.into_iter().map(str::to_owned).collect())
 }
 
-/// (6) aterm-link, the member that is the reason the submodule exists, still
-/// path-depends on the submodule's crates.
 fn consumer_reaches_submodule(root: &Path, metadata: &Value) -> Result<(), String> {
     let (packages, _) = packages_and_members(metadata)?;
     let consumer = packages
@@ -769,8 +725,6 @@ mod tests {
     use super::*;
     use aterm_json::json;
 
-    /// An offline run's refusal for a crate the cache lacks is the machine's
-    /// (COULD NOT RUN), in both of Cargo's spellings; any other refusal is not.
     #[test]
     fn an_offline_cache_miss_is_the_machines_refusal() {
         for stderr in [
@@ -796,8 +750,6 @@ mod tests {
         assert!(machine_refusal(&why), "{why}");
     }
 
-    /// The astream crates the built tree below resolves: aterm's graph as this was
-    /// written.
     const FIXTURE: [&str; 6] = [
         "astream-broker",
         "astream-cap",
@@ -807,9 +759,6 @@ mod tests {
         "astream-wire",
     ];
 
-    /// A tree that holds every obligation, written out: the base every
-    /// mutation below starts from, which must itself validate or the
-    /// mutations prove nothing.
     fn valid() -> (PathBuf, Facts) {
         let root = PathBuf::from("/w");
         let pin = "1".repeat(40);
@@ -917,11 +866,8 @@ mod tests {
         }
     }
 
-    /// One planted drift: a named edit to the valid base's facts.
     type Plant = Box<dyn Fn(&mut Facts)>;
 
-    /// The valid base's facts validate, and each planted drift from the pinned
-    /// submodule is refused.
     #[test]
     fn every_planted_drift_from_the_pinned_submodule_is_refused() {
         let (root, facts) = valid();
@@ -1121,10 +1067,6 @@ mod tests {
         }
     }
 
-    /// The crates checked are the graph's, not a list's: an astream crate no list names is
-    /// held to the pin like the rest — redirected to a sibling checkout or given another
-    /// licence, it is refused — and, resolved from the submodule, it is among the crates the
-    /// pin reports.
     #[test]
     fn an_astream_crate_no_list_names_is_held_to_the_submodule_too() {
         let (root, facts) = valid();
@@ -1200,8 +1142,6 @@ mod tests {
         rejects(&root, &pinned, &["`asb` is an aterm workspace member"]);
     }
 
-    /// A throwaway superproject whose `vendor/astream` is a real repository,
-    /// so `pin_motion` runs the git it runs in production.
     struct Fixture {
         root: aterm_tempfile::TempDir,
     }
@@ -1248,7 +1188,6 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_owned()
         }
 
-        /// A commit in the submodule on top of `parent` (or the current HEAD).
         fn astream_commit(&self, parent: Option<&str>, msg: &str) -> String {
             let sub = self.root.path().join(SUBMODULE);
             if let Some(p) = parent {
@@ -1258,7 +1197,6 @@ mod tests {
             self.run(&sub, &["rev-parse", "HEAD"])
         }
 
-        /// A commit in the superproject that records `pin` at the gitlink.
         fn commit_pin(&self, parent: Option<&str>, pin: &str, msg: &str) -> String {
             if let Some(p) = parent {
                 self.run(self.root.path(), &["checkout", "-q", "--detach", p]);

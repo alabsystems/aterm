@@ -7,6 +7,7 @@ pub(crate) mod acquire_worker;
 #[cfg(test)]
 pub(crate) mod blit;
 pub(crate) mod encoder;
+pub(crate) mod fetch;
 pub(crate) mod ffi;
 pub(crate) mod loss;
 pub(crate) mod pipelines;
@@ -385,6 +386,81 @@ mod tests {
             }
         }
         assert!(checked > 30_000, "halo sweep unexpectedly small: {checked}");
+    }
+
+    /// `k_udiv_parity`'s parameters, as `parity_kernel.metal` declares them.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct UdivParityParams {
+        d0: u32,
+        q_max: u32,
+        r_all: u32,
+    }
+
+    /// `cell.metal`'s `udiv_small` is the integer divide over every divide its callers make: the glow ramp's `n / 2w` (a quad up to 65535 px wide, a quotient of at most 255) and the fx sprite texel's `l·side / dst` (a destination side up to 65535, a quotient below the art's side, at most the fx atlas's 4096). Every divisor up to 2^17 meets every quotient up to 4096 at the remainders a float estimate gets wrong first (0, 1, d − 2, d − 1), and every divisor up to 512 meets every remainder.
+    #[test]
+    fn udiv_small_is_the_integer_divide_over_its_callers_domain() {
+        const Q_MAX: u32 = crate::renderer::fx_gpu::FX_ATLAS_CAP;
+        const D_EDGE: u32 = 1 << 17;
+        const D_EVERY: u32 = 512;
+        const CHUNK: u32 = 1 << 14;
+
+        let dev = device();
+        let lib = dev
+            .new_library(&shaders::cell_with_parity_kernels())
+            .expect("cell.metal + parity kernels compile");
+        let kf = lib.function("k_udiv_parity").expect("k_udiv_parity");
+        let pso = dev.new_compute_pipeline(&kf).expect("udiv compute pso");
+        let queue = dev.new_command_queue().expect("queue");
+
+        let mut sweeps = vec![(1, D_EVERY, 1)];
+        sweeps.extend((0..D_EDGE / CHUNK).map(|k| (1 + k * CHUNK, CHUNK, 0)));
+        let mut divisors = 0u64;
+        for (d0, count, r_all) in sweeps {
+            let p = UdivParityParams {
+                d0,
+                q_max: Q_MAX,
+                r_all,
+            };
+            let pbuf = dev
+                .new_buffer(size_of::<UdivParityParams>())
+                .expect("params");
+            // SAFETY: `UdivParityParams` is `repr(C)` and the buffer was just created at exactly its size; no GPU work is in flight.
+            unsafe { ffi::buffer_write(&pbuf, as_bytes(&p)) };
+            let n = count as usize;
+            let b_bad = dev.new_buffer(n * 4).expect("bad");
+            let b_first = dev.new_buffer(n * 4).expect("first");
+            ffi::dispatch_compute(
+                &queue,
+                &pso,
+                &[&pbuf, &b_bad, &b_first],
+                ffi::MtlSize {
+                    width: n,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+            .expect("udiv parity dispatch completes");
+            // SAFETY: `dispatch_compute` blocked on `waitUntilCompleted`, so every GPU write to these shared buffers has landed.
+            let (bad, first) =
+                unsafe { (ffi::buffer_u32s(&b_bad, n), ffi::buffer_u32s(&b_first, n)) };
+            for (i, (&bad, &first)) in bad.iter().zip(&first).enumerate() {
+                let d = d0 + i as u32;
+                assert_eq!(
+                    bad,
+                    0,
+                    "udiv_small disagrees with the integer divide {bad} times at divisor {d}, first \
+                     at {first} / {d} = {}",
+                    first / d
+                );
+            }
+            divisors += u64::from(count);
+        }
+        assert_eq!(
+            divisors,
+            u64::from(D_EVERY + D_EDGE),
+            "the sweep covers every divisor"
+        );
     }
 
     /// The 32-byte `Probe` uniform in `shaders/state_probe.metal`: `float4`

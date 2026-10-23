@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 
 //! The history verbs (design §10.2): `rev`, `log`, `compare`, `branches` and `tags`.
 
@@ -18,11 +17,8 @@ use crate::page::{End, Listing};
 use crate::policy::Access;
 use crate::slug::Slug;
 
-/// `log`'s default `--limit`.
 const LOG_LIMIT: usize = 30;
 
-/// A listing's Items answer, each item its raw JSON, with the listing's pages and
-/// consistency on the receipt.
 fn items<T>(
     inv: &Invocation,
     gh: &Github,
@@ -46,9 +42,7 @@ fn items<T>(
 }
 
 /// `agh rev REPO@REF`: the commit the ref names.
-///
 /// # Errors
-///
 /// Usage for no `@REF` or a `:PATH`; NotFound for no such commit.
 pub(crate) fn rev(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
@@ -73,9 +67,7 @@ pub(crate) fn rev(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
 }
 
 /// `agh log REPO[@REF] [--path P] [--since T] [--author L] [--limit N]`: the newest N commits.
-///
 /// # Errors
-///
 /// Usage for a `:PATH` or a bad `--since`; the walk's error.
 pub(crate) fn log(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
@@ -110,7 +102,6 @@ pub(crate) fn log(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     ))
 }
 
-/// The answer for refs that share no history.
 fn unrelated(base: &str, head: &str) -> Value {
     json!({
         "ahead_by": 0u64,
@@ -124,9 +115,7 @@ fn unrelated(base: &str, head: &str) -> Value {
 }
 
 /// `agh compare REPO BASE...HEAD`: compares `base` and `head`.
-///
 /// # Errors
-///
 /// Usage for a range without `...`; Incomplete `CompareCap`; the read's error.
 pub(crate) fn compare(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
@@ -184,9 +173,7 @@ pub(crate) fn compare(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
 }
 
 /// `agh branches REPO`: every branch, sorted by name.
-///
 /// # Errors
-///
 /// The walk's error.
 pub(crate) fn branches(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
@@ -208,9 +195,7 @@ pub(crate) fn branches(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
 }
 
 /// `agh tags REPO`: every tag, sorted by name.
-///
 /// # Errors
-///
 /// The walk's error.
 pub(crate) fn tags(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;

@@ -13,15 +13,9 @@ use aterm_uds::spawnfd::Command;
 /// A wait for something that must happen: a hang detector, never a latency budget.
 pub const HANG: Duration = Duration::from_secs(60);
 
-/// The programs that are a Rust toolchain to the installer: what it resolves
-/// on PATH (`command -v`, and its walk of PATH's dirs for a `targo`).
 const TOOLCHAIN: [&str; 5] = ["cargo", "rustc", "rustup", "targo", "alab-targo"];
 
-/// The system dirs every run's PATH ends with: `/usr/bin:/bin`, unless one of them holds a
-/// [`TOOLCHAIN`] program — a distribution's rustup puts `cargo`, `rustc` and `rustup` in
-/// `/usr/bin`, as on the Linux lane — when it is one folder under [`scratch_root`] linking every
-/// other program of theirs, so a case that hands the installer no toolchain hands it none on any
-/// host.
+/// The system dirs every run's PATH ends with: `/usr/bin:/bin`.
 pub fn system_path() -> &'static str {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
@@ -76,8 +70,7 @@ pub fn install_sh() -> PathBuf {
     root().join("tools/install.sh")
 }
 
-/// The names of install.sh's bootstrap verifier pin
-/// (crates/aterm-bootstrap-verify's `pin::KEYS`).
+/// The names of install.sh's bootstrap verifier pin (crates/aterm-bootstrap-verify's `pin::KEYS`).
 #[cfg_attr(
     not(target_os = "linux"),
     allow(
@@ -92,10 +85,7 @@ pub const VERIFIER_PIN: [&str; 4] = [
     "LINUX_VERIFIER_SHA256_AARCH64",
 ];
 
-/// A copy of install.sh at `rel` under `scratch` with its bootstrap verifier pin emptied,
-/// whatever it pins: the script an architecture with no pinned digest runs, whose verifier
-/// is the embedded one. A test of that verifier's whole run uses it, so committing a pin
-/// changes no such test.
+/// A copy of install.sh at `rel` under `scratch` with its bootstrap verifier pin emptied.
 #[cfg_attr(
     not(target_os = "linux"),
     allow(
@@ -158,8 +148,7 @@ pub fn q(s: &str) -> String {
     quoted
 }
 
-/// Whether curl's `argv` follows redirects: `L` in any short-option cluster (`-L`, `-sSIL`) or
-/// `--location` in either spelling.
+/// Whether curl's `argv` follows redirects.
 pub fn follows_redirects(argv: &[&str]) -> bool {
     argv.iter().any(|arg| match arg.strip_prefix("--") {
         Some(long) => long.starts_with("location"),
@@ -174,8 +163,7 @@ pub fn s(path: &Path) -> &str {
     path.to_str().expect("scratch paths are UTF-8")
 }
 
-/// Where every [`Scratch`] is made: the target dir, unless the Linux verifier would refuse a store
-/// below it.
+/// Where every [`Scratch`] is made.
 pub fn scratch_root() -> &'static Path {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
@@ -203,8 +191,7 @@ pub fn scratch_root() -> &'static Path {
     })
 }
 
-/// A scratch directory, removed on drop, named by its PHYSICAL path (the spelling `pwd -P` and the
-/// installer's own probes print).
+/// A scratch directory.
 pub struct Scratch {
     _dir: aterm_tempfile::TempDir,
     path: PathBuf,
@@ -248,9 +235,7 @@ impl Scratch {
         file
     }
 
-    /// An executable stand-in at `rel` whose body names no per-test path, so every caller shares
-    /// one inode and only the first exec on the machine waits on the system's code assessment
-    /// (`aterm_tempfile::stand_in`).
+    /// An executable stand-in at `rel` whose body names no per-test path.
     pub fn stand_in(&self, rel: &str, body: &str) -> PathBuf {
         let file = self.join(rel);
         if let Some(parent) = file.parent() {
@@ -355,9 +340,7 @@ impl Scratch {
     }
 }
 
-/// The environment of a whole-script run, nothing inherited: the scratch HOME and TMPDIR, zsh, the
-/// system PATH, the app destination inside HOME (never the machine's /Applications), and the
-/// toolset half off (its `aterm pkg` would reach the network) — then `extra` on top, by key.
+/// The environment of a whole-script run.
 pub fn hermetic(home: &Home, extra: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = vec![
         ("HOME".into(), s(&home.home).into()),
@@ -387,8 +370,7 @@ pub fn installer(script: &Path, home: &Home, extra: &[(&str, &str)], args: &[&st
     run(&mut cmd)
 }
 
-/// A shell pipeline `code` run by `/bin/sh -c` in exactly `env`, for the cases whose subject is
-/// what arrives on the installer's stdin.
+/// A shell pipeline `code` run by `/bin/sh -c` in exactly `env`.
 pub fn sh(code: &str, env: &[(&str, &str)]) -> Run {
     let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
     cmd.arg("-c").arg(code).env_clear();
@@ -458,8 +440,7 @@ impl Lib {
         self
     }
 
-    /// Shell code run at this point in the batch's own shell (globals it sets persist), recorded
-    /// with the named globals.
+    /// Shell code run at this point in the batch's own shell (globals it sets persist).
     pub fn call(&mut self, code: impl Into<String>, vars: &[&str]) -> usize {
         self.items.push(Item::Call(
             code.into(),
@@ -571,8 +552,6 @@ fn parse_record(record: &str, code: &str) -> Rec {
     rec
 }
 
-/// Sources the installer in library mode and defines the recorder: every value
-/// is read with builtins, so a call costs no fork beyond its own.
 const DRIVER_PRELUDE: &str = r#"ATERM_INSTALL_LIBRARY_ONLY=1
 . "$1"
 __d="$2"

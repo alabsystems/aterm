@@ -9,7 +9,7 @@ use std::time::Duration;
 /// The development seam that selects [`Timing::FAST`] in a debug build.
 pub const DEV_FAST_TIMERS: &str = aterm_types::domain::ENV_DEV_FAST_TIMERS;
 
-/// A timing value: the factor every routed wait divides its production length by.
+/// A timing value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timing {
     divisor: u32,
@@ -99,8 +99,7 @@ impl Timing {
         self.scale_millis(bounded)
     }
 
-    /// Encode `(self, production_ms, floor_ms)` into a 20-byte little-endian
-    /// wire snapshot (`divisor: u32, production_ms: u64, floor_ms: u64`).
+    /// Encode `(self, production_ms, floor_ms)` into a 20-byte little-endian wire snapshot.
     #[must_use]
     #[inline]
     pub const fn encode_cadence_wire_le(self, production_ms: u64, floor_ms: u64) -> [u8; 20] {
@@ -114,7 +113,7 @@ impl Timing {
     }
 
     /// Decode a 20-byte little-endian cadence snapshot produced by
-    /// [`Self::encode_cadence_wire_le`], accepting only canonical divisors (`1` or `1000`).
+    /// [`Self::encode_cadence_wire_le`], accepting only canonical divisors.
     #[must_use]
     #[inline]
     pub const fn decode_cadence_wire_le(wire: &[u8; 20]) -> Option<(Self, u64, u64)> {
@@ -133,8 +132,7 @@ impl Timing {
         Some((timing, production_ms, floor_ms))
     }
 
-    /// Encode `(self, production_ms, floor_ms)` into a 20-byte big-endian
-    /// wire snapshot (`divisor: u32, production_ms: u64, floor_ms: u64`).
+    /// Encode `(self, production_ms, floor_ms)` into a 20-byte big-endian wire snapshot.
     #[must_use]
     #[inline]
     pub const fn encode_cadence_wire_be(self, production_ms: u64, floor_ms: u64) -> [u8; 20] {
@@ -148,7 +146,7 @@ impl Timing {
     }
 
     /// Decode a 20-byte big-endian cadence snapshot produced by [`Self::encode_cadence_wire_be`],
-    /// accepting only canonical divisors (`1` or `1000`).
+    /// accepting only canonical divisors.
     #[must_use]
     #[inline]
     pub const fn decode_cadence_wire_be(wire: &[u8; 20]) -> Option<(Self, u64, u64)> {
@@ -264,8 +262,6 @@ mod tests {
         assert!(Timing::FAST.is_fast() && !Timing::PRODUCTION.is_fast());
     }
 
-    /// A floored wait: production unchanged, the test value never under the
-    /// floor, and never over the production length.
     #[test]
     fn a_floored_wait_keeps_production_and_its_floor() {
         let (five, second) = (Duration::from_secs(5), Duration::from_secs(1));
@@ -281,7 +277,6 @@ mod tests {
         );
     }
 
-    /// The choice only moves toward fast: once selected, every read agrees.
     #[test]
     fn select_fast_wins_for_the_rest_of_the_process() {
         select_fast();

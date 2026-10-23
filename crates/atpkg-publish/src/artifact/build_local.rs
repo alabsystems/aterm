@@ -1,13 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg-publish build-local <program> <checkout> [--link]`: a native development build
-//! from a checkout's atpkg declaration, never signed or uploaded. It is [`super::pack`]'s
-//! first half (toolchain resolution, metadata read, build, arch check). The artifact lands
-//! under `~/.local/share/aterm/dev-builds/artifacts/` with its `local-build.json` and
-//! `SHA256SUMS`; `--link` hands it to the client's dev-link lane (`atpkg::link`), the only
-//! thing that touches the store. Either [`Policy`] builds with the sealed toolchain's
-//! compiler, and a mutable bootstrap stage is refused.
+//! Native development build from a checkout's atpkg declaration (`atpkg-publish build-local`).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -111,9 +105,7 @@ fn safe_name(s: &str) -> bool {
 ///
 /// # Errors
 ///
-/// A usage error for a bad program name or checkout; a refusal for a mutable bootstrap
-/// stage, a toolchain missing one of its four drivers, tracked source changes, a
-/// bundle-only program or a missing declaration.
+/// Usage error for a bad program name or checkout; refusal for an invalid toolchain or dirty tree.
 pub fn plan(ctx: &Ctx, req: &Request, tools: &dyn Tools) -> Result<Plan> {
     let program = &req.program;
     if !program
@@ -246,7 +238,6 @@ pub fn plan(ctx: &Ctx, req: &Request, tools: &dyn Tools) -> Result<Plan> {
         ("RUSTDOC".into(), tc.bin.join("trustdoc").into()),
         (
             "CARGO_TARGET_DIR".into(),
-            // Named `*.noindex`: Spotlight skips the build with all it holds.
             out.join("targets.noindex").join(program).into(),
         ),
     ];
@@ -278,7 +269,6 @@ fn write(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
     std::fs::write(path, bytes).map_err(|e| Error::io(format!("write {}", path.display()), &e))
 }
 
-/// The one executable the build reported for `bin`.
 fn executable_of(stream: &[u8], bin: &str) -> Option<PathBuf> {
     let mut found: Vec<PathBuf> = String::from_utf8_lossy(stream)
         .lines()
@@ -304,16 +294,13 @@ fn executable_of(stream: &[u8], bin: &str) -> Option<PathBuf> {
     }
 }
 
-/// Run the plan: build, check every bin (one executable each, the host's architecture,
-/// a native startup smoke), and lay the artifact with its record and digests.
+/// Run the plan, check every bin, and lay the artifact with its record and digests.
 ///
 /// # Errors
 ///
-/// The build's failure, a source change during it, an existing artifact, or a bin that
-/// fails a check.
+/// Build failure, source change during the build, existing artifact, or failed bin check.
 pub fn build(ctx: &Ctx, req: &Request, plan: &Plan, tools: &dyn Tools) -> Result<Built> {
     let program = &req.program;
-    // The same lease a pack holds: gc never reclaims the planned toolchain mid-build.
     let _lease = toolchain::lease(
         ctx,
         &plan.sysroot.join("bin"),
@@ -454,8 +441,7 @@ pub fn build(ctx: &Ctx, req: &Request, plan: &Plan, tools: &dyn Tools) -> Result
     })
 }
 
-/// The client's dev-link lane, in-process: the artifact's exposed bins linked under the
-/// store prefix.
+/// Link the artifact's exposed bins under the store prefix.
 ///
 /// # Errors
 ///

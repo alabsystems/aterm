@@ -2030,8 +2030,11 @@ fn the_host_sends_its_tabs_rows_only_when_they_change() {
 
 #[test]
 fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
-    let dir = ScratchDir::new("upgrade-status", "unreadable-records");
-    let o = opts(&dir);
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-upgrade-unreadable-records-")
+        .tempdir()
+        .expect("temp dir");
+    let o = opts(dir.path());
     let tabs = [LiveTab {
         sid: TAB.to_string(),
         fgpgid: Some(7),
@@ -2049,6 +2052,12 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     );
     assert_eq!(next, None);
     assert!(rows_at(&o, NOW).is_empty(), "--status reads no records");
+    let (status, whole) = status_rows_with(&o, NOW, &held, &Aside::default);
+    assert!(status.is_empty());
+    assert!(
+        !whole,
+        "no rows from an unlistable directory is not an all-clear"
+    );
     assert_eq!(
         view.unlisted(),
         Some(state_dir(&o).as_path()),
@@ -2092,7 +2101,17 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
         1,
         "--status reads the one that reads"
     );
+    let (status, whole) = status_rows_with(&o, NOW, &held, &Aside::default);
+    assert_eq!(status.len(), 1, "the readable sibling is still shown");
+    assert_eq!(status[0].session, "aaa");
+    assert!(
+        !whole,
+        "a record that could not be read leaves status incomplete"
+    );
     std::fs::remove_file(&looped).expect("unloop");
+    let (status, whole) = status_rows_with(&o, NOW, &held, &Aside::default);
+    assert_eq!(status.len(), 1);
+    assert!(whole, "readable records and holders make status complete");
     view.refresh_with_keeping(&o, &tabs, NOW, &held, &mut |rows, tabs| {
         sent.push(rows.to_vec());
         kept.push(tabs.to_vec());
@@ -2107,6 +2126,9 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     assert_eq!(sent.len(), 3);
     assert!(sent[2].is_empty(), "no directory: no records, handed over");
     assert_eq!(view.unlisted(), None, "no directory: none named");
+    let (status, whole) = status_rows_with(&o, NOW, &held, &Aside::default);
+    assert!(status.is_empty());
+    assert!(whole, "a missing directory means there are no records");
     std::fs::write(state_dir(&o), b"").expect("a file in the directory's place again");
     view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent.push(rows.to_vec()));
     assert!(view.unlisted().is_some());

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE MACHINE'S OCCUPANCY AS THE HOST READS IT FOR ONE SESSION
-//! (`docs/DESIGN-harness-occupancy-2026-10-20.md` §2, §4.2): what `IdleHost::occupancy`
-//! answers, from the window's facts board taken once a disk look.
+//! THE MACHINE'S OCCUPANCY AS THE HOST READS IT FOR ONE SESSION.
 
 use crate::harness::disk::Level;
 use crate::supervise::memory::Pressure;
@@ -14,8 +12,7 @@ pub const LOOK_EVERY_MS: i64 = 60_000;
 /// A reading older than two board looks no longer speaks for now.
 pub const STALE_AFTER_MS: i64 = 2 * LOOK_EVERY_MS;
 
-/// The build slots as the board last proved them: those proven free less those an orphaned build
-/// still fills, and the slot files present (`slots=<usable>/<n>`).
+/// The build slots as the board last proved them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotsSeen {
     /// Proven free, less those discounted.
@@ -27,8 +24,7 @@ pub struct SlotsSeen {
 /// The board as one session's host reads it ([module docs](self)).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OccupancyReading {
-    /// When the board was taken, unix ms; 0 for none (the empty reading). A board re-read for a
-    /// line's write (`PaceGrant::Room`) is stamped when its oldest figure was read.
+    /// When the board was taken.
     pub taken_ms: i64,
     /// The board's snapshot is older than two looks, or there is none.
     pub stale: bool,
@@ -40,11 +36,9 @@ pub struct OccupancyReading {
     pub disk: Option<Level>,
     /// The build slots, where read.
     pub slots: Option<SlotsSeen>,
-    /// How long `hold-room`'s slot term has held on the board's looks, ms: `Some` once that spans
-    /// its `for=`, `None` before and whenever a look broke it.
+    /// How long `hold-room`'s slot term has held on the board's looks.
     pub slots_free_ms: Option<u64>,
-    /// `hold-room`'s machine terms at the look: `None` where the board could not judge them (a term
-    /// this host does not measure, no snapshot).
+    /// `hold-room`'s machine terms at the look.
     pub room: Option<bool>,
     /// The last look at which a build slot's holder lay in this session's process tree, unix ms.
     pub held_slot_last_ms: Option<i64>,
@@ -64,11 +58,7 @@ impl OccupancyReading {
         self.taken_ms > 0 && !self.stale
     }
 
-    /// Whether the reading's figures may be typed at `at_ms` (unix): it speaks for now, and it
-    /// was read no more than [`FACT_FRESH_MS`] before `at_ms` (a reading stamped after it is no
-    /// older). `None`, a clock that cannot be read: never.
-    ///
-    /// [`FACT_FRESH_MS`]: crate::supervise::facts::FACT_FRESH_MS
+    /// Whether the reading's figures may be typed at `at_ms` (unix).
     #[must_use]
     pub fn typeable_at(&self, at_ms: Option<i64>) -> bool {
         self.fresh()
@@ -78,7 +68,7 @@ impl OccupancyReading {
     }
 
     /// Whether a slot holder of this session's was seen within the last `held_ms` before the board
-    /// was taken: a hold that has held `held_ms` saw it during the hold.
+    /// was taken.
     #[must_use]
     pub fn held_slot_within(&self, held_ms: i64) -> bool {
         self.held_slot_last_ms

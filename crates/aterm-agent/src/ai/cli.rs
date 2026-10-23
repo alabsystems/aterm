@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm ai`: status, doctor, login, review and fleet.
+//! The `aterm ai` command.
 
 use std::ffi::OsString;
 use std::io::{self, Read as _, Write};
@@ -165,8 +165,6 @@ pub struct Look {
     pub held: Option<Held>,
 }
 
-/// The asking agent's level, and why: a person, with no agent among the ancestors, may do
-/// anything.
 fn inherited(asker: Asker) -> Result<(Level, String), &'static str> {
     match asker {
         Asker::Agent(id, level) => Ok((level, format!("inherited from {id}"))),
@@ -185,14 +183,13 @@ pub fn review_level(s: &Settings, asker: Asker) -> Result<(Level, String), &'sta
     }
 }
 
-/// What the cache holds of the URL `[ai] fleet` names, under its pinned key.
 fn held_of(s: &Settings, ai_dir: Option<&Path>) -> Option<Held> {
     let url = s.fleet_source.as_deref().filter(|u| fleet::is_url(u))?;
     let key = s.fleet_key.as_deref().unwrap_or_default();
     fleet::held_state(ai_dir?).filter(|h| h.of(url, key))
 }
 
-/// Fetches the fleet document from the URL `[ai] fleet` names: when due, or now with `force`.
+/// Fetches the fleet document from the URL `[ai] fleet` names.
 pub fn fleet_fetch(env: &Env, fetcher: &dyn Fetcher, force: bool) -> Option<Fetched> {
     let text = env.config.as_deref().and_then(|p| {
         crate::harness::accounts::read_bounded(p, config::CONFIG_MAX_BYTES)
@@ -271,7 +268,6 @@ pub fn look(env: &Env) -> Look {
 }
 
 const LABEL_W: usize = 12;
-/// The most of what the asker wants checked, read from stdin (`review -`).
 const WORDS_MAX: usize = 16 * 1024;
 const STATE_W: usize = 15;
 
@@ -279,7 +275,7 @@ fn pad(s: &str, w: usize) -> String {
     format!("{s:<w$}")
 }
 
-/// The look as text; `fixes` adds the fix under each row that warns or fails.
+/// The doctor's text.
 pub fn render_text(out: &mut dyn Write, look: &Look, fixes: bool, next: &str) {
     let s = &look.settings;
     let from = |f: config::From| match f {
@@ -342,7 +338,6 @@ pub fn render_text(out: &mut dyn Write, look: &Look, fixes: bool, next: &str) {
     let _ = writeln!(out, "\nhealth: {}", h.line(next));
 }
 
-/// The reviewers a review asks by default: the listed ones used here, less the asker.
 fn default_reviewers<'s>(s: &'s Settings, asker: &str) -> Vec<&'s str> {
     s.reviewers
         .0
@@ -352,8 +347,7 @@ fn default_reviewers<'s>(s: &'s Settings, asker: &str) -> Vec<&'s str> {
         .collect()
 }
 
-/// The asking CLI when no `--from` names it: the agent among the ancestors, else the agent's
-/// own variables, else the preferred CLI.
+/// The asking CLI (`--from`, ancestor agent, environment, or preferred CLI).
 fn asker_id(env: &Env, s: &Settings) -> &'static str {
     if let Some((id, _)) = env.asker.agent() {
         return id;
@@ -367,7 +361,6 @@ fn asker_id(env: &Env, s: &Settings) -> &'static str {
     }
 }
 
-/// The text's `reviews:` line.
 fn reviews_line(look: &Look) -> String {
     let s = &look.settings;
     if !s.reviews.0 {
@@ -391,7 +384,6 @@ fn reviews_line(look: &Look) -> String {
     )
 }
 
-/// What is held of a fleet document from a URL, in a few words.
 fn held_words(held: Option<&Held>, key: Option<&str>) -> String {
     let signer = key.map_or(String::new(), |k| {
         format!(" · signer {}…", fleet::fingerprint(k))
@@ -421,7 +413,7 @@ fn rfc(n: Option<i64>) -> Value {
         })
 }
 
-/// The look as one JSON object.
+/// The doctor's one JSON object.
 #[must_use]
 pub fn render_json(look: &Look, now: i64, next: &str) -> String {
     let s = &look.settings;
@@ -556,7 +548,6 @@ pub fn render_json(look: &Look, now: i64, next: &str) -> String {
     aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
 }
 
-/// Whether this run may fix: a person at a terminal, not an agent, not `--read-only`.
 fn may_fix(env: &Env, read_only: bool) -> Result<(), String> {
     if read_only {
         return Err("--read-only".to_string());
@@ -624,7 +615,6 @@ fn done_line(c: &Connector, done: &Done) -> String {
     }
 }
 
-/// The one act the health line names.
 fn next_act(env: &Env, read_only: bool) -> &'static str {
     match may_fix(env, read_only) {
         Ok(()) => "aterm ai doctor",
@@ -635,7 +625,6 @@ fn next_act(env: &Env, read_only: bool) -> &'static str {
     }
 }
 
-/// Installs `id` with `aterm pkg install`, on this terminal.
 fn install(env: &Env, runner: &dyn Runner, id: &str) -> Result<(), String> {
     let exe = env.exe.clone().ok_or("this program's path is unknown")?;
     let args = vec!["pkg".to_string(), "install".to_string(), id.to_string()];
@@ -646,7 +635,6 @@ fn install(env: &Env, runner: &dyn Runner, id: &str) -> Result<(), String> {
     }
 }
 
-/// `aterm ai doctor` on this machine.
 fn doctor_here(
     env: &Env,
     runner: &dyn Runner,
@@ -739,7 +727,6 @@ fn exit_of(rows: &[Row]) -> ExitCode {
     }
 }
 
-/// The machines `--on` / `--fleet` name, validated.
 fn machines(env: &Env, on: Option<&[String]>) -> Result<Vec<(String, String)>, String> {
     let hosts = match on {
         Some(on) => on.to_vec(),
@@ -761,7 +748,6 @@ fn ssh_program() -> PathBuf {
     PathBuf::from("/usr/bin/ssh")
 }
 
-/// The closed state words a remote doctor's JSON gives, by CLI: never its free text.
 fn remote_states(json: &str) -> Option<Vec<(String, String)>> {
     let v: Value = aterm_json::from_str(json).ok()?;
     let mut out = Vec::new();
@@ -790,14 +776,10 @@ fn remote_states(json: &str) -> Option<Vec<(String, String)>> {
     Some(out)
 }
 
-/// One machine's closed state words, by CLI id.
 type States = Vec<(String, String)>;
 
-/// The words that count a CLI as working on a machine.
 const WORKING: &[&str] = &["ok", "idle", "limited", "due"];
 
-/// Reads every machine read-only: this one's look, and each host's closed state words over
-/// `ssh -T -o BatchMode=yes`; then the coverage per CLI. Signs in nowhere.
 fn fleet_poll(
     env: &Env,
     runner: &dyn Runner,
@@ -945,7 +927,6 @@ fn fleet_poll(
     }
 }
 
-/// `aterm ai doctor --on <hosts>` or `--fleet`.
 fn doctor_away(
     env: &Env,
     runner: &dyn Runner,
@@ -1002,7 +983,6 @@ fn csv(v: &str) -> Vec<String> {
         .collect()
 }
 
-/// `aterm ai login <id>`.
 fn login_verb(
     env: &Env,
     runner: &dyn Runner,
@@ -1130,7 +1110,6 @@ fn parse_review(args: &[String]) -> Result<ReviewArgs, String> {
     Ok(r)
 }
 
-/// `aterm ai review`.
 fn review_verb(
     env: &Env,
     runner: &dyn Runner,
@@ -1330,10 +1309,8 @@ fn review_verb(
     }
 }
 
-/// The largest secret key file read.
 const SECRET_MAX: u64 = 4096;
 
-/// A secret key file's PKCS#8 bytes: base64 text (what `keygen` writes) or raw.
 fn secret_of(path: &Path) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
     let file =
@@ -1364,7 +1341,6 @@ fn secret_of(path: &Path) -> Result<Vec<u8>, String> {
         .unwrap_or(raw))
 }
 
-/// The bytes of a fleet document named on the command line, bounded.
 fn doc_of(path: &Path) -> Result<Vec<u8>, String> {
     crate::harness::accounts::read_bounded(path, config::FLEET_MAX_BYTES)
         .map_err(|e| crate::harness::one_line(&format!("{e:?}"), 120))?
@@ -1378,7 +1354,6 @@ fn sig_path(doc: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// `aterm ai fleet status`.
 fn fleet_status(env: &Env, out: &mut dyn Write) -> ExitCode {
     let l = look(env);
     let s = &l.settings;
@@ -1447,7 +1422,6 @@ fn fleet_status(env: &Env, out: &mut dyn Write) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `aterm ai fleet keygen <secret-key-file>`.
 fn fleet_keygen(path: &Path, out: &mut dyn Write) -> Result<(), String> {
     use std::io::Write as _;
     let (secret, public) = fleet::keygen()?;
@@ -1481,7 +1455,6 @@ fn fleet_keygen(path: &Path, out: &mut dyn Write) -> Result<(), String> {
     Ok(())
 }
 
-/// `aterm ai fleet sign <doc> --key <secret-key-file>`.
 fn fleet_sign(doc: &Path, key: &Path, out: &mut dyn Write) -> Result<(), String> {
     let bytes = doc_of(doc)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| "the document is not UTF-8")?;
@@ -1520,7 +1493,6 @@ fn fleet_sign(doc: &Path, key: &Path, out: &mut dyn Write) -> Result<(), String>
     Ok(())
 }
 
-/// `aterm ai fleet verify <doc> [--key <public-key>]`.
 fn fleet_verify(
     env: &Env,
     doc: &Path,
@@ -1559,7 +1531,6 @@ fn fleet_verify(
     Ok(())
 }
 
-/// `aterm ai fleet …`.
 fn fleet_verb(
     env: &Env,
     fetcher: &dyn Fetcher,

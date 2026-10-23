@@ -240,6 +240,22 @@ pub struct CursorRainbow {
 }
 
 impl CursorRainbow {
+    /// Reset animation state while preserving pooled scratch buffers and the rim LUT memo.
+    #[inline]
+    pub fn reset(&mut self) {
+        let mut rim_scratch = std::mem::take(&mut self.rim_scratch);
+        rim_scratch.clear();
+        let mut settle_sink = std::mem::take(&mut self.settle_sink);
+        settle_sink.clear();
+        let rim_memo = self.rim_memo;
+        *self = Self {
+            rim_scratch,
+            rim_memo,
+            settle_sink,
+            ..Self::default()
+        };
+    }
+
     /// Whether the host must keep arming the animation tick.
     #[must_use]
     #[inline]

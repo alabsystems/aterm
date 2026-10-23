@@ -6,7 +6,6 @@
 
 use super::*;
 
-/// What `parser` delivers for `bytes` cut at every byte, and one byte at a time.
 fn feed_every_way(c1: bool, bytes: &[u8]) -> RecordingSink {
     let fresh = || {
         let mut parser = Parser::new();
@@ -33,7 +32,6 @@ fn feed_every_way(c1: bool, bytes: &[u8]) -> RecordingSink {
     whole
 }
 
-/// `payload` in tmux's passthrough wrapper.
 fn wrapped(payload: &[u8]) -> Vec<u8> {
     let mut out = b"\x1bPtmux;".to_vec();
     for &byte in payload {
@@ -46,7 +44,6 @@ fn wrapped(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The payloads a program wraps.
 const PAYLOADS: [&[u8]; 9] = [
     b"\x1bP$qm\x1b\\",
     b"\x1bP+q544E\x1b\\",
@@ -59,11 +56,6 @@ const PAYLOADS: [&[u8]; 9] = [
     b"\x1bP$qm\x9c",
 ];
 
-/// THE WRAPPER IS A TRANSPORT. Each payload wrapped reads exactly as it reads
-/// bare — the same prints, dispatches, hooks, puts and ends, the DCS ended
-/// at ST complete — with text before and after, however the bytes are cut,
-/// in both C1 modes. tmux 3.5a, given these wrappers with `allow-passthrough
-/// on`, writes exactly the bare payloads to its own terminal.
 #[test]
 fn a_wrapped_sequence_reads_as_it_reads_bare() {
     for c1 in [false, true] {
@@ -86,10 +78,6 @@ fn a_wrapped_sequence_reads_as_it_reads_bare() {
     }
 }
 
-/// A string the payload leaves open ends with its wrapper, as at its ST, and
-/// what follows the wrapper reads from Ground: a title is set, a query is
-/// ended at ST, and the text after prints. Behind tmux the string would run on
-/// into whatever tmux wrote next.
 #[test]
 fn a_string_left_open_ends_with_its_wrapper() {
     for c1 in [false, true] {
@@ -105,11 +93,6 @@ fn a_string_left_open_ends_with_its_wrapper() {
     }
 }
 
-/// An `ESC \` the program did not double ends its own string as it ends the
-/// wrapper, so an ST-ended sequence wrapped by a program that doubled nothing
-/// still runs, and the text after it prints, as before the unwrap (its ESC
-/// broke the wrapper off). RED before: the wrapper's end left the payload's
-/// OSC open, which swallowed the text after it.
 #[test]
 fn an_st_the_program_did_not_double_ends_its_string() {
     for c1 in [false, true] {
@@ -126,10 +109,6 @@ fn an_st_the_program_did_not_double_ends_its_string() {
     }
 }
 
-/// RIS (`ESC c`) resets the parser whole, the wrapper it arrives in included,
-/// whether the program doubled its ESC or not: what follows reads as bare, an
-/// ST-ended title and the text after it too. RED before: the wrapper stayed
-/// open, and the title's ST ended it instead of the title.
 #[test]
 fn a_reset_ends_the_wrapper() {
     for c1 in [false, true] {
@@ -156,11 +135,6 @@ fn a_reset_ends_the_wrapper() {
     }
 }
 
-/// Negative control: the comparison above tells the two apart. The same
-/// wrapper with a head that is not `tmux;` is an ignored DCS, which its
-/// doubled ESC breaks off, and the payload's doubled ST breaks the payload's
-/// DCS off: the query is canceled, never ended at ST, exactly as every
-/// wrapper read before the unwrap.
 #[test]
 fn a_head_that_is_not_tmux_is_an_ignored_dcs() {
     for c1 in [false, true] {
@@ -183,9 +157,6 @@ fn a_head_that_is_not_tmux_is_an_ignored_dcs() {
     }
 }
 
-/// An ESC the program did not double keeps both bytes: such a sequence ran
-/// before the unwrap (its ESC broke the wrapper off) and still runs. tmux
-/// drops that ESC and forwards the rest as text (measured: `] 2 ; t BEL`).
 #[test]
 fn an_escape_the_program_did_not_double_keeps_its_sequence() {
     for c1 in [false, true] {
@@ -195,9 +166,6 @@ fn an_escape_the_program_did_not_double_keeps_its_sequence() {
     }
 }
 
-/// CAN, SUB and the 8-bit ST are payload, as tmux forwards them: they act on
-/// the payload's own sequence and leave the wrapper open, so a later doubled
-/// ESC is still one ESC and the text after the wrapper's `ESC \` prints.
 #[test]
 fn a_cancel_inside_the_wrapper_cancels_the_payload_not_the_wrapper() {
     for c1 in [false, true] {
@@ -208,9 +176,6 @@ fn a_cancel_inside_the_wrapper_cancels_the_payload_not_the_wrapper() {
     }
 }
 
-/// A wrapper inside a wrapper is unwrapped once: the inner `ESC P tmux;` is
-/// a DCS the sink ignores, broken off by its own doubled ESC, which then
-/// begins the payload as it did before the unwrap.
 #[test]
 fn a_wrapper_inside_a_wrapper_is_unwrapped_once() {
     let mut parser = Parser::new();
@@ -226,10 +191,6 @@ fn a_wrapper_inside_a_wrapper_is_unwrapped_once() {
     );
 }
 
-/// Where a wrapper stands, and what ends it from there: a `CAN`, which ends
-/// what the payload left torn (canceled, never ended at ST) and the head of a
-/// wrapper not yet open, then `ESC \` while one is open. What follows reads
-/// from Ground.
 #[test]
 fn a_cancel_then_st_end_the_wrapper_from_where_it_stands() {
     for (head, stands) in [
@@ -265,11 +226,6 @@ fn a_cancel_then_st_end_the_wrapper_from_where_it_stands() {
     }
 }
 
-/// A carry taken at any byte of a wrapped stream continues in the successor
-/// exactly as the live parser goes on: the wrapper's head, the open wrapper
-/// and the ESC it waits on travel with the payload's own state. Where the
-/// payload's DCS is hooked, no `carry` exists (the handler holds the
-/// string), as without a wrapper.
 #[test]
 fn a_carry_inside_a_wrapper_continues_in_the_successor() {
     let stream = [
@@ -315,8 +271,6 @@ fn a_carry_inside_a_wrapper_continues_in_the_successor() {
     }
 }
 
-/// A head carried anywhere but in the ignored DCS its `ESC P t` began, or
-/// past four bytes, is refused.
 #[test]
 fn a_head_outside_its_ignored_dcs_is_refused() {
     for (state, tmux) in [

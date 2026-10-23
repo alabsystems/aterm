@@ -14,8 +14,7 @@ pub enum CheckerPhase {
     Starting,
     /// Asking the host for the current channel and policy, or pausing after it did not answer.
     Settings,
-    /// Reading the bundle under this executable and, when it is newer, running the codesign policy
-    /// on it (bounded by the helper timeout).
+    /// Reading the bundle under this executable and verifying its signature when newer.
     BundleProbe,
     /// Waiting for the machine-wide `checker.lock` (bounded by [`CHECKER_LOCK_WAIT`]).
     LockWait,
@@ -82,8 +81,7 @@ impl CheckerPhase {
 /// How long one cycle waits for the machine-wide `checker.lock` before recording a deferral.
 pub const CHECKER_LOCK_WAIT: Duration = Duration::from_secs(60);
 
-/// After how many consecutive cycles behind a `checker.lock` held past [`CHECKER_LOCK_WAIT`] by a
-/// holder showing no progress a process checks without the lock.
+/// Consecutive stalled `checker.lock` deferrals past [`CHECKER_LOCK_WAIT`] before checking ungated.
 pub const CHECKER_UNGATED_AFTER: u64 = 3;
 
 /// The longest a check may run between two heartbeats: its non-download steps, each bounded.
@@ -149,15 +147,13 @@ pub struct CheckerBeat {
     pub max_interval_secs: u64,
     /// Replacement threads this process has started.
     pub respawns: u64,
-    /// Consecutive cycles that deferred to a `checker.lock` held past [`CHECKER_LOCK_WAIT`] by a
-    /// holder showing no progress; 0 while the holder is seen working.
+    /// Consecutive cycles deferred to an unresponsive `checker.lock` holder (`0` while active).
     pub deferrals: u64,
     /// Consecutive times the host did not answer the settings query.
     pub settings_misses: u64,
     /// The loop generation holding this process's check lane, with its phase and stamp.
     pub lane: Option<LaneHolder>,
-    /// Checks the loop completed in this process (any generation or result, sibling skips
-    /// included): how the window's watchdog sees a replacement checking again.
+    /// Completed check cycles in this process across all generations.
     pub checks: u64,
 }
 
@@ -166,16 +162,14 @@ pub struct CheckerBeat {
 pub struct LaneHolder {
     /// The holding generation.
     pub generation: u64,
-    /// Its phase: [`CheckerPhase::LockWait`] from the moment it took the lane, or, once it was
-    /// retired, the phase it stalled in.
+    /// [`CheckerPhase::LockWait`] while active, or the stalled phase once retired.
     pub phase: CheckerPhase,
     /// [`now_secs`] running seconds: when it took the lane, or its last stamp.
     pub at_secs: u64,
 }
 
 impl CheckerBeat {
-    /// The retired generation still holding this process's check lane, if the live checker is stuck
-    /// behind one: a replacement cannot check until it lets go.
+    /// Retired generation still holding this process's check lane, if any.
     #[inline]
     #[must_use]
     pub fn blocked_by(&self) -> Option<LaneHolder> {
@@ -200,8 +194,7 @@ pub enum CheckerVerdict {
         /// Running seconds until the stamp crosses its threshold.
         stale_in_secs: u64,
     },
-    /// Not stamped for `for_secs` running seconds, past twice its phase's budget plus
-    /// [`STALL_SLACK`].
+    /// Unstamped for `for_secs` running seconds, past twice the phase budget plus [`STALL_SLACK`].
     Stalled {
         /// Running seconds since the last stamp.
         for_secs: u64,
@@ -263,20 +256,18 @@ pub fn standing_stall(beat: &CheckerBeat, now_secs: u64) -> Option<(u64, Checker
         .map(|holder| (now_secs.saturating_sub(holder.at_secs), holder.phase))
 }
 
-/// The heartbeat.
+/// Atomic heartbeat state for the update checker.
 pub struct CheckerWatch {
     /// `generation << 48 | phase << 40 | running secs`.
     beat: AtomicU64,
-    /// The check lane's loop holder, packed the same way; `0` while none holds
-    /// it ([`Self::hold_lane`], [`CheckerBeat::lane`]).
+    /// Packed check-lane holder (`0` when unheld; see [`Self::hold_lane`]).
     lane: AtomicU64,
     max_interval: AtomicU64,
     respawns: AtomicU64,
     deferrals: AtomicU64,
     settings_misses: AtomicU64,
     checks: AtomicU64,
-    /// Optional host event-loop wake on a phase change; progress stamps never call it,
-    /// so an idle window is not woken per download report.
+    /// Optional host event-loop wake invoked on phase transitions.
     phase_wake: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
@@ -360,8 +351,7 @@ impl CheckerWatch {
         generation_of(self.beat.load(Ordering::Acquire)) == generation
     }
 
-    /// Publish the loop's longest legitimate wait between stamps, restated every cycle from
-    /// `Cadence::max_wait`.
+    /// Publishes the loop's maximum wait interval between stamps (`Cadence::max_wait`).
     pub fn set_max_interval(&self, generation: u64, secs: u64) {
         if self.is_current(generation) {
             self.max_interval.store(secs, Ordering::Relaxed);
@@ -382,8 +372,7 @@ impl CheckerWatch {
         }
     }
 
-    /// Record `generation` as the check lane's holder until the returned mark drops, where the
-    /// cycle lets go of the lane.
+    /// Marks `generation` as holding the check lane until the returned [`LaneMark`] drops.
     #[must_use = "the lane is marked held only while the mark lives"]
     pub fn hold_lane(&self, generation: u64) -> LaneMark<'_> {
         self.lane.store(
@@ -560,10 +549,6 @@ mod tests {
     /// The loop's longest wait, as it registers it (`cadence_bounds::LONGEST_WAIT`).
     const LONGEST: u64 = crate::cadence_bounds::LONGEST_WAIT.as_secs();
 
-    /// Each phase is judged against its own budget: a waiting loop may be quiet for
-    /// twice the loop's longest wait, a lock wait only for twice its bound, and a check
-    /// for twice the longest non-download step — so a checker parked on a lock is called
-    /// out in minutes.
     #[test]
     fn a_stamp_is_stale_past_twice_its_phase_budget_plus_slack_and_not_before() {
         let slack = STALL_SLACK.as_secs();
@@ -613,8 +598,6 @@ mod tests {
         ));
     }
 
-    /// A phase change wakes the host so it can fold the shorter deadline; same-phase stamps
-    /// and download progress do not wake an idle window.
     #[test]
     fn phase_change_wakes_host_to_replace_an_older_long_deadline() {
         let watch = CheckerWatch::new();
@@ -688,8 +671,6 @@ mod tests {
         assert!(watch.supersede(live).is_some(), "the slot is spent again");
     }
 
-    /// A generation stalled in its check holds the lane its replacement can never take; the
-    /// lane keeps the holder's last stamp so the stall stays standing until it lets go.
     #[test]
     fn a_retired_generation_holding_the_lane_keeps_its_stall_standing_until_it_lets_go() {
         let watch = CheckerWatch::new();

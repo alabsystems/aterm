@@ -273,12 +273,6 @@ impl Grid {
         self.mirror_wide_spacer_extras(row_idx);
     }
 
-    /// Give every wide lead's continuation spacer the lead's rendition-valued
-    /// extras: the deferred-fill counterpart of `scroll_materialize`'s
-    /// `mirror_wide_spacer_extras`, which explains the rule. `fill_row_cells`
-    /// emits truecolor fg/bg and SGR 58 colour for the lead's column only.
-    /// Collects `(lead, spacer)` pairs while the row is borrowed, then writes;
-    /// `cell_extra_mut` sets the HAS_EXTRAS bit the render path gates on.
     fn mirror_wide_spacer_extras(&mut self, row_idx: u16) {
         let Some(idx) = self.storage.row_index(row_idx) else {
             return;
@@ -331,7 +325,6 @@ impl Grid {
     }
 }
 
-/// Deferred extra to apply after the row borrow is released.
 enum DeferredExtra {
     /// Combining marks on a BMP base, attached via `add_combining`.
     CombiningMarks(u16, aterm_alloc::SmallVec<char, 4>),
@@ -343,11 +336,6 @@ enum DeferredExtra {
     RgbBg(u16, [u8; 3]),
 }
 
-/// Populate row cells from a line's text (phase 1), returning the deferred
-/// extras and how far the fill reached: the line's cells are the first
-/// `filled`, and none past them holds anything of it ([`filled_span_cols`]).
-/// A BMP unit is a plain cell, a BMP base with combining marks defers the
-/// marks, and a non-BMP or ZWJ unit becomes a complex cell.
 fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> (Vec<DeferredExtra>, u16) {
     use crate::{CellFlags, PackedColor};
 
@@ -383,15 +371,12 @@ fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> (Vec<Def
     (deferred, col)
 }
 
-/// Bundled style for a cell being placed from a scrollback Line.
 struct LineCellStyle {
     fg: crate::PackedColor,
     bg: crate::PackedColor,
     flags: crate::CellFlags,
 }
 
-/// Classify and place one grapheme unit (`unit_str`, `chars_consumed` chars);
-/// returns the new column and any extra to apply after the row borrow.
 fn place_line_cell(
     row: &mut Row,
     col: u16,
@@ -426,7 +411,6 @@ fn place_line_cell(
     }
 }
 
-/// Set a normal (non-complex) cell, handling wide chars.
 fn set_cell(row: &mut Row, col: u16, cols: u16, c: char, s: &LineCellStyle, is_wide: bool) -> u16 {
     use crate::CellFlags;
     let flags = if is_wide {
@@ -449,7 +433,6 @@ fn set_cell(row: &mut Row, col: u16, cols: u16, c: char, s: &LineCellStyle, is_w
     }
 }
 
-/// Set a complex cell (non-BMP, ZWJ sequence, etc.), deferring its string.
 fn set_complex_cell(
     row: &mut Row,
     col: u16,
@@ -488,8 +471,6 @@ fn set_complex_cell(
     }
 }
 
-/// Apply deferred extras (combining marks, complex chars, RGB colours) to the
-/// grid's extras.
 fn apply_deferred_extras(extras: &mut CellExtras, row_idx: u16, deferred: Vec<DeferredExtra>) {
     for extra in deferred {
         match extra {
@@ -523,9 +504,6 @@ mod tests {
     use super::*;
     use aterm_scrollback::{CellAttrs, Line, Rle};
 
-    /// `fill_row_from_line` replaces the target row with the line's text,
-    /// truncated to the width, blank past it, with the line's wrap flag; other
-    /// rows (and an out-of-range target) are untouched.
     #[test]
     fn fill_row_from_line_replaces_exactly_its_row() {
         let text = |grid: &Grid, row: u16| -> String {
@@ -601,9 +579,6 @@ mod tests {
         }
     }
 
-    /// A glyph the row cannot hold (a wide unit in a one-column row, or at the
-    /// last column) takes its link and underline colour with it, in both fills;
-    /// the cells before it keep theirs.
     #[test]
     fn a_glyph_the_row_cannot_hold_takes_its_link_and_underline_colour() {
         use aterm_scrollback::{HyperlinkSpan, UnderlineColorSpan};

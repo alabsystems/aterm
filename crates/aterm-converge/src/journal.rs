@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `<state_dir>/converge/journal.ndjson`: one line per change, flushed to stable media before applying.
+//! `<state_dir>/converge/journal.ndjson`: one line per change, flushed to stable media before
+//! applying.
 
 use crate::engine::Journal;
 use serde::Serialize;
@@ -10,7 +11,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Bounded NDJSON change journal (`{"time", "id", "from", "to", "revert"}`) with single-rotation locking.
+/// Bounded NDJSON change journal (`{"time", "id", "from", "to", "revert"}`) with single-rotation
+/// locking.
 #[derive(Debug, Clone)]
 pub struct FileJournal {
     dir: PathBuf,
@@ -136,7 +138,6 @@ impl Journal for FileJournal {
     }
 }
 
-/// The journal's folder, owner-only where modes exist.
 fn make_dir(dir: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -145,15 +146,9 @@ fn make_dir(dir: &Path) -> io::Result<()> {
     builder.create(dir)
 }
 
-/// The journal's lock, held exclusively from [`Held::take`] until it drops, which releases
-/// it by `LOCK_UN` before the close (clippy.toml: the flock release rule; a child forked
-/// meanwhile would keep a lock the close alone let go).
 struct Held(File);
 
 impl Held {
-    /// `path` (created owner-only where modes exist), locked, waiting up to `wait` for
-    /// another writer. A filesystem that keeps no locks refuses, and so does the line and
-    /// its change: a journal two writers can rotate under each other keeps no promise.
     fn take(path: &Path, wait: Duration) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
@@ -193,7 +188,6 @@ impl Drop for Held {
     }
 }
 
-/// The journal, opened to append, created owner-only where modes exist.
 fn open_append(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.append(true).create(true);
@@ -220,7 +214,6 @@ mod tests {
         }
     }
 
-    /// [`Scripted`] whose apply first reads the journal and keeps what it found.
     struct Peeks {
         inner: Scripted,
         journal: PathBuf,

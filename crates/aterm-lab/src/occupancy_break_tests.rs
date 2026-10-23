@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for `occupancy-break-claude`: all of it but the run, which needs a real Claude Code (its
-//! listing, its lab's `aterm.toml` and seam, the stub's script, its promotion, and its judge over
-//! a synthetic recording).
+//! Tests for `occupancy-break-claude`: all of it but the run, which needs a real Claude Code.
 
 use std::path::Path;
 
@@ -15,8 +13,6 @@ use super::*;
 use crate::scn::{Plan, scenarios};
 use crate::stub::{ToolTurn, tool_turn};
 
-/// The rows Claude Code draws waiting on one workflow (`aterm-phase`'s capture), the capture's
-/// own header and exit lines left out.
 fn workflow_screen() -> Vec<String> {
     include_str!("../../aterm-phase/src/fixtures/wait_bg.out")
         .lines()
@@ -25,7 +21,6 @@ fn workflow_screen() -> Vec<String> {
         .collect()
 }
 
-/// [`workflow_screen`] with its workflow gone: no status row and no footer row for it.
 fn done_screen() -> Vec<String> {
     workflow_screen()
         .into_iter()
@@ -33,8 +28,6 @@ fn done_screen() -> Vec<String> {
         .collect()
 }
 
-/// THE SCENARIO IS LISTED ONCE, with its `[harness]` lines, its instance's seam and its plan, as
-/// `lab scn run occupancy-break-claude` finds it.
 #[test]
 fn the_scenario_is_listed_with_its_lab() {
     let listed: Vec<_> = scenarios().into_iter().filter(|s| s.name == NAME).collect();
@@ -53,9 +46,6 @@ fn the_scenario_is_listed_with_its_lab() {
     );
 }
 
-/// THE LAB'S SCRATCH `aterm.toml` GRANTS PROMPT: its `[harness]` lines land under the root
-/// `[harness]` table, where the owner's key reaches `prompt`, under `cruise` with a 5 s grace.
-/// NEGATIVE CONTROL: the same lab without the scenario's lines reads `observe`, and no grant.
 #[test]
 fn its_scratch_aterm_toml_grants_prompt_under_cruise() {
     let (cfg, notes) =
@@ -68,8 +58,6 @@ fn its_scratch_aterm_toml_grants_prompt_under_cruise() {
     assert_ne!(plain.occupancy, Occupancy::Prompt);
 }
 
-/// THE INSTANCE GETS THE NUDGE'S SEAM AT A MINUTE: `LAB_INSTANCE_ENV` takes the scenario's words
-/// as the seam's name and [`NUDGE_S`].
 #[test]
 fn its_instance_gets_the_nudge_seam_at_a_minute() {
     assert_eq!(
@@ -78,7 +66,6 @@ fn its_instance_gets_the_nudge_seam_at_a_minute() {
     );
 }
 
-/// A request body of `messages`.
 fn body(messages: Vec<J>) -> Vec<u8> {
     J::obj([("messages", J::Arr(messages))])
         .dump(COMPACT)
@@ -128,12 +115,6 @@ fn result(text: &str) -> J {
     ])
 }
 
-/// THE STUB PLAYS THE AGENT FROM THE SCRIPT, as its `tool` mode reads it from the lab's file:
-/// the main thread calls `Workflow` with the script, says it started, and answers the nudge with
-/// a declaration the `WAITING:` reader takes; a step's subagent, its first message under the
-/// mark, sleeps and says so. NEGATIVE CONTROL: a main thread with no `toolstart` is not the
-/// script's, and the task never carries the steps' mark (so the main thread is never answered as
-/// a step).
 #[test]
 fn the_stub_plays_the_agent_from_the_script() {
     let script = J::parse(&script().dump(COMPACT)).expect("the script is JSON");
@@ -174,9 +155,6 @@ fn the_stub_plays_the_agent_from_the_script() {
     );
 }
 
-/// THE RUN PROMOTES UNDER THE SCENARIO'S NAME: `lab tape promote occupancy-break-claude-01` names
-/// the corpus tape after the scenario, a corpus name, and refuses a run whose summary carries the
-/// judge's `error`. NEGATIVE CONTROL: a run the judge passed is not refused.
 #[test]
 fn its_run_promotes_under_its_name_unless_the_judge_failed() {
     let run = Path::new("/results").join(format!("{NAME}-01"));
@@ -191,8 +169,6 @@ fn its_run_promotes_under_its_name_unless_the_judge_failed() {
     assert!(crate::tape::run_failed(&failed).is_some());
 }
 
-/// The reader's workflow wait: the capture of one workflow is one; the same screen with its
-/// workflow gone is not.
 #[test]
 fn a_workflow_wait_is_read_off_the_screen() {
     assert!(workflow_waits(&workflow_screen()));
@@ -202,7 +178,6 @@ fn a_workflow_wait_is_read_off_the_screen() {
 const SID: &str = "s-0123456789abcdef0123";
 const EPISODE: &str = "00000000000000ab";
 
-/// A ledger row of `sid` as the loop writes it.
 fn row(sid: &str, rule: &str, decision: &str, command: &str, reason: &str) -> String {
     J::obj([
         ("ts", J::Int(1_000)),
@@ -217,8 +192,6 @@ fn row(sid: &str, rule: &str, decision: &str, command: &str, reason: &str) -> St
     .dump(COMPACT)
 }
 
-/// A `messages` row keyed `key` titled `title`, as the wire writes it (each byte but a letter or
-/// a digit `%XX`).
 fn message(id: u32, key: &str, title: &str) -> String {
     let pct = |s: &str| {
         s.bytes()
@@ -317,24 +290,17 @@ fn judged(p: &Parts) -> Vec<String> {
     })
 }
 
-/// THE JUDGE PASSES THE RUN THE SCENARIO MEANS ([module docs](super)): the line typed once at the
-/// break, fenced, past the nudge's wait, its intent before it in one episode, its record in
-/// Messages, the hold declared after it, the workflow still drawn; other sessions' rows and
-/// records and the policy's own rows are not the door's.
 #[test]
 fn the_judge_passes_the_run_the_scenario_means() {
     assert_eq!(judged(&passing()), Vec::<String>::new());
 }
 
-/// One change of the passing recording, named.
 type Case = (&'static str, Box<dyn Fn(&mut Parts)>);
 
 fn case(what: &'static str, change: impl Fn(&mut Parts) + 'static) -> Case {
     (what, Box::new(change))
 }
 
-/// EACH WAY THE RUN CAN FALL SHORT FAILS IT, alone: NEGATIVE CONTROLS of the passing recording,
-/// one part changed at a time, each a failure of its own.
 #[test]
 fn each_way_the_run_falls_short_fails_it_alone() {
     let reason = format!("rule=wait-nudge@v1 episode={EPISODE} held_ms=61000");

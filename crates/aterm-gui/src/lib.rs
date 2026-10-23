@@ -3122,7 +3122,7 @@ enum Wake {
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
     Aos {
-        asked: aos_verb::Asked,
+        ask: aos_verb::Ask,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
     PersonStandIn {
@@ -18027,8 +18027,8 @@ impl App {
             Wake::CardSeed { asked, reply } => {
                 let _ = reply.send(self.control_card_seed(asked));
             }
-            Wake::Aos { asked, reply } => {
-                let _ = reply.send(self.control_aos(asked, Instant::now()));
+            Wake::Aos { ask, reply } => {
+                let _ = reply.send(self.control_aos(ask, Instant::now()));
             }
             Wake::PersonStandIn { asked, reply } => {
                 let _ = reply.send(self.person_stand_in(asked));
@@ -26588,6 +26588,11 @@ mod tests;
 #[cfg(test)]
 #[path = "lib_aos_repair_tests.rs"]
 mod aos_repair_tests;
+
+/// An admitted schedule plan published over the front window's glow on the host path (design §10.6); only a debug build publishes plans.
+#[cfg(all(test, debug_assertions))]
+#[path = "lib_aos_publish_tests.rs"]
+mod aos_publish_tests;
 
 #[cfg(test)]
 #[path = "lib_session_pool_tests.rs"]

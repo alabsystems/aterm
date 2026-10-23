@@ -51,7 +51,7 @@ pub struct Proc {
     pub refused: bool,
     /// Descriptors besides the output file.
     pub fds: Vec<Fd>,
-    /// fds 1 and 2 on this output file: (dev, ino).
+    /// Descriptors 1 and 2 on this output file `(dev, ino)`.
     pub out: Option<(u64, u64)>,
     pub wchan: Option<String>,
     /// A thread in an uninterruptible wait.
@@ -479,7 +479,7 @@ impl World {
         }
     }
 
-    /// aterm's user's held processes, as the host lists them: a tab's member (it descends from aterm, pid 100) or one aterm's coalition holds is aterm's.
+    /// Held processes owned by `UID` (tab descendants of pid 100 or coalition members).
     fn held(&self) -> Vec<aterm_vitals::jobs::HeldProc> {
         self.procs
             .values()

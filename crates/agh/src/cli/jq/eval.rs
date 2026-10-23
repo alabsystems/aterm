@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 
 //! The jq evaluator: each expression is a stream of values, written into an output vector in order.
 
@@ -13,7 +12,6 @@ use super::parse::{ArithOp, Ast, StrPiece};
 use super::{Func, json_text, runtime};
 use crate::error::{Error, Result};
 
-/// The variables in scope: a chain of `as $name` bindings, innermost first.
 struct Env<'a> {
     name: &'a str,
     value: &'a Value,
@@ -38,25 +36,18 @@ pub(super) fn run(ast: &Ast, input: &Value, out: &mut Vec<Value>) -> Result<()> 
     eval(ast, input, None, out)
 }
 
-/// Every output of `ast`, or its error: for the constructs that fail whole (`[e]`, `map`,
-/// `sort_by`, `last(f)`).
 fn collect(ast: &Ast, input: &Value, env: Option<&Env<'_>>) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     eval(ast, input, env, &mut out)?;
     Ok(out)
 }
 
-/// The outputs `ast` wrote before it stopped, and how it stopped.
 fn stream(ast: &Ast, input: &Value, env: Option<&Env<'_>>) -> (Vec<Value>, Result<()>) {
     let mut out = Vec::new();
     let status = eval(ast, input, env, &mut out);
     (out, status)
 }
 
-/// The inner side of a product, which jq runs again for each output of the outer side. Its
-/// outputs are the same each time, so it runs once, on first use, and its error is raised the
-/// first time its outputs are used up, where jq first meets it. A missing slice bound is
-/// `null`.
 struct Inner<'a> {
     ast: Option<&'a Ast>,
     run: Option<(Vec<Value>, Option<Error>)>,
@@ -67,7 +58,6 @@ impl<'a> Inner<'a> {
         Inner { ast, run: None }
     }
 
-    /// The outputs, run on first use.
     fn values(&mut self, input: &Value, env: Option<&Env<'_>>) -> &[Value] {
         let ast = self.ast;
         let run = self.run.get_or_insert_with(|| match ast {
@@ -80,7 +70,6 @@ impl<'a> Inner<'a> {
         &run.0
     }
 
-    /// The error that ended the outputs, once they have been used up.
     fn end(&mut self) -> Result<()> {
         match self.run.as_mut().and_then(|run| run.1.take()) {
             Some(e) => Err(e),
@@ -89,9 +78,6 @@ impl<'a> Inner<'a> {
     }
 }
 
-/// `lhs op rhs`, as jq runs a binary operator: the right side outermost and the left side
-/// innermost, each result written as it is made. The left side's error stops the stream once
-/// the first right output's results are out; the right side's once all of its are.
 fn binop(
     lhs: &Ast,
     rhs: &Ast,
@@ -111,7 +97,6 @@ fn binop(
     status
 }
 
-/// `t[k]`, or nothing when the step is optional and `t` cannot be indexed with `k`.
 fn step(result: Result<Value>, opt: bool, out: &mut Vec<Value>) -> Result<()> {
     match result {
         Ok(value) => out.push(value),
@@ -121,12 +106,10 @@ fn step(result: Result<Value>, opt: bool, out: &mut Vec<Value>) -> Result<()> {
     Ok(())
 }
 
-/// jq's truthiness: everything but `false` and `null`.
 const fn truthy(value: &Value) -> bool {
     !matches!(value, Value::Null | Value::Bool(false))
 }
 
-/// jq's type name.
 const fn type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
@@ -138,7 +121,6 @@ const fn type_name(value: &Value) -> &'static str {
     }
 }
 
-/// `{type} ({value})`, as jq's errors name a value: the value cut to 30 characters.
 fn shown(value: &Value) -> String {
     let text = value.to_string();
     let cut: String = text.chars().take(30).collect();
@@ -149,7 +131,6 @@ fn shown(value: &Value) -> String {
     }
 }
 
-/// Compact JSON for anything but a string, which is itself.
 fn tostring(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -284,8 +265,6 @@ fn eval(ast: &Ast, input: &Value, env: Option<&Env<'_>>, out: &mut Vec<Value>) -
     Ok(())
 }
 
-/// A string's every rendering: the cartesian product of its interpolations' outputs, written
-/// before the error that stopped it.
 fn interpolate(
     pieces: &[StrPiece],
     input: &Value,
@@ -324,9 +303,6 @@ fn interpolate(
     error.map_or(Ok(()), Err)
 }
 
-/// One object entry's `(key, value)` pairs, in jq's order (the key outermost), and the error
-/// that ended them. A key that is not a string fails where jq's insert meets it: at its first
-/// value.
 fn object_entry(
     key: &Ast,
     value: &Ast,
@@ -351,10 +327,6 @@ fn object_entry(
     (pairs, status.err())
 }
 
-/// `{k: v, …}`: the cartesian product of its entries' pairs, the first entry outermost, each
-/// object written as it is made. An entry runs only when the entries before it have a pair,
-/// and its error stops the stream the first time its pairs are used up. An odometer over the
-/// entries, with no recursion, so the number of entries is unbounded.
 fn object(
     entries: &[(Ast, Ast)],
     input: &Value,
@@ -400,7 +372,6 @@ fn object(
     Ok(())
 }
 
-/// `t[k]`.
 fn index(target: &Value, key: &Value) -> Result<Value> {
     match (target, key) {
         (Value::Null, Value::String(_) | Value::Number(_) | Value::Null) => Ok(Value::Null),
@@ -426,9 +397,6 @@ fn index(target: &Value, key: &Value) -> Result<Value> {
     }
 }
 
-/// A slice bound, as a whole index into a sequence of `len`, as jq 1.7.1 takes it: a negative
-/// counted from the end first, then a fraction floored for the start and raised for the end,
-/// then clamped. So `[1,2,3][:-0.5]` ends at `ceil(2.5)`, and is the whole array.
 fn slice_index(bound: &Value, len: usize, default: usize, end: bool) -> Result<usize> {
     let n = match bound {
         Value::Null => return Ok(default),
@@ -446,7 +414,6 @@ fn slice_index(bound: &Value, len: usize, default: usize, end: bool) -> Result<u
     Ok(n.clamp(0.0, len_f) as usize)
 }
 
-/// `t[lo:hi]`, by Unicode scalar on a string.
 fn slice(target: &Value, lo: &Value, hi: &Value) -> Result<Value> {
     match target {
         Value::Null => Ok(Value::Null),
@@ -476,14 +443,12 @@ fn slice(target: &Value, lo: &Value, hi: &Value) -> Result<Value> {
     }
 }
 
-/// A number's exact integer, when it has one.
 fn integer(n: &Number) -> Option<i128> {
     n.as_u64()
         .map(i128::from)
         .or_else(|| n.as_i64().map(i128::from))
 }
 
-/// An integer as a JSON number, or a double when it fits neither `u64` nor `i64`.
 fn from_integer(v: i128) -> Value {
     if let Ok(u) = u64::try_from(v) {
         Value::from(u)
@@ -506,7 +471,6 @@ pub(super) fn from_double(v: f64) -> Value {
     }
 }
 
-/// Two numbers combined: exactly when both are integers, else as doubles.
 fn arith(a: &Number, b: &Number, int: fn(i128, i128) -> i128, dbl: fn(f64, f64) -> f64) -> Value {
     match (integer(a), integer(b)) {
         (Some(x), Some(y)) => from_integer(int(x, y)),
@@ -514,7 +478,6 @@ fn arith(a: &Number, b: &Number, int: fn(i128, i128) -> i128, dbl: fn(f64, f64) 
     }
 }
 
-/// `a + b`.
 fn add(a: &Value, b: &Value) -> Result<Value> {
     match (a, b) {
         (Value::Null, x) | (x, Value::Null) => Ok(x.clone()),
@@ -540,7 +503,6 @@ fn add(a: &Value, b: &Value) -> Result<Value> {
     }
 }
 
-/// `a - b`.
 fn sub(a: &Value, b: &Value) -> Result<Value> {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => Ok(arith(x, y, |p, q| p - q, |p, q| p - q)),
@@ -561,7 +523,6 @@ fn sub(a: &Value, b: &Value) -> Result<Value> {
     }
 }
 
-/// A value's place in jq's type order.
 const fn rank(value: &Value) -> u8 {
     match value {
         Value::Null => 0,
@@ -574,8 +535,6 @@ const fn rank(value: &Value) -> u8 {
     }
 }
 
-/// jq's total order: null < false < true < numbers < strings < arrays < objects; arrays
-/// element-wise; objects by their sorted keys, then their values.
 fn compare(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => match (integer(x), integer(y)) {
@@ -613,8 +572,6 @@ fn compare(a: &Value, b: &Value) -> Ordering {
     }
 }
 
-/// The items `.[]` yields: an array's items, or an object's values in sorted key order. The
-/// error names `what`, the function iterating its input, when there is one (`t[]` has none).
 fn items_of(value: &Value, what: Option<&str>) -> Result<Vec<Value>> {
     match value {
         Value::Array(items) => Ok(items.clone()),
@@ -629,7 +586,6 @@ fn items_of(value: &Value, what: Option<&str>) -> Result<Vec<Value>> {
     }
 }
 
-/// An array input, for the functions that sort.
 fn array_of<'v>(value: &'v Value, what: &str) -> Result<&'v Vec<Value>> {
     match value {
         Value::Array(items) => Ok(items),
@@ -640,7 +596,6 @@ fn array_of<'v>(value: &'v Value, what: &str) -> Result<&'v Vec<Value>> {
     }
 }
 
-/// A string input or argument.
 fn string_of<'v>(value: &'v Value, what: &str) -> Result<&'v str> {
     match value {
         Value::String(text) => Ok(text),
@@ -651,8 +606,6 @@ fn string_of<'v>(value: &'v Value, what: &str) -> Result<&'v str> {
     }
 }
 
-/// `split(sep)` of `text`, as jq 1.7.1 splits: an empty input gives `[]`, an empty separator
-/// every character.
 fn split(text: &str, sep: &str) -> Vec<Value> {
     if text.is_empty() {
         return Vec::new();
@@ -665,7 +618,6 @@ fn split(text: &str, sep: &str) -> Vec<Value> {
         .collect()
 }
 
-/// The first value of `obj` under any of `names` that is neither null nor false.
 fn first_truthy<'v>(obj: &'v Map, names: &[&str]) -> Option<&'v Value> {
     names
         .iter()
@@ -673,7 +625,6 @@ fn first_truthy<'v>(obj: &'v Map, names: &[&str]) -> Option<&'v Value> {
         .find(|v| truthy(v))
 }
 
-/// `from_entries`.
 fn from_entries(input: &Value) -> Result<Value> {
     let mut map = Map::new();
     for entry in items_of(input, Some("from_entries"))? {
@@ -703,9 +654,6 @@ fn from_entries(input: &Value) -> Result<Value> {
     Ok(Value::Object(map))
 }
 
-/// Whether `f` holds for any (`want == true`) or all (`want == false`) of `items`. As jq
-/// 1.7.1's `isempty(first(...))`, the first output that decides stops the search, so an error
-/// `f` meets after it is never raised.
 fn any_all(items: &[Value], f: Option<&Ast>, env: Option<&Env<'_>>, want: bool) -> Result<bool> {
     for item in items {
         let (outputs, status) = match f {
@@ -720,7 +668,6 @@ fn any_all(items: &[Value], f: Option<&Ast>, env: Option<&Env<'_>>, want: bool) 
     Ok(!want)
 }
 
-/// One function call.
 fn call(
     func: Func,
     args: &[Ast],
@@ -1009,8 +956,6 @@ fn call(
     Ok(())
 }
 
-/// One `@tsv` cell: jq's escapes for a string, JSON for a number, `true`/`false`, and an empty
-/// cell for null.
 fn tsv_cell(value: &Value) -> Result<String> {
     Ok(match value {
         Value::Null => String::new(),
@@ -1038,8 +983,6 @@ fn tsv_cell(value: &Value) -> Result<String> {
     })
 }
 
-/// One `@csv` cell: a string quoted with its quotes doubled and a NUL written `\0`, as jq
-/// 1.7.1 does; a number or bool bare; null empty.
 fn csv_cell(value: &Value) -> Result<String> {
     Ok(match value {
         Value::Null => String::new(),
@@ -1054,7 +997,6 @@ fn csv_cell(value: &Value) -> Result<String> {
     })
 }
 
-/// `@name` applied to `input`.
 fn format(name: &str, input: &Value) -> Result<String> {
     match name {
         "tsv" | "csv" => {

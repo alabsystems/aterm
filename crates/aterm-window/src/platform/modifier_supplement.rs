@@ -7,34 +7,15 @@
 use crate::event::KeyEvent;
 use crate::keyboard::Key;
 
-/// Additional methods for the `KeyEvent` which cannot be implemented on all
-/// platforms.
+/// Additional methods for `KeyEvent` that cannot be implemented on all platforms.
 pub trait KeyEventExtModifierSupplement {
-    /// Identical to `KeyEvent::text` but this is affected by <kbd>Ctrl</kbd>.
-    ///
-    /// For example, pressing <kbd>Ctrl</kbd>+<kbd>a</kbd> produces `Some("\x01")`.
+    /// Identical to `KeyEvent::text` but affected by <kbd>Ctrl</kbd>.
     fn text_with_all_modifiers(&self) -> Option<&str>;
 
-    /// This value ignores all modifiers including,
-    /// but not limited to <kbd>Shift</kbd>, <kbd>Caps Lock</kbd>,
-    /// and <kbd>Ctrl</kbd>. In most cases this means that the
-    /// unicode character in the resulting string is lowercase.
-    ///
-    /// This is useful for key-bindings / shortcut key combinations.
-    ///
-    /// In case `logical_key` reports `Dead`, this will still report the
-    /// key as `Character` according to the current keyboard layout. This value
-    /// cannot be `Dead`.
+    /// Logical key ignoring all modifiers.
     fn key_without_modifiers(&self) -> Key;
 
-    /// [`KeyEvent::text`] at the press's <kbd>Shift</kbd> level with <kbd>Caps Lock</kbd>
-    /// off: what a <kbd>Ctrl</kbd> or <kbd>Alt</kbd> chord names, which takes Shift's case
-    /// and never the lock's.
-    ///
-    /// On X11 and Wayland xkb resolves Shift and Lock together, and an alphabetic key's type
-    /// cancels one against the other: Turkish Caps Lock + Shift+i types `i`, where Shift
-    /// alone types `İ`. So there the press is read again without the lock.
-    /// Elsewhere this is [`KeyEvent::text`].
+    /// [`KeyEvent::text`] at the press's <kbd>Shift</kbd> level with <kbd>Caps Lock</kbd> off.
     fn text_ignoring_lock(&self) -> Option<&str>;
 }
 

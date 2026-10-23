@@ -8,22 +8,17 @@ use crate::prompt::fixtures::{
     USAGE_WARNING_WEEKLY_2_1_300, WALL_WATCHDOG_SESSION_STATUSLINE_2_1_300, screen,
 };
 
-/// `rows` with row `i` replaced by `row`.
 fn with_row(mut rows: Vec<String>, i: usize, row: &str) -> Vec<String> {
     rows[i] = row.to_string();
     rows
 }
 
-/// The index of the first row that holds `text`.
 fn row_of(rows: &[String], text: &str) -> usize {
     rows.iter()
         .position(|r| r.contains(text))
         .unwrap_or_else(|| panic!("no row holds {text:?}: {rows:#?}"))
 }
 
-/// Every measured credits screen (2.1.300: both renderers, 110 and 80
-/// columns) reads as credits in use; the notice they start on names the
-/// five-hour window and its reset, cut at 80 columns or not.
 #[test]
 fn the_measured_credits_notices_read_as_credits_in_use() {
     let started = |reset: &str| Credits {
@@ -67,11 +62,6 @@ fn the_measured_credits_notices_read_as_credits_in_use() {
     }
 }
 
-/// The notice's PER-MODEL form (READ in the 2.1.304 bundle, `wbo`: `Now using
-/// usage credits for ${model} · Your ${model} limit resets ${reset}`, drawn
-/// where the window is a model's) is the one credits started on, its reset
-/// the model's, and names the model, in place of the measured started
-/// notice's row; its head naming no reset names the model and no start.
 #[test]
 fn the_per_model_notice_names_its_model_and_its_reset() {
     let rows = screen(CREDITS_STARTED_2_1_300);
@@ -105,15 +95,6 @@ fn the_per_model_notice_names_its_model_and_its_reset() {
     );
 }
 
-/// THE NOTICES OF A MODEL BILLED PER REQUEST WITH NO DIALOG (READ in the
-/// 2.1.301 to 2.1.304 bundles, the `fable-usage-credits` notification: a
-/// credits-only model whose consent Claude Code stored, or on a tier an admin
-/// bills, goes onto usage credits with no box, the footer's item never
-/// drawn), and lower-priority mode's end as credits take over, each in place
-/// of the measured lasting notice on its mode row: credits in use, with the
-/// model where the notice names one. NEGATIVE CONTROLS: the measured notice
-/// (the account's window, no model); the same words short of the edge, in
-/// the model's reply, or under no model's name; the row with no notice.
 #[test]
 fn a_model_billed_to_credits_with_no_dialog_reads_as_credits_in_use() {
     let rows = screen(CREDITS_IN_USE_2_1_300);
@@ -191,11 +172,6 @@ fn a_model_billed_to_credits_with_no_dialog_reads_as_credits_in_use() {
     }
 }
 
-/// The words are Claude Code's only where it draws them: NEGATIVE CONTROLS —
-/// the same words in a tool's output above the composer, in the model's
-/// reply, in a statusLine's left segment with something else on its right,
-/// and short of the right edge, are no credits; nor is any screen with no
-/// composer frame, nor the watchdog's screen.
 #[test]
 fn credits_words_anywhere_else_are_no_credits() {
     let rows = screen(CREDITS_IN_USE_2_1_300);
@@ -254,12 +230,6 @@ fn credits_words_anywhere_else_are_no_credits() {
     );
 }
 
-/// The vendor's warning, measured (`You've used 80% of your weekly limit ·
-/// resets Oct 18 at 8:50pm (…)`) and as the lab's E2 drew the session one on
-/// a statusLine's row (`… You've used 92% of your session limit · resets
-/// 4:12am (…)`), is read with its window, figure and reset. NEGATIVE
-/// CONTROLS: a model's or the credits' own figure, the words in a tool's
-/// output, a figure past 100, and the credits screens, are no warning.
 #[test]
 fn the_vendors_usage_warning_is_read_with_its_window_and_figure() {
     let rows = screen(USAGE_WARNING_WEEKLY_2_1_300);
